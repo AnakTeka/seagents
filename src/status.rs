@@ -216,31 +216,60 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
     })
 }
 
-/// How long the session has been in `state`, tracked through a `.state`
-/// sidecar that records the last observed transition. Whoever polls (the HUD
-/// every 750 ms, or a one-shot `status`) advances it; the clock only resets
-/// when the detected state actually changes, so focus-repaint noise in the
-/// output stream doesn't touch it. With no recent poller, `since` is "when a
-/// poller first saw this state" — an underestimate, never an overreport.
+/// How long the session has been in `state`, from the `.state` sidecar that
+/// records the last observed transition. The wrapper's own monitor thread
+/// (`track_session`, every 2 s for the session's whole life) is the primary
+/// writer, so the sidecar stays truthful even when no HUD is open; readers
+/// only write as a fallback for sessions launched by pre-monitor wrappers.
 fn state_duration(dir: &Path, wrapper_pid: u64, state: State) -> u64 {
     let path = dir.join(format!("{wrapper_pid}.state"));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let prev: Option<serde_json::Value> = std::fs::read_to_string(&path)
+    let now = unix_now();
+    now.saturating_sub(observe_state(&path, state, now))
+}
+
+/// Record `state` into the sidecar if it differs from what's there; returns
+/// the `since` timestamp of the current state. Multiple observers (wrapper
+/// monitor + an open HUD) may race on a transition — both write since≈now, so
+/// the divergence is bounded by one poll interval. Harmless.
+fn observe_state(path: &Path, state: State, now: u64) -> u64 {
+    let prev: Option<serde_json::Value> = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
     match prev {
         Some(p) if p["state"].as_str() == Some(state.word()) => {
-            now.saturating_sub(p["since"].as_u64().unwrap_or(now))
+            p["since"].as_u64().unwrap_or(now)
         }
         _ => {
             let record = serde_json::json!({ "state": state.word(), "since": now });
-            let _ = std::fs::write(&path, record.to_string());
-            0
+            let _ = std::fs::write(path, record.to_string());
+            now
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One detection pass over our *own* session, for the wrapper's monitor
+/// thread: re-classify from the teed tail and stamp the sidecar on
+/// transitions. This is what keeps "idle for" truthful while no HUD or
+/// status invocation is watching.
+pub(crate) fn track_session(raw: &Path, state_path: &Path, cmd: &str, child_pid: u64) {
+    let Some(buf) = read_tail(raw, 1024 * 1024) else {
+        return;
+    };
+    let (rows, cols) = live_pty_size(child_pid).unwrap_or((24, 80));
+    let screen = crate::detect::render(&buf, rows, cols);
+    let title = current_title(&buf).unwrap_or_default();
+    let agent = crate::vendor::herdr_detect::identify_agent(cmd);
+    let state = State::from(
+        crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
+    );
+    observe_state(state_path, state, unix_now());
 }
 
 /// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
