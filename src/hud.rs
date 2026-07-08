@@ -285,10 +285,10 @@ fn session_row(s: &Session) -> ListItem<'static> {
             format!("{:<8}", truncate(&s.cmd, 8)),
             Style::default().fg(Color::Gray),
         ),
-        // How long the agent has been quiet: idle-for on green rows,
-        // waiting-on-you-for on red rows.
+        // Time in current state: idle-for on green rows, waiting-on-you-for
+        // on red ones.
         Span::styled(
-            format!("  {:>6}", crate::status::humanize_secs(s.quiet_secs)),
+            format!("  {:>6}", crate::status::humanize_secs(s.state_secs)),
             Style::default().fg(Color::DarkGray),
         ),
     ]);

@@ -149,7 +149,13 @@ continues the agent's group and nudges a repaint with SIGWINCH.
 
 Per session, keyed by the wrapper's pid:
 
-- **`<wrapper_pid>.raw`** — the teed output byte stream (for detection).
+- **`<wrapper_pid>.raw`** — the teed output byte stream (for detection);
+  rotated down to its last ~1 MB once it passes 16 MB.
+- **`<wrapper_pid>.state`** — last observed state transition
+  (`{"state": "idle", "since": <unix>}`), maintained by whoever polls; powers
+  the "idle for / waiting for" column. Transition-based on purpose: output age
+  can't work because a focused Claude repaints on the terminal's focus-in
+  report, which would reset the clock every time the HUD previews a window.
 - **`<wrapper_pid>.meta`** — JSON identity:
   ```json
   {

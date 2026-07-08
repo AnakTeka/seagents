@@ -70,10 +70,13 @@ pub(crate) struct Session {
     pub(crate) cwd: String,
     pub(crate) cmd: String,
     pub(crate) pid: u64,
-    /// Seconds since the agent last produced output (the `.raw` tee mtime).
-    /// An idle agent emits nothing, so this is "idle for"; for a blocked agent
-    /// it's how long it has been waiting on the user.
-    pub(crate) quiet_secs: u64,
+    /// Seconds the agent has been in its current state ("idle for" on green
+    /// rows, "waiting on you for" on red ones). Tracked via observed state
+    /// *transitions* persisted in the `.state` sidecar — NOT output age: an
+    /// idle Claude still emits bytes when its window is merely focused (the
+    /// terminal's focus-in report triggers a repaint), so a preview from the
+    /// HUD would reset an output-mtime clock.
+    pub(crate) state_secs: u64,
 }
 
 /// Gather every tracked session, sorted most-urgent first. Shared by the
@@ -115,7 +118,7 @@ pub fn print() -> i32 {
             s.state.badge(),
             s.dir,
             s.cmd,
-            humanize_secs(s.quiet_secs),
+            humanize_secs(s.state_secs),
             dw = dir_w,
             cw = cmd_w,
         );
@@ -141,7 +144,7 @@ pub fn print_json() -> i32 {
                 "cwd": s.cwd,
                 "cmd": s.cmd,
                 "pid": s.pid,
-                "quiet_secs": s.quiet_secs,
+                "state_secs": s.state_secs,
             })
         })
         .collect();
@@ -176,6 +179,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
     if !alive {
         let _ = std::fs::remove_file(meta_path);
         let _ = std::fs::remove_file(&raw);
+        let _ = std::fs::remove_file(dir.join(format!("{wrapper_pid}.state")));
         return None;
     }
 
@@ -199,14 +203,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         None => State::Unknown,
     };
 
-    // Last-output age from the tee file's mtime — cheap and already accurate:
-    // the pump flushes on every chunk, and quiet agents write nothing.
-    let quiet_secs = std::fs::metadata(&raw)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let state_secs = state_duration(dir, wrapper_pid, state);
 
     Some(Session {
         id: wrapper_pid,
@@ -215,8 +212,35 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         cwd: cwd.to_string(),
         cmd,
         pid: child_pid.unwrap_or(wrapper_pid),
-        quiet_secs,
+        state_secs,
     })
+}
+
+/// How long the session has been in `state`, tracked through a `.state`
+/// sidecar that records the last observed transition. Whoever polls (the HUD
+/// every 750 ms, or a one-shot `status`) advances it; the clock only resets
+/// when the detected state actually changes, so focus-repaint noise in the
+/// output stream doesn't touch it. With no recent poller, `since` is "when a
+/// poller first saw this state" — an underestimate, never an overreport.
+fn state_duration(dir: &Path, wrapper_pid: u64, state: State) -> u64 {
+    let path = dir.join(format!("{wrapper_pid}.state"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let prev: Option<serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    match prev {
+        Some(p) if p["state"].as_str() == Some(state.word()) => {
+            now.saturating_sub(p["since"].as_u64().unwrap_or(now))
+        }
+        _ => {
+            let record = serde_json::json!({ "state": state.word(), "since": now });
+            let _ = std::fs::write(&path, record.to_string());
+            0
+        }
+    }
 }
 
 /// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
