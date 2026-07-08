@@ -1,0 +1,19 @@
+[package]
+name = "findclaw"
+version = "0.1.0"
+edition = "2021"
+description = "observe coding agents running in your own terminal windows"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "findclaw"
+path = "src/main.rs"
+
+[dependencies]
+portable-pty = "0.8"
+crossterm = "0.28"
+signal-hook = "0.3"
+libc = "0.2"
+serde_json = "1"
+vt100 = "0.15"
+ratatui = "0.28"
