@@ -1,7 +1,7 @@
 //! Milestone 4: the floating HUD.
 //!
 //! A ratatui panel meant to run in an i3 floating window. It polls the same
-//! session data as `findclaw status`, colour-codes each agent by state, and on
+//! session data as `seagents status`, colour-codes each agent by state, and on
 //! Enter or left-click focuses that agent's i3 window (milestone 3). Everything
 //! underneath is already proven — this is assembly.
 
@@ -25,7 +25,7 @@ const REFRESH: Duration = Duration::from_millis(750);
 
 pub fn run() -> i32 {
     if enable_raw_mode().is_err() {
-        eprintln!("findclaw: the HUD needs a terminal (try `findclaw status` instead)");
+        eprintln!("seagents: the HUD needs a terminal (try `seagents status` instead)");
         return 1;
     }
     let mut stdout = io::stdout();
@@ -162,7 +162,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.rows_top = body.y + 1;
 
     if app.sessions.is_empty() {
-        let empty = Paragraph::new("no agents tracked — launch one with `findclaw run claude`")
+        let empty = Paragraph::new("no agents tracked — launch one with `seagents run claude`")
             .block(agent_block())
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, body);
@@ -182,7 +182,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn agent_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .title(" findclaw ")
+        .title(" seagents ")
 }
 
 fn session_row(s: &Session) -> ListItem<'static> {

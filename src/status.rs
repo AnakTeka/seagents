@@ -66,7 +66,7 @@ pub(crate) fn collect() -> Vec<Session> {
     sessions
 }
 
-/// Scan `~/.cache/findclaw/*.meta`, classify each session, print a table.
+/// Scan `~/.cache/seagents/*.meta`, classify each session, print a table.
 pub fn print() -> i32 {
     let sessions = collect();
     if sessions.is_empty() {
@@ -201,7 +201,7 @@ fn title_state(data: &[u8]) -> State {
 
 /// The current window title: the most recent non-empty OSC title in the stream.
 /// This is exactly what the terminal emulator mirrors into its X11 window title,
-/// so it's the handle findclaw uses to locate the agent's i3 window.
+/// so it's the handle seagents uses to locate the agent's i3 window.
 pub(crate) fn current_title(data: &[u8]) -> Option<String> {
     all_titles(data)
         .into_iter()

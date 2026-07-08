@@ -1,6 +1,6 @@
-//! findclaw — observe coding agents running in your own terminal windows.
+//! seagents — observe coding agents running in your own terminal windows.
 //!
-//! Milestone 1: `findclaw run <cmd...>` — a transparent pty-teeing launcher.
+//! Milestone 1: `seagents run <cmd...>` — a transparent pty-teeing launcher.
 //! It spawns <cmd> on an inner PTY, relays stdin/output byte-for-byte between
 //! your real terminal and the child, and tees a copy of the output stream to a
 //! file so a future daemon can scrape it for agent status. Nothing here parses
@@ -25,7 +25,7 @@ fn main() {
         Some("run") => {
             let cmd: Vec<String> = args.collect();
             if cmd.is_empty() {
-                eprintln!("usage: findclaw run <cmd> [args...]");
+                eprintln!("usage: seagents run <cmd> [args...]");
                 std::process::exit(2);
             }
             std::process::exit(run(cmd));
@@ -36,7 +36,7 @@ fn main() {
             match pid {
                 Some(p) => std::process::exit(focus::focus(p)),
                 None => {
-                    eprintln!("usage: findclaw focus <child_pid>");
+                    eprintln!("usage: seagents focus <child_pid>");
                     std::process::exit(2);
                 }
             }
@@ -66,12 +66,12 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("findclaw {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("seagents {}", env!("CARGO_PKG_VERSION"));
     eprintln!("usage:");
-    eprintln!("  findclaw [hud]                 the floating agent HUD (default)");
-    eprintln!("  findclaw run <cmd> [args...]   launch an agent, teeing its output");
-    eprintln!("  findclaw status                show every tracked agent's state");
-    eprintln!("  findclaw focus <child_pid>     focus that agent's i3 window");
+    eprintln!("  seagents [hud]                 the floating agent HUD (default)");
+    eprintln!("  seagents run <cmd> [args...]   launch an agent, teeing its output");
+    eprintln!("  seagents status                show every tracked agent's state");
+    eprintln!("  seagents focus <child_pid>     focus that agent's i3 window");
 }
 
 /// Query the *outer* terminal's real size, including pixel dimensions, so the
@@ -98,11 +98,11 @@ fn terminal_size() -> PtySize {
     }
 }
 
-/// Directory holding this machine's findclaw session files.
+/// Directory holding this machine's seagents session files.
 fn cache_dir() -> std::path::PathBuf {
     let base = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/findclaw"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/findclaw"));
+        .map(|h| std::path::PathBuf::from(h).join(".cache/seagents"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/seagents"));
     let _ = fs::create_dir_all(&base);
     base
 }
@@ -154,7 +154,7 @@ fn run(cmd: Vec<String>) -> i32 {
     let pair = match pty_system.openpty(size) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("findclaw: openpty failed: {e}");
+            eprintln!("seagents: openpty failed: {e}");
             return 1;
         }
     };
@@ -171,7 +171,7 @@ fn run(cmd: Vec<String>) -> i32 {
     let mut child = match pair.slave.spawn_command(builder) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("findclaw: failed to spawn {}: {e}", cmd[0]);
+            eprintln!("seagents: failed to spawn {}: {e}", cmd[0]);
             return 1;
         }
     };
@@ -183,14 +183,14 @@ fn run(cmd: Vec<String>) -> i32 {
     let mut reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("findclaw: clone reader failed: {e}");
+            eprintln!("seagents: clone reader failed: {e}");
             return 1;
         }
     };
     let mut writer = match pair.master.take_writer() {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("findclaw: take writer failed: {e}");
+            eprintln!("seagents: take writer failed: {e}");
             return 1;
         }
     };
@@ -201,8 +201,8 @@ fn run(cmd: Vec<String>) -> i32 {
     let tee = File::create(&raw_path).ok();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size);
-    if std::env::var("FINDCLAW_DEBUG").is_ok() {
-        eprintln!("findclaw: teeing to {}", raw_path.display());
+    if std::env::var("SEAGENTS_DEBUG").is_ok() {
+        eprintln!("seagents: teeing to {}", raw_path.display());
     }
 
     // Put the outer terminal into raw mode so keystrokes and control bytes flow

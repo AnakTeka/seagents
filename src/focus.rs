@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// `findclaw focus <child_pid>` — bring the agent's terminal window to the
+/// `seagents focus <child_pid>` — bring the agent's terminal window to the
 /// front. CLI wrapper: prints any error and maps to an exit code.
 pub fn focus(child_pid: u64) -> i32 {
     match focus_window(child_pid) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("findclaw: {e}");
+            eprintln!("seagents: {e}");
             1
         }
     }

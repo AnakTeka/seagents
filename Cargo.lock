@@ -172,19 +172,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "findclaw"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "libc",
- "portable-pty",
- "ratatui",
- "serde_json",
- "signal-hook",
- "vt100",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,6 +463,19 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seagents"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "serde_json",
+ "signal-hook",
+ "vt100",
+]
 
 [[package]]
 name = "serde"
