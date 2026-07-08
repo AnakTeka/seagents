@@ -172,19 +172,31 @@ fn update_manifests_now() -> i32 {
 }
 
 /// Background refresh for the HUD: at most once per day, silently.
+/// `SEAGENTS_NO_UPDATE=1` disables the automatic phone-home entirely
+/// (`seagents update-manifests` still works on demand).
 pub(crate) fn spawn_manifest_update() {
+    if std::env::var_os("SEAGENTS_NO_UPDATE").is_some() {
+        return;
+    }
     thread::spawn(|| {
-        let status = vendor::herdr_detect::manifest_update::load_status();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let fresh = status
-            .last_check_unix
-            .is_some_and(|t| now.saturating_sub(t) < 24 * 3600);
-        if fresh {
+        // Throttle on our own attempt stamp, not just the updater's recorded
+        // last check: a failed catalog fetch never advances last_check_unix,
+        // which would otherwise mean one curl attempt per HUD launch while
+        // offline.
+        let stamp = vendor::herdr_detect::config::state_dir()
+            .join("agent-detection/last-attempt");
+        let fresh_attempt = fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|e| e.as_secs() < 24 * 3600);
+        if fresh_attempt {
             return;
         }
+        if let Some(parent) = stamp.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&stamp, b"");
         if let Ok(output) = vendor::herdr_detect::manifest_update::check_and_update() {
             if !output.updated.is_empty() {
                 // The manifest cache is behind an RwLock; the HUD's next poll
@@ -498,7 +510,19 @@ fn run(cmd: Vec<String>) -> i32 {
                         let _ = crossterm::terminal::disable_raw_mode();
                     }
                     unsafe { libc::raise(libc::SIGTSTP) };
-                    // — stopped here until the user resumes us (fg) —
+                    // — stopped here until the user resumes us —
+                    // `bg` resumes us in a *background* pgrp: re-rawing from
+                    // there raises SIGTTOU (stopping us again) and a bg
+                    // fullscreen TUI is useless anyway. Treat bg as a deferred
+                    // fg: hold the agent stopped and wait until we own the
+                    // terminal again before unwinding.
+                    loop {
+                        let fg = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+                        if fg < 0 || fg == unsafe { libc::getpgrp() } {
+                            break; // foreground again (or no tty to wait on)
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                     if raw {
                         let _ = crossterm::terminal::enable_raw_mode();
                     }

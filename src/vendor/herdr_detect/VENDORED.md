@@ -21,25 +21,36 @@ to shadow both remote and bundled rules (herdr's hot-tuning workflow).
 
 ## Local modifications (re-apply after any re-sync)
 
+Substantive deltas are marked with `// seagents:` comments in the code; the
+mechanical path retargets (`crate::config::`/`crate::detect::` → `super::…`,
+applied throughout all files including tests) and the added
+`#[allow(dead_code)]` attributes are not individually marked — this list is
+their record.
+
 - `mod.rs`: removed the process-identification half (herdr's
   `crate::platform`-coupled `ForegroundJob` machinery and its tests) — seagents
   spawns its agents itself and maps argv basename via `identify_agent()`.
   Removed herdr-internal `full_lifecycle_hook_authority()`. Added
-  `pub mod config;`.
+  `pub mod config;`; `#[allow(dead_code)]` on `should_skip_state_update`.
 - `config.rs`: **not vendored** — seagents-local replacement for herdr's
   `crate::config` (`config_dir()`/`state_dir()` under seagents' XDG paths).
-- `manifest.rs`: `crate::config::` → `super::config::` (one site).
+- `manifest.rs`: `crate::config::` → `super::config::` (one site);
+  `#[allow(dead_code)]` on `manifest_summaries`, `explain`,
+  `explain_for_label` (unused vendored API surface, kept for parity).
 - `manifest_update.rs`: removed `auto_update()` (tokio/AppEvent coupling) —
   callers use `check_and_update()` + `manifest::reload_manifests()` directly;
   `tracing::warn!` → local `warn_log!` (stderr, gated on `SEAGENTS_DEBUG`);
   `crate::config::` → `super::config::`; the async wrapper's test rewritten to
-  drive `check_and_update()` directly.
+  drive `check_and_update()` directly; `fetch_text` pins https catalogs to
+  https across redirects (`--proto '=https' --proto-redir '=https'`).
 - `manifest/tests.rs`: `crate::config::`/`crate::detect::` paths retargeted
   into this module tree.
 
 ## Re-sync procedure
 
-1. `git -C herdr pull`, then diff `herdr/src/detect/` against this directory.
-2. Re-copy upstream files and re-apply the modifications above (they are all
-   mechanical; each is marked with a `// seagents:` comment in the code).
+1. Get the reference clone (gitignored, absent on fresh machines):
+   `git clone https://github.com/ogulcancelik/herdr && git -C herdr checkout <new pin>`
+   — then diff `herdr/src/detect/` against this directory.
+2. Re-copy upstream files and re-apply the modifications above (all
+   mechanical), and update the pinned commit at the top of this file.
 3. `cargo test`, then live-verify with `seagents debug-screen`.

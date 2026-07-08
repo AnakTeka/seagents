@@ -249,6 +249,10 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - **Detection covers herdr's agent roster** — any agent with a bundled manifest
   (claude, codex, gemini, cursor, copilot, …) is classified when launched via
   `seagents run <agent>`; unrecognized commands show as ⚪ unknown.
+- **`bg` on a suspended agent is a deferred `fg`, by design** — resuming in a
+  background pgrp can't re-enter raw mode (SIGTTOU would re-stop the job), and a
+  backgrounded fullscreen TUI is useless anyway, so the wrapper holds the agent
+  stopped until it owns the terminal again. `fg` unwinds everything.
 - **keyd `overload(meta, esc)` kills the HUD on `$mod`+drag** — mouse buttons
   don't pass through keyd, so a capslock(meta)+mouse-drag counts as a *tap* and
   emits Esc into the focused window on release; the HUD quits via its Esc
@@ -279,7 +283,7 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 
 ```bash
 cargo build            # or --release
-cargo test             # 50 tests (vendored engine + manifests, title parsing, glyph strip)
+cargo test             # all tests (vendored engine + manifests, title parsing, glyph strip)
 cargo run -- status    # etc.
 
 # Inspect detection against a real capture (state + matched rule; --json for

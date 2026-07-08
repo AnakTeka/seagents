@@ -455,19 +455,26 @@ fn catalog_url() -> String {
 
 fn fetch_text(url: &str) -> Result<String, String> {
     let max_fetch_bytes = MAX_FETCH_BYTES.to_string();
+    let mut args = vec![
+        "-sfL",
+        "--retry",
+        "2",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "15",
+        "--max-filesize",
+        &max_fetch_bytes,
+    ];
+    // seagents: pin https catalogs to https across redirects — `-L` alone
+    // would happily follow an https→http downgrade. Conditional so the
+    // file:// URLs used by tests (and local overrides) still work.
+    if url.starts_with("https://") {
+        args.extend(["--proto", "=https", "--proto-redir", "=https"]);
+    }
+    args.push(url);
     let mut child = Command::new("curl")
-        .args([
-            "-sfL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "--max-filesize",
-            &max_fetch_bytes,
-            url,
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|err| format!("curl failed: {err}"))?;

@@ -113,12 +113,29 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     }
                     // A mouse report torn across a read boundary surfaces as a
                     // bare Esc key (seen live during an i3 $mod+drag of the HUD
-                    // window). A human Esc arrives alone; a torn sequence has
-                    // its tail bytes right behind it — only quit when nothing
-                    // immediately follows.
+                    // window). A torn sequence's tail arrives as garbage *key*
+                    // events right behind the Esc; pending mouse-motion events
+                    // are unrelated and must not veto the quit (motion streams
+                    // continuously under mode 1003, so "any pending input"
+                    // would suppress Esc whenever the pointer is moving).
                     KeyCode::Esc => {
-                        if event::poll(Duration::from_millis(25)).unwrap_or(false) {
-                            hud_log!("ignored Esc: input pending (torn escape sequence)");
+                        let deadline = Instant::now() + Duration::from_millis(50);
+                        let mut torn = false;
+                        while event::poll(Duration::from_millis(25)).unwrap_or(false) {
+                            match event::read() {
+                                Ok(Event::Key(_)) => {
+                                    torn = true;
+                                    break;
+                                }
+                                Ok(_) => {} // motion/resize: irrelevant, drop
+                                Err(_) => break,
+                            }
+                            if Instant::now() >= deadline {
+                                break;
+                            }
+                        }
+                        if torn {
+                            hud_log!("ignored Esc: torn escape sequence");
                         } else {
                             hud_log!("exit: quit key {:?}", k);
                             return 0;
