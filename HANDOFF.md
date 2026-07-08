@@ -86,7 +86,9 @@ seagents [hud]              floating agent HUD (also the default with no args)
 seagents run <cmd> [args]   launch an agent, teeing its output (this is how tracking happens)
 seagents status            one-shot table of every tracked agent's state
 seagents focus <child_pid> focus that agent's i3 window
-seagents debug-screen <raw_file> [cols] [rows]   dev tool: render a .raw + print is_blocked verdict
+seagents update-manifests  fetch fresh detection rules from herdr.dev now
+seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
+                           dev tool: render a .raw + the engine's explain verdict
 ```
 
 HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
@@ -97,15 +99,19 @@ keep focus on HUD); `Enter`/left-click = **jump** (commit focus to the agent);
 
 ## Architecture / how it works
 
-Source is small (~5 modules under `src/`):
+Source layout under `src/`:
 
 - **`src/main.rs`** — CLI dispatch; the `run()` pty-tee wrapper; `cache_dir()`,
-  `session_paths()`, `write_meta()`, `terminal_size()`.
+  `session_paths()`, `write_meta()`, `terminal_size()`; manifest-update helpers.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()`, `print()`,
   `read_session()` (detection + reaping), OSC-title parsing (`all_titles`,
-  `current_title`, `title_state`), `live_pty_size()`, `read_tail()`.
-- **`src/detect.rs`** — `render()` (vt100) and `is_blocked()` (rules ported from
-  herdr's `claude.toml`), with unit tests.
+  `current_title`), `live_pty_size()`, `read_tail()`.
+- **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
+  vendored engine's verdicts on live-capture scenarios.
+- **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
+  (see its `VENDORED.md`): per-agent TOML rule manifests evaluated by a
+  region/priority engine, self-updating from herdr.dev. This replaced our
+  hand-written `is_blocked()` rules entirely.
 - **`src/focus.rs`** — `focus_window()` (con_id-first, title fallback),
   `preview_window()`, `focused_con_id()`/`focused_terminal_con_id()`,
   `session_for_child()`, i3 tree helpers, `core_title()`.
@@ -150,22 +156,28 @@ there is no `ended` state.
 
 ### 3. `seagents status` — detection
 
-State precedence: **blocked** (from rendered screen) wins over **title-based**
-(working/idle) wins over **unknown**.
+Classification is **herdr's manifest engine, vendored** at
+`src/vendor/herdr_detect/` (from herdr v0.7.3; AGPL — see License below). Per
+agent, a TOML manifest of rules is evaluated against *regions* of the screen
+(`prompt_box_body`, `after_last_horizontal_rule`, `osc_title`, …) with
+priorities — e.g. a `❯` in the prompt box is a *950-priority idle* signal that
+outranks loose blocked heuristics, which is what kills the "chat text says
+'would you like to…' → blocked" class of false positives our old hand rules had.
 
-- **working / idle** come from Claude's **OSC terminal title**, which it broadcasts
-  in the raw stream — no terminal emulator needed:
-  - braille spinner prefix (U+2800–U+28FF) + space → **working**
-  - `✳ ` (U+2733) + space → **idle/done**
-  - We take the last *classifiable* title, ignoring transient empty titles.
-- **blocked** has no title signal, so we replay the raw tail through the **`vt100`**
-  crate to reconstruct the visible screen, then run `is_blocked()` — rules ported
-  from herdr's `claude.toml`: a decision prompt (`do you want to proceed?`,
-  `enter to select`, MCP `[ ]` checkboxes) confirmed by a cancel footer or a
-  selectable option, minus known false-positive screens (transcript viewer, model
-  picker). **Rendering is geometry-sensitive** — wrong cols/rows → garbled screen →
-  detection silently fails. We read the child's **live** terminal size from
+- Inputs we feed it: the **vt100-rendered screen** from the raw tail, plus the
+  last non-empty **OSC title** (`current_title`). **Rendering is
+  geometry-sensitive** — wrong cols/rows → garbled screen → detection silently
+  fails. We read the child's **live** terminal size from
   `/proc/<child_pid>/fd/0` via `TIOCGWINSZ` (falling back to meta, then 80×24).
+- The agent is identified from the recorded argv basename
+  (`identify_agent("claude")`), so any of herdr's ~18 supported agents (codex,
+  gemini, cursor, copilot, …) is detected if launched via `seagents run`.
+- **Rules self-update**: manifests are fetched from
+  `https://herdr.dev/agent-detection/index.toml` (shelling to `curl`), cached
+  under `~/.local/state/seagents/agent-detection/`, version-gated (never
+  downgrade, engine-version-checked). The HUD refreshes them in the background
+  at most daily; `seagents update-manifests` forces it. Local overrides:
+  `~/.config/seagents/agent-detection/<agent>.toml`.
 
 ### 4. `seagents focus` — jump to the agent's i3 window
 
@@ -194,8 +206,13 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 
 - **pty-tee, not screen-scraping** — can't read another process's PTY; pty-tee is
   terminal-agnostic. (kitty introspection was the alternative, no kitty here.)
-- **Rust** — so we *could* lift herdr's AGPL detector; in the end we wrote our own
-  detection, so **there is no herdr code in seagents** (see License below).
+- **Vendored herdr detection (2026-07-08)** — we first wrote our own rules, hit
+  the false-positive wall (chat text tripping "blocked"), and replaced them with
+  herdr's engine + manifests wholesale. Rationale: rules are maintained upstream
+  and self-update at runtime; only an engine-version bump (currently v2) ever
+  requires re-syncing the vendored code. **This commits seagents to
+  AGPL-3.0-or-later permanently** (LICENSE added; the "maybe relicense MIT"
+  option is gone). Re-sync procedure: `src/vendor/herdr_detect/VENDORED.md`.
 - **focus by recorded con_id** — the only reliable window handle given Terminator's
   shared PID and colliding idle titles.
 - **self-reaping cache** — a fully-exited agent isn't interesting; "idle" already
@@ -217,8 +234,18 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - **Mouse flicker on HUD preview** — with i3's default `mouse_warping output`, each
   preview warps the mouse to the agent's monitor and back. Setting `mouse_warping
   none` in i3 removes it, but that's a *global* i3 behavior change (undecided).
-- **Detection is Claude-Code-specific** — the OSC-title glyphs and `is_blocked`
-  rules are tuned for Claude Code. Other agents would need their own rules.
+- **Detection covers herdr's agent roster** — any agent with a bundled manifest
+  (claude, codex, gemini, cursor, copilot, …) is classified when launched via
+  `seagents run <agent>`; unrecognized commands show as ⚪ unknown.
+- **keyd `overload(meta, esc)` kills the HUD on `$mod`+drag** — mouse buttons
+  don't pass through keyd, so a capslock(meta)+mouse-drag counts as a *tap* and
+  emits Esc into the focused window on release; the HUD quits via its Esc
+  binding (looks like a crash, exit 0). Same stray Esc also interrupts a focused
+  Claude Code when dragging its window. Fix on each keyd machine:
+  `[global] overload_tap_timeout = 200` in `/etc/keyd/default.conf`, then
+  `keyd reload`. (Done on the laptop 2026-07-08; check other machines.) The HUD
+  additionally ignores an Esc that arrives with more input pending, so torn
+  mouse escape sequences can't fake a quit.
 
 ---
 
@@ -227,9 +254,8 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - **Verify** the con_id focus fix live (see Current Status).
 - Decide the **mouse_warping** question for the HUD preview.
 - **README.md** for the repo landing page (not written yet).
-- **License**: `Cargo.toml` says `AGPL-3.0-or-later` from when we planned to reuse
-  herdr's code. Since we didn't, AGPL is now *optional* — could relicense to
-  MIT/Apache. Decide before making the repo public.
+- ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
+  locks AGPL-3.0-or-later; LICENSE file added.
 - Sweep **orphan `.raw`** files that have no `.meta` (only pre-`meta`-era leftovers).
 - Optional: **eww** port of the HUD for a prettier always-on widget.
 - Optional: read **herdr's socket API** to fold herdr-hosted agents into the same
@@ -241,12 +267,18 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 
 ```bash
 cargo build            # or --release
-cargo test             # 9 unit tests (detect rules, title parsing, glyph strip)
+cargo test             # 50 tests (vendored engine + manifests, title parsing, glyph strip)
 cargo run -- status    # etc.
 
-# Tune blocked-detection against a real capture:
-seagents debug-screen ~/.cache/seagents/<pid>.raw <cols> <rows>
+# Inspect detection against a real capture (state + matched rule; --json for
+# the full evaluated-rule breakdown, like herdr's `agent explain`):
+seagents debug-screen ~/.cache/seagents/<pid>.raw <cols> <rows> [--json]
 # get <cols>/<rows> from: stty size < /proc/<child_pid>/fd/0
+# SEAGENTS_DEBUG=1 surfaces manifest-update warnings on stderr
+
+# Debug the HUD post-mortem (its terminal vanishes with it):
+SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud
+# appends every crossterm input event + the exit reason
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a

@@ -17,6 +17,7 @@ mod detect;
 mod focus;
 mod hud;
 mod status;
+mod vendor;
 
 fn main() {
     let mut args = std::env::args();
@@ -41,18 +42,78 @@ fn main() {
                 }
             }
         }
-        // Dev tool: render a .raw file and show the detector's verdict, for
-        // tuning detection against real captures.
+        // Dev tool: render a .raw file and show the detection engine's verdict
+        // (the equivalent of herdr's `agent explain`) for tuning against real
+        // captures. Add --json for the full evaluated-rule breakdown.
         Some("debug-screen") => {
-            let file = args.next().unwrap_or_default();
-            let cols: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(80);
-            let rows: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(24);
+            let mut file = String::new();
+            let mut dims: Vec<u16> = Vec::new();
+            let mut json = false;
+            let mut agent_name = "claude".to_string();
+            for a in args {
+                match a.as_str() {
+                    "--json" => json = true,
+                    s if s.starts_with("--agent=") => agent_name = s[8..].to_string(),
+                    s => match s.parse::<u16>() {
+                        Ok(n) => dims.push(n),
+                        Err(_) => file = s.to_string(),
+                    },
+                }
+            }
+            let cols = dims.first().copied().unwrap_or(80);
+            let rows = dims.get(1).copied().unwrap_or(24);
             let data = std::fs::read(&file).unwrap_or_default();
             let screen = detect::render(&data, rows, cols);
+            let title = status::current_title(&data).unwrap_or_default();
             println!("{screen}");
-            println!("\n---\nis_blocked = {}", detect::is_blocked(&screen));
+            let explain = match vendor::herdr_detect::parse_agent_label(&agent_name) {
+                Some(agent) => vendor::herdr_detect::manifest::explain_with_input(
+                    agent,
+                    vendor::herdr_detect::manifest::DetectionInput {
+                        screen: &screen,
+                        osc_title: &title,
+                        osc_progress: "",
+                    },
+                ),
+                None => {
+                    eprintln!("unknown agent {agent_name:?}");
+                    std::process::exit(2);
+                }
+            };
+            println!("\n---");
+            println!("osc_title = {title:?}");
+            println!(
+                "state = {} (manifest {} v{})",
+                vendor::herdr_detect::manifest::agent_state_label(explain.state),
+                explain
+                    .source
+                    .as_ref()
+                    .map(|s| s.kind())
+                    .unwrap_or("none"),
+                explain.manifest_version.as_deref().unwrap_or("?"),
+            );
+            match &explain.matched_rule {
+                Some(rule) => println!(
+                    "matched_rule = {} (priority {}, region {})",
+                    rule.id, rule.priority, rule.region
+                ),
+                None => println!(
+                    "matched_rule = none ({})",
+                    explain.fallback_reason.as_deref().unwrap_or("no fallback")
+                ),
+            }
+            if let Some(warning) = &explain.warning {
+                println!("warning = {warning}");
+            }
+            if json {
+                let value = vendor::herdr_detect::manifest::explain_to_json_value(&explain);
+                println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+            }
             std::process::exit(0);
         }
+        // Refresh detection manifests from herdr.dev right now (the HUD also
+        // does this in the background at most once a day).
+        Some("update-manifests") => std::process::exit(update_manifests_now()),
         Some("hud") | None => std::process::exit(hud::run()),
         Some("help") | Some("-h") | Some("--help") => {
             usage();
@@ -72,6 +133,54 @@ fn usage() {
     eprintln!("  seagents run <cmd> [args...]   launch an agent, teeing its output");
     eprintln!("  seagents status                show every tracked agent's state");
     eprintln!("  seagents focus <child_pid>     focus that agent's i3 window");
+    eprintln!("  seagents update-manifests      fetch fresh detection rules from herdr.dev");
+}
+
+/// Explicit `update-manifests`: fetch, report per-agent results, reload.
+fn update_manifests_now() -> i32 {
+    match vendor::herdr_detect::manifest_update::check_and_update() {
+        Ok(output) => {
+            if !output.updated.is_empty() {
+                vendor::herdr_detect::manifest::reload_manifests();
+            }
+            for (agent, remote) in &output.status.agents {
+                let version = remote.cached_version.as_deref().unwrap_or("-");
+                match &remote.last_error {
+                    Some(err) => println!("{agent:<10} {:<8} {version}  {err}", remote.last_result),
+                    None => println!("{agent:<10} {:<8} {version}", remote.last_result),
+                }
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("manifest update failed: {err}");
+            1
+        }
+    }
+}
+
+/// Background refresh for the HUD: at most once per day, silently.
+pub(crate) fn spawn_manifest_update() {
+    thread::spawn(|| {
+        let status = vendor::herdr_detect::manifest_update::load_status();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let fresh = status
+            .last_check_unix
+            .is_some_and(|t| now.saturating_sub(t) < 24 * 3600);
+        if fresh {
+            return;
+        }
+        if let Ok(output) = vendor::herdr_detect::manifest_update::check_and_update() {
+            if !output.updated.is_empty() {
+                // The manifest cache is behind an RwLock; the HUD's next poll
+                // picks up the new rules.
+                vendor::herdr_detect::manifest::reload_manifests();
+            }
+        }
+    });
 }
 
 /// Query the *outer* terminal's real size, including pixel dimensions, so the

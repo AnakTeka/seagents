@@ -1,11 +1,10 @@
-//! Milestone 2a: derive each tracked agent's state from its teed output.
+//! Milestone 2: derive each tracked agent's state from its teed output.
 //!
-//! For now we read only the OSC terminal-title stream, which Claude Code uses
-//! to broadcast its state: a braille spinner prefix means "working", a "✳ "
-//! prefix means "idle/done". This needs no terminal emulator — titles are just
-//! escape sequences in the raw stream. Detecting "blocked" (a permission prompt
-//! awaiting input) needs a rendered screen and herdr's manifest engine; that is
-//! milestone 2b.
+//! Classification is herdr's vendored manifest engine (see
+//! `vendor/herdr_detect/`): we render the raw tail into a screen via vt100,
+//! extract the current OSC title from the stream, and hand both to
+//! `detect_agent_with_osc()`. The engine's per-agent TOML rules (bundled, plus
+//! self-updating from herdr.dev) decide idle/working/blocked.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -35,6 +34,18 @@ impl State {
             State::Working => "🟡 working",
             State::Idle => "🟢 idle",
             State::Unknown => "⚪ unknown",
+        }
+    }
+}
+
+impl From<crate::vendor::herdr_detect::AgentState> for State {
+    fn from(state: crate::vendor::herdr_detect::AgentState) -> Self {
+        use crate::vendor::herdr_detect::AgentState;
+        match state {
+            AgentState::Blocked => State::Blocked,
+            AgentState::Working => State::Working,
+            AgentState::Idle => State::Idle,
+            AgentState::Unknown => State::Unknown,
         }
     }
 }
@@ -127,13 +138,12 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
                 .or_else(|| Some((v["rows"].as_u64()? as u16, v["cols"].as_u64()? as u16)))
                 .unwrap_or((24, 80));
             let screen = crate::detect::render(&buf, rows, cols);
-            // Blocked lives in the screen and must win over the title, which can
-            // still read "idle" while a prompt waits.
-            if crate::detect::is_blocked(&screen) {
-                State::Blocked
-            } else {
-                title_state(&buf)
-            }
+            let title = current_title(&buf).unwrap_or_default();
+            let agent = crate::vendor::herdr_detect::identify_agent(&cmd);
+            let detection = crate::vendor::herdr_detect::detect_agent_with_osc(
+                agent, &screen, &title, "",
+            );
+            State::from(detection.state)
         }
         None => State::Unknown,
     };
@@ -188,18 +198,9 @@ pub(crate) fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Classify by the most recent title that maps to a *known* state, so a
-/// transient empty/cleared title doesn't wipe out a real working/idle signal.
-fn title_state(data: &[u8]) -> State {
-    all_titles(data)
-        .iter()
-        .rev()
-        .map(|t| classify(t))
-        .find(|s| *s != State::Unknown)
-        .unwrap_or(State::Unknown)
-}
-
 /// The current window title: the most recent non-empty OSC title in the stream.
+/// Skipping empties matters for detection too: Claude clears the title
+/// transiently, and the engine's title rules should see the last real one.
 /// This is exactly what the terminal emulator mirrors into its X11 window title,
 /// so it's the handle seagents uses to locate the agent's i3 window.
 pub(crate) fn current_title(data: &[u8]) -> Option<String> {
@@ -257,26 +258,6 @@ fn all_titles(data: &[u8]) -> Vec<String> {
     titles
 }
 
-/// Map a Claude Code title to a state by its leading glyph.
-/// Braille spinner + space → working; "✳ " → idle/done.
-fn classify(title: &str) -> State {
-    let mut chars = title.chars();
-    let first = chars.next();
-    let second = chars.next();
-    if second == Some(' ') {
-        if let Some(c) = first {
-            let cp = c as u32;
-            if (0x2800..=0x28FF).contains(&cp) {
-                return State::Working;
-            }
-            if cp == 0x2733 {
-                return State::Idle;
-            }
-        }
-    }
-    State::Unknown
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,16 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn classifies_working_and_idle() {
-        assert!(matches!(classify("⠂ Claude Code"), State::Working));
-        assert!(matches!(classify("✳ Understand repo"), State::Idle));
-        assert!(matches!(classify("plain title"), State::Unknown));
-    }
-
-    #[test]
-    fn trailing_empty_title_falls_back_to_last_known() {
-        // working spinner, then Claude clears the title on exit → still "working"
+    fn current_title_skips_trailing_empty() {
+        // working spinner, then Claude clears the title → still the spinner title
         let data = b"\x1b]2;\xe2\xa0\x82 Claude Code\x07\x1b]2;\x07";
-        assert!(matches!(title_state(data), State::Working));
+        assert_eq!(current_title(data).as_deref(), Some("⠂ Claude Code"));
     }
 }
