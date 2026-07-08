@@ -24,6 +24,9 @@ use crate::status::{self, Session, State};
 const REFRESH: Duration = Duration::from_millis(750);
 
 pub fn run() -> i32 {
+    // Long-lived surface → good place to opportunistically refresh detection
+    // manifests (daily-throttled, background, silent).
+    crate::spawn_manifest_update();
     if enable_raw_mode().is_err() {
         eprintln!("seagents: the HUD needs a terminal (try `seagents status` instead)");
         return 1;
@@ -63,6 +66,24 @@ struct App {
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
+    // Debug aid: set SEAGENTS_HUD_LOG=<path> to append every input event the
+    // HUD receives (and why it exits) — the terminal vanishes with the process,
+    // so this is the only way to see what happened after the fact.
+    let mut log = std::env::var_os("SEAGENTS_HUD_LOG").and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
+    macro_rules! hud_log {
+        ($($arg:tt)*) => {
+            if let Some(f) = log.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        };
+    }
     let mut app = App {
         sessions: status::collect(),
         list: ListState::default(),
@@ -82,9 +103,27 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
 
         let timeout = REFRESH.saturating_sub(last_refresh.elapsed());
         if event::poll(timeout).unwrap_or(false) {
-            match event::read() {
+            let ev = event::read();
+            hud_log!("{ev:?}");
+            match ev {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return 0,
+                    KeyCode::Char('q') => {
+                        hud_log!("exit: quit key {:?}", k);
+                        return 0;
+                    }
+                    // A mouse report torn across a read boundary surfaces as a
+                    // bare Esc key (seen live during an i3 $mod+drag of the HUD
+                    // window). A human Esc arrives alone; a torn sequence has
+                    // its tail bytes right behind it — only quit when nothing
+                    // immediately follows.
+                    KeyCode::Esc => {
+                        if event::poll(Duration::from_millis(25)).unwrap_or(false) {
+                            hud_log!("ignored Esc: input pending (torn escape sequence)");
+                        } else {
+                            hud_log!("exit: quit key {:?}", k);
+                            return 0;
+                        }
+                    }
                     KeyCode::Down | KeyCode::Char('j') => move_selection(&mut app, 1),
                     KeyCode::Up | KeyCode::Char('k') => move_selection(&mut app, -1),
                     KeyCode::Enter => focus_selected(&mut app),
