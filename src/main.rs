@@ -31,6 +31,18 @@ fn main() {
             }
             std::process::exit(run(cmd));
         }
+        // Hidden: the in-PTY job-control anchor `run` wraps around the agent.
+        // The PTY session leader must not BE the agent: a lone process group in
+        // its own session is "orphaned" and the kernel silently discards the
+        // SIGTSTP it raises on Ctrl+Z. The anchor forks the agent into a second
+        // process group (de-orphaning it), then relays stops/exits upward.
+        Some("__lead") => {
+            let cmd: Vec<String> = args.collect();
+            if cmd.is_empty() {
+                std::process::exit(2);
+            }
+            std::process::exit(lead(cmd));
+        }
         Some("status") => std::process::exit(status::print()),
         Some("focus") => {
             let pid = args.next().and_then(|s| s.parse::<u64>().ok());
@@ -183,6 +195,72 @@ pub(crate) fn spawn_manifest_update() {
     });
 }
 
+/// The job-control anchor (`seagents __lead <cmd...>`), running as the inner
+/// PTY's session leader. It forks the agent into its own foreground process
+/// group — giving the agent a same-session parent so its Ctrl+Z SIGTSTP is
+/// *not* discarded under the orphaned-process-group rule — then mirrors the
+/// agent's lifecycle: agent stops → anchor stops itself (SIGSTOP, which cannot
+/// be discarded, so the wrapper's WUNTRACED wait sees it); anchor is resumed →
+/// it resumes the agent's group and nudges a repaint with SIGWINCH.
+fn lead(cmd: Vec<String>) -> i32 {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpgid(0, 0);
+            // Becoming the foreground group from a background one raises
+            // SIGTTOU; ignore it around the handoff.
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, libc::getpid());
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("seagents: failed to spawn {}: {e}", cmd[0]);
+            return 127;
+        }
+    };
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        // Also from the parent side, so the group exists before we wait on it
+        // regardless of who wins the fork/exec race.
+        libc::setpgid(pid, pid);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(0, pid);
+    }
+
+    loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return 1;
+        }
+        if libc::WIFSTOPPED(status) {
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+                // — resumed by the wrapper (the user ran `fg`) —
+                libc::kill(-pid, libc::SIGCONT);
+                libc::kill(-pid, libc::SIGWINCH);
+            }
+            continue;
+        }
+        if libc::WIFEXITED(status) {
+            return libc::WEXITSTATUS(status);
+        }
+        if libc::WIFSIGNALED(status) {
+            return 128 + libc::WTERMSIG(status);
+        }
+    }
+}
+
 /// Query the *outer* terminal's real size, including pixel dimensions, so the
 /// inner PTY matches it exactly (apps like image/graphics protocols care).
 fn terminal_size() -> PtySize {
@@ -276,9 +354,14 @@ fn run(cmd: Vec<String>) -> i32 {
         }
     };
 
-    // Build the child command, inheriting cwd and environment.
-    let mut builder = CommandBuilder::new(&cmd[0]);
-    for arg in &cmd[1..] {
+    // Build the child command, inheriting cwd and environment. The agent runs
+    // under the `__lead` anchor (see `lead()`): spawned directly it would be a
+    // lone, orphaned process group whose Ctrl+Z SIGTSTP the kernel discards.
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("seagents"));
+    let mut builder = CommandBuilder::new(exe);
+    builder.arg("__lead");
+    for arg in &cmd {
         builder.arg(arg);
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -388,10 +471,63 @@ fn run(cmd: Vec<String>) -> i32 {
         }
     }
 
-    // Block until the child exits, then restore the terminal.
-    let code = match child.wait() {
-        Ok(status) => status.exit_code() as i32,
-        Err(_) => 1,
+    // Block until the child exits, forwarding job control along the way.
+    // Claude (and other TUIs) implement Ctrl+Z by stopping themselves on the
+    // inner PTY — a plain wait() never sees that, so the wrapper would sit
+    // running while the child is frozen and the user's shell never gets its
+    // prompt back. Waiting with WUNTRACED mirrors the stop: restore the outer
+    // terminal, suspend ourselves (now the shell shows the job as suspended);
+    // when the user resumes us, re-enter raw mode, push the possibly-changed
+    // size, and continue the child.
+    let code = match child.process_id() {
+        Some(pid) => {
+            let pid = pid as libc::pid_t;
+            loop {
+                let mut status: libc::c_int = 0;
+                let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+                if r < 0 {
+                    if std::io::Error::last_os_error().kind()
+                        == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    break 1; // ECHILD: nothing left to wait for
+                }
+                if libc::WIFSTOPPED(status) {
+                    if raw {
+                        let _ = crossterm::terminal::disable_raw_mode();
+                    }
+                    unsafe { libc::raise(libc::SIGTSTP) };
+                    // — stopped here until the user resumes us (fg) —
+                    if raw {
+                        let _ = crossterm::terminal::enable_raw_mode();
+                    }
+                    let size = terminal_size();
+                    if let Ok(m) = master.lock() {
+                        let _ = m.resize(size);
+                    }
+                    // Continue the anchor; it in turn continues the agent's
+                    // process group (see `lead()`).
+                    unsafe {
+                        if libc::kill(-pid, libc::SIGCONT) != 0 {
+                            let _ = libc::kill(pid, libc::SIGCONT);
+                        }
+                    }
+                    continue;
+                }
+                if libc::WIFEXITED(status) {
+                    break libc::WEXITSTATUS(status);
+                }
+                if libc::WIFSIGNALED(status) {
+                    break 128 + libc::WTERMSIG(status);
+                }
+            }
+        }
+        // No pid (shouldn't happen post-spawn): fall back to a plain wait.
+        None => match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => 1,
+        },
     };
 
     // Let the output pump drain anything buffered before we tear down.

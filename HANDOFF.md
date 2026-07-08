@@ -132,6 +132,18 @@ PTY of a process you didn't spawn** (a kernel isolation, not a missing feature).
 The alternative was kitty's `@ get-text` introspection, rejected because the dev
 machine has no kitty (`TERM=xterm-256color`, Terminator).
 
+**Job control (Ctrl+Z) is forwarded, not passed through.** The agent does not run
+directly as the inner PTY's session leader: a lone process group in its own
+session is *orphaned*, and the kernel silently discards the SIGTSTP an agent
+raises on Ctrl+Z (this is why suspend "did nothing" before 2026-07-08). Instead
+`run` spawns a hidden anchor (`seagents __lead <cmd>`) as session leader, which
+forks the agent into its own foreground process group — de-orphaned, so Ctrl+Z
+stops it normally. The anchor mirrors the stop upward with `raise(SIGSTOP)`
+(not discardable); the wrapper waits with `WUNTRACED`, restores the outer
+terminal, and suspends itself, so your shell shows the job as `Stopped`. `fg`
+unwinds the chain: wrapper re-raws + resizes, continues the anchor, anchor
+continues the agent's group and nudges a repaint with SIGWINCH.
+
 ### 2. Data model — `~/.cache/seagents/`
 
 Per session, keyed by the wrapper's pid:
@@ -141,7 +153,7 @@ Per session, keyed by the wrapper's pid:
   ```json
   {
     "wrapper_pid": 1437882,
-    "child_pid": 1437883,          // the actual claude process
+    "child_pid": 1437883,          // the __lead anchor (agent's parent, same lifetime, same tty)
     "cwd": "/home/me/.../homelab", // launch cwd = grouping key (like herdr)
     "argv": ["claude"],
     "started": 1783468316,
