@@ -55,6 +55,10 @@ pub(crate) struct Session {
     pub(crate) dir: String,
     pub(crate) cmd: String,
     pub(crate) pid: u64,
+    /// Seconds since the agent last produced output (the `.raw` tee mtime).
+    /// An idle agent emits nothing, so this is "idle for"; for a blocked agent
+    /// it's how long it has been waiting on the user.
+    pub(crate) quiet_secs: u64,
 }
 
 /// Gather every tracked session, sorted most-urgent first. Shared by the
@@ -73,7 +77,10 @@ pub(crate) fn collect() -> Vec<Session> {
             }
         }
     }
-    sessions.sort_by_key(|s| (s.state.rank(), s.dir.clone()));
+    // Alphabetical by directory so agents sharing a cwd sit together; urgency
+    // (blocked > working > idle) orders within a group, colors still flag
+    // blocked rows at a glance.
+    sessions.sort_by_key(|s| (s.dir.clone(), s.state.rank(), s.pid));
     sessions
 }
 
@@ -89,11 +96,11 @@ pub fn print() -> i32 {
     let cmd_w = sessions.iter().map(|s| s.cmd.len()).max().unwrap_or(3).max(3);
     for s in &sessions {
         println!(
-            "{:<11}  {:<dw$}  {:<cw$}  {}",
+            "{:<11}  {:<dw$}  {:<cw$}  {:>6}",
             s.state.badge(),
             s.dir,
             s.cmd,
-            s.pid,
+            humanize_secs(s.quiet_secs),
             dw = dir_w,
             cw = cmd_w,
         );
@@ -148,12 +155,39 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         None => State::Unknown,
     };
 
+    // Last-output age from the tee file's mtime — cheap and already accurate:
+    // the pump flushes on every chunk, and quiet agents write nothing.
+    let quiet_secs = std::fs::metadata(&raw)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     Some(Session {
         state,
         dir: basename(cwd),
         cmd,
         pid: child_pid.unwrap_or(wrapper_pid),
+        quiet_secs,
     })
+}
+
+/// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
+pub(crate) fn humanize_secs(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => {
+            let m = (secs % 3600) / 60;
+            if m == 0 {
+                format!("{}h", secs / 3600)
+            } else {
+                format!("{}h{m:02}m", secs / 3600)
+            }
+        }
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 fn basename(p: &str) -> String {
