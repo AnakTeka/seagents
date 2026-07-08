@@ -127,6 +127,7 @@ fn write_meta(
     cwd: &std::path::Path,
     argv: &[String],
     size: &PtySize,
+    con_id: Option<u64>,
 ) {
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -141,6 +142,9 @@ fn write_meta(
         // Geometry so the daemon can re-render the raw stream at the right size.
         "cols": size.cols,
         "rows": size.rows,
+        // The i3 window this agent runs in, captured at launch — the reliable
+        // handle for focus (titles can collide between idle agents).
+        "con_id": con_id,
     });
     if let Ok(s) = serde_json::to_string_pretty(&meta) {
         let _ = fs::write(path, s);
@@ -148,6 +152,10 @@ fn write_meta(
 }
 
 fn run(cmd: Vec<String>) -> i32 {
+    // Capture the launching terminal's i3 window up front, while it's still the
+    // focused window (the user just typed the command into it).
+    let con_id = focus::focused_terminal_con_id();
+
     let size = terminal_size();
 
     let pty_system = native_pty_system();
@@ -200,7 +208,7 @@ fn run(cmd: Vec<String>) -> i32 {
     let (raw_path, meta_path) = session_paths();
     let tee = File::create(&raw_path).ok();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size);
+    write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size, con_id);
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
         eprintln!("seagents: teeing to {}", raw_path.display());
     }

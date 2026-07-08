@@ -24,9 +24,19 @@ pub fn focus(child_pid: u64) -> i32 {
 /// Locate and focus the agent's i3 window, returning a human-readable error
 /// instead of printing — so callers like the HUD stay in control of the screen.
 pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
-    let raw =
-        raw_for_child(child_pid).ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
+    let (meta, raw) = session_for_child(child_pid)
+        .ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
 
+    // Preferred: the exact i3 window recorded at launch. Unambiguous even when
+    // several agents share an identical title (e.g. idle "✳ Claude Code").
+    if let Some(con_id) = meta["con_id"].as_u64() {
+        if i3_focus(con_id) {
+            return Ok(());
+        }
+        // Recorded window is gone (or moved handlers) — fall through to title.
+    }
+
+    // Fallback for sessions launched before con_id was recorded: match by title.
     let title = crate::status::read_tail(&raw, 256 * 1024)
         .as_deref()
         .and_then(crate::status::current_title)
@@ -34,8 +44,6 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
     let want = core_title(&title);
 
     let windows = i3_windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
-
-    // Prefer terminal-class windows when several titles collide.
     let mut matches: Vec<&Win> = windows
         .iter()
         .filter(|w| core_title(&w.title) == want)
@@ -53,22 +61,74 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
     }
 }
 
-/// Find the `.raw` path for the session whose child pid matches.
-fn raw_for_child(child_pid: u64) -> Option<PathBuf> {
+/// Reveal the agent's window on its monitor, then hand focus straight back to
+/// `return_to` (the HUD) so the user keeps navigating. `i3-msg focus` switches
+/// the target output to the agent's workspace; refocusing the HUD leaves that
+/// output showing the agent while input stays on the HUD.
+pub(crate) fn preview_window(child_pid: u64, return_to: Option<u64>) -> Result<(), String> {
+    focus_window(child_pid)?;
+    if let Some(id) = return_to {
+        i3_focus(id);
+    }
+    Ok(())
+}
+
+/// The con_id of the currently focused window (used to remember the HUD so we
+/// can return focus to it after a preview).
+pub(crate) fn focused_con_id() -> Option<u64> {
+    focused_node().and_then(|n| n["id"].as_u64())
+}
+
+/// The focused window's con_id, but only if it's a terminal-class window.
+/// `seagents run` calls this at launch to record which window an agent lives in;
+/// the terminal guard filters out dialogs/browsers that may momentarily hold
+/// focus, so we never record the wrong window.
+pub(crate) fn focused_terminal_con_id() -> Option<u64> {
+    let node = focused_node()?;
+    let is_window = node.get("window").and_then(|w| w.as_u64()).is_some();
+    let class = node["window_properties"]["class"].as_str().unwrap_or("");
+    (is_window && looks_like_terminal(class)).then(|| node["id"].as_u64())?
+}
+
+fn focused_node() -> Option<serde_json::Value> {
+    let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
+    let tree: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    find_focused(&tree).cloned()
+}
+
+fn find_focused(node: &serde_json::Value) -> Option<&serde_json::Value> {
+    if node["focused"].as_bool() == Some(true) {
+        return Some(node);
+    }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(children) = node[key].as_array() {
+            for child in children {
+                if let Some(found) = find_focused(child) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Look up a session's meta and `.raw` path by child pid.
+fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
     let dir = crate::cache_dir();
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("meta") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).ok()?;
-        let v: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
         };
         if v["child_pid"].as_u64() == Some(child_pid) {
             let wrapper_pid = v["wrapper_pid"].as_u64()?;
-            return Some(dir.join(format!("{wrapper_pid}.raw")));
+            return Some((v, dir.join(format!("{wrapper_pid}.raw"))));
         }
     }
     None

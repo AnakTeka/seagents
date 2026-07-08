@@ -57,14 +57,18 @@ struct App {
     message: String,
     /// Screen y of the first agent row, cached each frame for mouse hit-testing.
     rows_top: u16,
+    /// con_id of the HUD's own window, so previews can return focus to it.
+    /// Captured lazily on the first preview, when the HUD is definitely focused.
+    hud_con_id: Option<u64>,
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
     let mut app = App {
         sessions: status::collect(),
         list: ListState::default(),
-        message: "enter/click to focus · r refresh · q quit".to_string(),
+        message: "j/k preview · enter jump · r refresh · q quit".to_string(),
         rows_top: 1,
+        hud_con_id: None,
     };
     if !app.sessions.is_empty() {
         app.list.select(Some(0));
@@ -133,6 +137,27 @@ fn move_selection(app: &mut App, delta: isize) {
     let cur = app.list.selected().unwrap_or(0) as isize;
     let next = (cur + delta).rem_euclid(n as isize) as usize;
     app.list.select(Some(next));
+    preview_selected(app);
+}
+
+/// Reveal the highlighted agent's window on its monitor while keeping keyboard
+/// focus on the HUD, so navigation doubles as a live preview.
+fn preview_selected(app: &mut App) {
+    // Capture the HUD's window the first time — right now it's focused, since
+    // the user is driving the HUD.
+    if app.hud_con_id.is_none() {
+        app.hud_con_id = crate::focus::focused_con_id();
+    }
+    let Some(i) = app.list.selected() else {
+        return;
+    };
+    let Some(s) = app.sessions.get(i) else {
+        return;
+    };
+    match crate::focus::preview_window(s.pid, app.hud_con_id) {
+        Ok(()) => app.message = format!("previewing {} · enter to jump", s.dir),
+        Err(e) => app.message = e,
+    }
 }
 
 fn focus_selected(app: &mut App) {
