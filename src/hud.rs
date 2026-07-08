@@ -87,7 +87,11 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
     let mut app = App {
         sessions: status::collect(),
         list: ListState::default(),
-        message: "j/k preview · enter jump · r refresh · q quit".to_string(),
+        // Surface detection-rule update problems where they'll be seen; the
+        // help line is one keypress away from rediscovery.
+        message: crate::manifest_health_warning()
+            .map(|w| format!("⚠ {w}"))
+            .unwrap_or_else(|| "j/k preview · enter jump · r refresh · q quit".to_string()),
         rows_top: 1,
         hud_con_id: None,
     };
@@ -270,7 +274,7 @@ fn session_row(s: &Session) -> ListItem<'static> {
     let color = state_color(s.state);
     let line = Line::from(vec![
         Span::styled("● ", Style::default().fg(color)),
-        Span::styled(format!("{:<8}", state_word(s.state)), Style::default().fg(color)),
+        Span::styled(format!("{:<8}", s.state.word()), Style::default().fg(color)),
         Span::raw("  "),
         Span::styled(
             format!("{:<16}", truncate(&s.dir, 16)),
@@ -297,16 +301,6 @@ fn state_color(state: State) -> Color {
         State::Working => Color::Yellow,
         State::Idle => Color::Green,
         State::Unknown => Color::Gray,
-    }
-}
-
-fn state_word(state: State) -> &'static str {
-    // Reuse the badge text without its emoji prefix.
-    match state {
-        State::Blocked => "blocked",
-        State::Working => "working",
-        State::Idle => "idle",
-        State::Unknown => "unknown",
     }
 }
 

@@ -84,7 +84,8 @@ seagents itself is terminal-agnostic.
 ```
 seagents [hud]              floating agent HUD (also the default with no args)
 seagents run <cmd> [args]   launch an agent, teeing its output (this is how tracking happens)
-seagents status            one-shot table of every tracked agent's state
+seagents status [--json]   one-shot table of every tracked agent's state
+                           (--json: machine-readable, for eww/widget frontends)
 seagents focus <child_pid> focus that agent's i3 window
 seagents update-manifests  fetch fresh detection rules from herdr.dev now
 seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
@@ -291,6 +292,10 @@ cargo run -- status    # etc.
 seagents debug-screen ~/.cache/seagents/<pid>.raw <cols> <rows> [--json]
 # get <cols>/<rows> from: stty size < /proc/<child_pid>/fd/0
 # SEAGENTS_DEBUG=1 surfaces manifest-update warnings on stderr
+
+# Regression-test the Ctrl+Z suspend/resume chain headlessly (scripted pty
+# driving an interactive bash — run after touching run()/lead()/the pumps):
+python3 tools/test-jobctl.py
 
 # Debug the HUD post-mortem (its terminal vanishes with it):
 SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud

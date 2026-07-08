@@ -36,6 +36,15 @@ impl State {
             State::Unknown => "⚪ unknown",
         }
     }
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            State::Blocked => "blocked",
+            State::Working => "working",
+            State::Idle => "idle",
+            State::Unknown => "unknown",
+        }
+    }
 }
 
 impl From<crate::vendor::herdr_detect::AgentState> for State {
@@ -51,8 +60,14 @@ impl From<crate::vendor::herdr_detect::AgentState> for State {
 }
 
 pub(crate) struct Session {
+    /// Stable session id (the wrapper's pid — the cache-file key). External
+    /// consumers should treat it as opaque; a future herdr-socket source will
+    /// mint ids that are not pids.
+    pub(crate) id: u64,
     pub(crate) state: State,
     pub(crate) dir: String,
+    /// Full launch cwd (dir is its basename).
+    pub(crate) cwd: String,
     pub(crate) cmd: String,
     pub(crate) pid: u64,
     /// Seconds since the agent last produced output (the `.raw` tee mtime).
@@ -105,6 +120,35 @@ pub fn print() -> i32 {
             cw = cmd_w,
         );
     }
+    if let Some(warning) = crate::manifest_health_warning() {
+        eprintln!("⚠ {warning}");
+    }
+    0
+}
+
+/// `seagents status --json`: machine-readable session list, one array on
+/// stdout. This is the integration surface for widget frontends (eww etc.):
+/// poll this, render rows, and wire clicks to `seagents focus <pid>`.
+pub fn print_json() -> i32 {
+    let sessions = collect();
+    let arr: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "state": s.state.word(),
+                "dir": s.dir,
+                "cwd": s.cwd,
+                "cmd": s.cmd,
+                "pid": s.pid,
+                "quiet_secs": s.quiet_secs,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into())
+    );
     0
 }
 
@@ -165,8 +209,10 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         .unwrap_or(0);
 
     Some(Session {
+        id: wrapper_pid,
         state,
         dir: basename(cwd),
+        cwd: cwd.to_string(),
         cmd,
         pid: child_pid.unwrap_or(wrapper_pid),
         quiet_secs,

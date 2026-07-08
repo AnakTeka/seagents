@@ -43,7 +43,14 @@ fn main() {
             }
             std::process::exit(lead(cmd));
         }
-        Some("status") => std::process::exit(status::print()),
+        Some("status") => match args.next().as_deref() {
+            Some("--json") => std::process::exit(status::print_json()),
+            None => std::process::exit(status::print()),
+            Some(_) => {
+                eprintln!("usage: seagents status [--json]");
+                std::process::exit(2);
+            }
+        },
         Some("focus") => {
             let pid = args.next().and_then(|s| s.parse::<u64>().ok());
             match pid {
@@ -143,7 +150,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  seagents [hud]                 the floating agent HUD (default)");
     eprintln!("  seagents run <cmd> [args...]   launch an agent, teeing its output");
-    eprintln!("  seagents status                show every tracked agent's state");
+    eprintln!("  seagents status [--json]       show every tracked agent's state");
     eprintln!("  seagents focus <child_pid>     focus that agent's i3 window");
     eprintln!("  seagents update-manifests      fetch fresh detection rules from herdr.dev");
 }
@@ -205,6 +212,37 @@ pub(crate) fn spawn_manifest_update() {
             }
         }
     });
+}
+
+/// One line of manifest-update health for the HUD footer / status output —
+/// the vendored engine only improves while updates apply, and a persistent
+/// failure (worst case: manifests requiring a newer engine after an upstream
+/// bump) would otherwise rot silently behind SEAGENTS_DEBUG.
+pub(crate) fn manifest_health_warning() -> Option<String> {
+    let status = vendor::herdr_detect::manifest_update::load_status();
+    let failing: Vec<&String> = status
+        .agents
+        .iter()
+        .filter(|(_, s)| s.last_result == "failed")
+        .map(|(agent, _)| agent)
+        .collect();
+    if failing.is_empty() {
+        return None;
+    }
+    let engine_drift = status.agents.values().any(|s| {
+        s.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("requires engine"))
+    });
+    Some(if engine_drift {
+        "detection rules need a newer engine — re-sync src/vendor/herdr_detect (see VENDORED.md)"
+            .to_string()
+    } else {
+        format!(
+            "manifest update failing for {} agent(s) — try `seagents update-manifests`",
+            failing.len()
+        )
+    })
 }
 
 /// The job-control anchor (`seagents __lead <cmd...>`), running as the inner
@@ -350,6 +388,41 @@ fn write_meta(
     }
 }
 
+/// Shrink an oversized tee file to its last ~1 MB (all detection ever reads),
+/// atomically: write the tail to a sibling temp file, rename it over the
+/// original — readers see the old or the new file, never a torn one — and
+/// return a fresh append handle. vt100 replay tolerates starting mid-stream:
+/// the next full repaint converges the grid.
+fn rotate_tee(path: &std::path::Path) -> Option<File> {
+    let tail = status::read_tail(path, 1024 * 1024)?;
+    let tmp = path.with_extension("raw.tmp");
+    fs::write(&tmp, &tail).ok()?;
+    fs::rename(&tmp, path).ok()?;
+    fs::OpenOptions::new().append(true).open(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rotate_tee_keeps_the_tail() {
+        let dir = std::env::temp_dir().join(format!("seagents-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.raw");
+        // 3 MB of 'a' then a recognizable 16-byte tail marker.
+        let mut data = vec![b'a'; 3 * 1024 * 1024];
+        data.extend_from_slice(b"TAIL-MARKER-HERE");
+        std::fs::write(&path, &data).unwrap();
+
+        let handle = super::rotate_tee(&path).expect("rotation should succeed");
+        drop(handle);
+
+        let rotated = std::fs::read(&path).unwrap();
+        assert_eq!(rotated.len(), 1024 * 1024);
+        assert!(rotated.ends_with(b"TAIL-MARKER-HERE"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 fn run(cmd: Vec<String>) -> i32 {
     // Capture the launching terminal's i3 window up front, while it's still the
     // focused window (the user just typed the command into it).
@@ -422,10 +495,19 @@ fn run(cmd: Vec<String>) -> i32 {
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
 
     // Output pump: master -> stdout (+ tee). This owns the "T-junction".
+    let tee_path = raw_path.clone();
     let reader_handle = thread::spawn(move || {
         let mut out = std::io::stdout();
         let mut tee = tee;
         let mut buf = [0u8; 8192];
+        // Rotation bookkeeping: the tee is the only unbounded file in the
+        // system (Claude repaints constantly; multi-day sessions reach
+        // hundreds of MB). Detection only ever reads the last ~1 MB, so once
+        // the file passes the cap we rewrite it keeping just that tail.
+        // Checked every CHECK_EVERY bytes written, not per chunk.
+        const ROTATE_AT: u64 = 16 * 1024 * 1024;
+        const CHECK_EVERY: u64 = 4 * 1024 * 1024;
+        let mut since_check: u64 = 0;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -438,6 +520,17 @@ fn run(cmd: Vec<String>) -> i32 {
                     if let Some(f) = tee.as_mut() {
                         let _ = f.write_all(data);
                         let _ = f.flush();
+                        since_check += n as u64;
+                        if since_check >= CHECK_EVERY {
+                            since_check = 0;
+                            let oversize =
+                                f.metadata().map(|m| m.len() > ROTATE_AT).unwrap_or(false);
+                            if oversize {
+                                if let Some(rotated) = rotate_tee(&tee_path) {
+                                    tee = Some(rotated);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
