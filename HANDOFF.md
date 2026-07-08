@@ -133,6 +133,14 @@ PTY of a process you didn't spawn** (a kernel isolation, not a missing feature).
 The alternative was kitty's `@ get-text` introspection, rejected because the dev
 machine has no kitty (`TERM=xterm-256color`, Terminator).
 
+**Desktop notifications on transitions.** The wrapper's monitor thread fires
+`notify-send` when its agent finishes (working → idle, normal urgency) or
+starts waiting on input (→ blocked, critical urgency) — suppressed while the
+agent's own i3 window is focused (you're already looking at it; tabs sharing
+one window/con_id are all treated as focused). `SEAGENTS_NO_NOTIFY=1`
+disables. herdr does this with OSC 9/99 terminal-native notifications, which
+Terminator/VTE doesn't support — hence notify-send.
+
 **Job control (Ctrl+Z) is forwarded, not passed through.** The agent does not run
 directly as the inner PTY's session leader: a lone process group in its own
 session is *orphaned*, and the kernel silently discards the SIGTSTP an agent

@@ -245,6 +245,47 @@ pub(crate) fn manifest_health_warning() -> Option<String> {
     })
 }
 
+/// Desktop notification for a state transition worth interrupting the user
+/// for: the agent finished (working → idle) or is waiting on input
+/// (→ blocked). Suppressed while the agent's own window is focused — the
+/// user is already looking at it (same idea as herdr's focus-aware
+/// notifications; mechanism differs since Terminator supports neither OSC 9
+/// nor OSC 99, so we shell out to notify-send). SEAGENTS_NO_NOTIFY=1 disables.
+fn notify_transition(
+    prev: status::State,
+    state: status::State,
+    dir: &str,
+    cmd: &str,
+    con_id: Option<u64>,
+) {
+    use status::State;
+    if std::env::var_os("SEAGENTS_NO_NOTIFY").is_some() {
+        return;
+    }
+    let (summary, body, urgency) = match (prev, state) {
+        (State::Working, State::Idle) => (
+            format!("{cmd} · {dir} — done"),
+            "finished and waiting at the prompt".to_string(),
+            "normal",
+        ),
+        (p, State::Blocked) if p != State::Blocked && p != State::Unknown => (
+            format!("{cmd} · {dir} — needs you"),
+            "waiting for your input".to_string(),
+            "critical",
+        ),
+        _ => return,
+    };
+    if con_id.is_some() && focus::focused_con_id() == con_id {
+        return;
+    }
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "seagents", "-u", urgency, "-t", "8000", &summary, &body])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// The job-control anchor (`seagents __lead <cmd...>`), running as the inner
 /// PTY's session leader. It forks the agent into its own foreground process
 /// group — giving the agent a same-session parent so its Ctrl+Z SIGTSTP is
@@ -592,19 +633,36 @@ fn run(cmd: Vec<String>) -> i32 {
             .and_then(|s| s.to_str())
             .unwrap_or(&cmd[0])
             .to_string();
+        let dir0 = cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
         thread::spawn(move || {
             // No new output ⇒ no state change (even resizes repaint), so skip
             // the vt100 render entirely while the tee is unchanged. This is
             // what makes an idle agent's monitor cost ~zero instead of a
             // permanent ~1% of a core re-detecting the same bytes.
             let mut last_seen: Option<(u64, std::time::SystemTime)> = None;
+            // In-memory previous state for transition notifications — kept
+            // separate from the sidecar on purpose: another observer (an open
+            // HUD) may stamp the sidecar first, but the notification decision
+            // must always be made from this wrapper's own observations.
+            let mut prev: Option<status::State> = None;
             loop {
                 let seen = fs::metadata(&raw_path)
                     .ok()
                     .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
                 if seen.is_none() || seen != last_seen {
                     last_seen = seen;
-                    status::track_session(&raw_path, &state_path, &cmd0, anchor_pid);
+                    if let Some(state) =
+                        status::track_session(&raw_path, &state_path, &cmd0, anchor_pid)
+                    {
+                        if let Some(prev) = prev {
+                            notify_transition(prev, state, &dir0, &cmd0, con_id);
+                        }
+                        prev = Some(state);
+                    }
                 }
                 thread::sleep(std::time::Duration::from_secs(2));
             }

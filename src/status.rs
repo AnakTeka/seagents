@@ -268,11 +268,15 @@ fn unix_now() -> u64 {
 /// One detection pass over our *own* session, for the wrapper's monitor
 /// thread: re-classify from the teed tail and stamp the sidecar on
 /// transitions. This is what keeps "idle for" truthful while no HUD or
-/// status invocation is watching.
-pub(crate) fn track_session(raw: &Path, state_path: &Path, cmd: &str, child_pid: u64) {
-    let Some(buf) = read_tail(raw, 1024 * 1024) else {
-        return;
-    };
+/// status invocation is watching. Returns the detected state so the caller
+/// can react to transitions (notifications).
+pub(crate) fn track_session(
+    raw: &Path,
+    state_path: &Path,
+    cmd: &str,
+    child_pid: u64,
+) -> Option<State> {
+    let buf = read_tail(raw, 1024 * 1024)?;
     let (rows, cols) = live_pty_size(child_pid).unwrap_or((24, 80));
     let screen = crate::detect::render(&buf, rows, cols);
     let title = current_title(&buf).unwrap_or_default();
@@ -281,6 +285,7 @@ pub(crate) fn track_session(raw: &Path, state_path: &Path, cmd: &str, child_pid:
         crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
     );
     observe_state(state_path, state, unix_now());
+    Some(state)
 }
 
 /// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
