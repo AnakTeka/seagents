@@ -235,16 +235,27 @@ fn observe_state(path: &Path, state: State, now: u64) -> u64 {
     let prev: Option<serde_json::Value> = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
-    match prev {
-        Some(p) if p["state"].as_str() == Some(state.word()) => {
-            p["since"].as_u64().unwrap_or(now)
+    if let Some(p) = &prev {
+        let prev_state = p["state"].as_str();
+        if prev_state == Some(state.word()) {
+            return p["since"].as_u64().unwrap_or(now);
         }
-        _ => {
-            let record = serde_json::json!({ "state": state.word(), "since": now });
-            let _ = std::fs::write(path, record.to_string());
-            now
+        // A transient Unknown sample (a render caught mid-repaint, e.g. the
+        // focus-in repaint a HUD preview triggers) must not reset a known
+        // state's clock. Only a definite state replaces a definite state.
+        if state == State::Unknown && prev_state.is_some_and(|s| s != "unknown") {
+            return p["since"].as_u64().unwrap_or(now);
         }
     }
+    // Atomic tmp+rename so a concurrent reader never sees a half-written
+    // record; pid-suffixed so the wrapper monitor and a HUD poll can't
+    // stomp each other's tmp file.
+    let record = serde_json::json!({ "state": state.word(), "since": now }).to_string();
+    let tmp = path.with_extension(format!("state.tmp{}", std::process::id()));
+    if std::fs::write(&tmp, &record).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    now
 }
 
 fn unix_now() -> u64 {
@@ -406,5 +417,22 @@ mod tests {
         // working spinner, then Claude clears the title → still the spinner title
         let data = b"\x1b]2;\xe2\xa0\x82 Claude Code\x07\x1b]2;\x07";
         assert_eq!(current_title(data).as_deref(), Some("⠂ Claude Code"));
+    }
+
+    #[test]
+    fn observe_state_keeps_clock_through_transient_unknown() {
+        let dir = std::env::temp_dir().join(format!("seagents-observe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.state");
+
+        assert_eq!(observe_state(&path, State::Idle, 100), 100);
+        // A mid-repaint Unknown sample must not reset the idle clock…
+        assert_eq!(observe_state(&path, State::Unknown, 150), 100);
+        assert_eq!(observe_state(&path, State::Idle, 200), 100);
+        // …but a real transition does.
+        assert_eq!(observe_state(&path, State::Blocked, 250), 250);
+        assert_eq!(observe_state(&path, State::Blocked, 300), 250);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

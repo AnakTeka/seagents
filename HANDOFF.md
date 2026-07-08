@@ -154,9 +154,12 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.state`** — last observed state transition
   (`{"state": "idle", "since": <unix>}`); powers the "idle for / waiting for"
   column. **Maintained by the wrapper itself** (a monitor thread re-detects
-  its own agent every 2s), so durations stay truthful with no HUD open;
-  HUD/status polls only write it as a fallback for sessions from pre-monitor
-  wrappers. Transition-based on purpose: output age can't work because a
+  its own agent every 2s, skipping the pass while the tee is unchanged), so
+  durations stay truthful with no HUD open. HUD/status polls also write it
+  whenever their own detection disagrees — the writers race benignly on
+  transitions (both stamp since≈now; writes are atomic tmp+rename, and a
+  transient Unknown never overwrites a known state).
+  Transition-based on purpose: output age can't work because a
   focused Claude repaints on the terminal's focus-in report, which would
   reset the clock every time the HUD previews a window.
 - **`<wrapper_pid>.meta`** — JSON identity:

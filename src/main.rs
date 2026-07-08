@@ -581,7 +581,10 @@ fn run(cmd: Vec<String>) -> i32 {
     // guaranteed to live exactly as long as the agent, so this keeps
     // "idle for / waiting for" truthful even when no HUD or status poll is
     // watching — opening the HUD hours later shows the real durations.
-    {
+    // (Guarded on a known pid: without one, geometry lookups would fail
+    // forever and the monitor would misclassify at 80x24 while other
+    // observers disagree — better no monitor than a flapping one.)
+    if let Some(anchor_pid) = child.process_id().map(u64::from) {
         let raw_path = raw_path.clone();
         let state_path = raw_path.with_extension("state");
         let cmd0 = std::path::Path::new(&cmd[0])
@@ -589,10 +592,22 @@ fn run(cmd: Vec<String>) -> i32 {
             .and_then(|s| s.to_str())
             .unwrap_or(&cmd[0])
             .to_string();
-        let anchor_pid = child.process_id().map(u64::from).unwrap_or(0);
-        thread::spawn(move || loop {
-            status::track_session(&raw_path, &state_path, &cmd0, anchor_pid);
-            thread::sleep(std::time::Duration::from_secs(2));
+        thread::spawn(move || {
+            // No new output ⇒ no state change (even resizes repaint), so skip
+            // the vt100 render entirely while the tee is unchanged. This is
+            // what makes an idle agent's monitor cost ~zero instead of a
+            // permanent ~1% of a core re-detecting the same bytes.
+            let mut last_seen: Option<(u64, std::time::SystemTime)> = None;
+            loop {
+                let seen = fs::metadata(&raw_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
+                if seen.is_none() || seen != last_seen {
+                    last_seen = seen;
+                    status::track_session(&raw_path, &state_path, &cmd0, anchor_pid);
+                }
+                thread::sleep(std::time::Duration::from_secs(2));
+            }
         });
     }
 
