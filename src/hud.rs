@@ -297,13 +297,13 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     if app.sessions.is_empty() {
         let empty = Paragraph::new("no agents tracked — launch one with `seagents run claude`")
-            .block(agent_block())
+            .block(agent_block(app.sort))
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, body);
     } else {
         let items: Vec<ListItem> = app.sessions.iter().map(session_row).collect();
         let list = List::new(items)
-            .block(agent_block())
+            .block(agent_block(app.sort))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▶ ");
         f.render_stateful_widget(list, body, &mut app.list);
@@ -313,10 +313,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(footer, chunks[1]);
 }
 
-fn agent_block() -> Block<'static> {
+fn agent_block(sort: status::Sort) -> Block<'static> {
+    use ratatui::widgets::block::Title;
     Block::default()
         .borders(Borders::ALL)
         .title(" seagents ")
+        // Persistent sort indicator, top-right — the footer flash on `s` is
+        // gone by the next message, this isn't.
+        .title(
+            Title::from(Line::from(Span::styled(
+                format!(" {} ", sort.word()),
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(Alignment::Right),
+        )
 }
 
 fn session_row(s: &Session) -> ListItem<'static> {
