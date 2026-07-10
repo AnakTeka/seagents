@@ -84,8 +84,11 @@ seagents itself is terminal-agnostic.
 ```
 seagents [hud]              floating agent HUD (also the default with no args)
 seagents run <cmd> [args]   launch an agent, teeing its output (this is how tracking happens)
-seagents status [--json]   one-shot table of every tracked agent's state
-                           (--json: machine-readable, for eww/widget frontends)
+seagents status [--json] [--sort=urgency|dir|recent]
+                           one-shot table of every tracked agent's state
+                           (--json: machine-readable, for eww/widget frontends;
+                            sorts: urgency = triage, longest-waiting first;
+                            dir = grouped by cwd; recent = latest change first)
 seagents focus <child_pid> focus that agent's i3 window
 seagents update-manifests  fetch fresh detection rules from herdr.dev now
 seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
@@ -94,6 +97,7 @@ seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
 
 HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
 keep focus on HUD); `Enter`/left-click = **jump** (commit focus to the agent);
+`s` = cycle sort (urgency → dir → recent; remembered across launches);
 `r` = refresh now; `q`/`Esc` = quit.
 
 ---

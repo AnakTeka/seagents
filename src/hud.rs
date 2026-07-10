@@ -57,6 +57,7 @@ pub fn run() -> i32 {
 struct App {
     sessions: Vec<Session>,
     list: ListState,
+    sort: status::Sort,
     message: String,
     /// Screen y of the first agent row, cached each frame for mouse hit-testing.
     rows_top: u16,
@@ -84,14 +85,16 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
             }
         };
     }
+    let sort = load_sort();
     let mut app = App {
-        sessions: status::collect(),
+        sessions: status::collect(sort),
         list: ListState::default(),
+        sort,
         // Surface detection-rule update problems where they'll be seen; the
         // help line is one keypress away from rediscovery.
         message: crate::manifest_health_warning()
             .map(|w| format!("⚠ {w}"))
-            .unwrap_or_else(|| "j/k preview · enter jump · r refresh · q quit".to_string()),
+            .unwrap_or_else(help_line),
         rows_top: 1,
         hud_con_id: None,
     };
@@ -148,6 +151,13 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     KeyCode::Down | KeyCode::Char('j') => move_selection(&mut app, 1),
                     KeyCode::Up | KeyCode::Char('k') => move_selection(&mut app, -1),
                     KeyCode::Enter => focus_selected(&mut app),
+                    KeyCode::Char('s') => {
+                        app.sort = app.sort.next();
+                        save_sort(app.sort);
+                        refresh(&mut app);
+                        last_refresh = Instant::now();
+                        app.message = format!("sort: {} · s to cycle", app.sort.word());
+                    }
                     KeyCode::Char('r') => {
                         refresh(&mut app);
                         last_refresh = Instant::now();
@@ -177,16 +187,52 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
 }
 
 fn refresh(app: &mut App) {
-    app.sessions = status::collect();
-    // Keep the selection in range as sessions come and go.
-    match app.list.selected() {
-        Some(i) if i >= app.sessions.len() => {
-            app.list
-                .select(app.sessions.len().checked_sub(1));
+    // Follow the selected *session*, not its row index — under the urgency and
+    // recent sorts, rows move as states change.
+    let selected_id = app
+        .list
+        .selected()
+        .and_then(|i| app.sessions.get(i))
+        .map(|s| s.id);
+    app.sessions = status::collect(app.sort);
+    let followed = selected_id.and_then(|id| app.sessions.iter().position(|s| s.id == id));
+    match followed {
+        Some(i) => app.list.select(Some(i)),
+        None if app.sessions.is_empty() => app.list.select(None),
+        // Selected session ended: clamp the old index into range.
+        None => {
+            let i = app
+                .list
+                .selected()
+                .unwrap_or(0)
+                .min(app.sessions.len() - 1);
+            app.list.select(Some(i));
         }
-        None if !app.sessions.is_empty() => app.list.select(Some(0)),
-        _ => {}
     }
+}
+
+fn help_line() -> String {
+    "j/k preview · enter jump · s sort · r refresh · q quit".to_string()
+}
+
+fn sort_pref_path() -> std::path::PathBuf {
+    crate::vendor::herdr_detect::config::state_dir().join("hud-sort")
+}
+
+/// The HUD remembers its sort mode across launches — one word in a state file.
+fn load_sort() -> status::Sort {
+    std::fs::read_to_string(sort_pref_path())
+        .ok()
+        .and_then(|s| status::Sort::parse(s.trim()))
+        .unwrap_or(status::Sort::Urgency)
+}
+
+fn save_sort(sort: status::Sort) {
+    let path = sort_pref_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, sort.word());
 }
 
 fn move_selection(app: &mut App, delta: isize) {

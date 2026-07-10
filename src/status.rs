@@ -86,9 +86,48 @@ pub(crate) struct Session {
     pub(crate) state_secs: u64,
 }
 
-/// Gather every tracked session, sorted most-urgent first. Shared by the
-/// `status` table and the HUD.
-pub(crate) fn collect() -> Vec<Session> {
+/// The three questions the list can be ordered to answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sort {
+    /// Triage: who needs me most, longest-waiting first.
+    Urgency,
+    /// Project view: same cwd grouped alphabetically, urgency within a group.
+    Dir,
+    /// Activity feed: most recent state change on top.
+    Recent,
+}
+
+impl Sort {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Sort::Urgency => "urgency",
+            Sort::Dir => "dir",
+            Sort::Recent => "recent",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Sort> {
+        match s {
+            "urgency" => Some(Sort::Urgency),
+            "dir" => Some(Sort::Dir),
+            "recent" => Some(Sort::Recent),
+            _ => None,
+        }
+    }
+
+    /// Cycle order for the HUD's `s` key.
+    pub(crate) fn next(self) -> Sort {
+        match self {
+            Sort::Urgency => Sort::Dir,
+            Sort::Dir => Sort::Recent,
+            Sort::Recent => Sort::Urgency,
+        }
+    }
+}
+
+/// Gather every tracked session in the given order. Shared by the `status`
+/// table and the HUD.
+pub(crate) fn collect(sort: Sort) -> Vec<Session> {
     let dir = crate::cache_dir();
     let mut sessions: Vec<Session> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -102,16 +141,26 @@ pub(crate) fn collect() -> Vec<Session> {
             }
         }
     }
-    // Alphabetical by directory so agents sharing a cwd sit together; urgency
-    // (blocked > working > idle) orders within a group, colors still flag
-    // blocked rows at a glance.
-    sessions.sort_by_key(|s| (s.dir.clone(), s.state.rank(), s.pid));
+    match sort {
+        // Within a rank, longest-in-state first: the blocked agent you've
+        // kept waiting longest tops the list.
+        Sort::Urgency => sessions.sort_by_key(|s| {
+            (
+                s.state.rank(),
+                std::cmp::Reverse(s.state_secs),
+                s.dir.clone(),
+                s.pid,
+            )
+        }),
+        Sort::Dir => sessions.sort_by_key(|s| (s.dir.clone(), s.state.rank(), s.pid)),
+        Sort::Recent => sessions.sort_by_key(|s| (s.state_secs, s.state.rank(), s.pid)),
+    }
     sessions
 }
 
 /// Scan `~/.cache/seagents/*.meta`, classify each session, print a table.
-pub fn print() -> i32 {
-    let sessions = collect();
+pub fn print(sort: Sort) -> i32 {
+    let sessions = collect(sort);
     if sessions.is_empty() {
         println!("no agents tracked");
         return 0;
@@ -139,8 +188,8 @@ pub fn print() -> i32 {
 /// `seagents status --json`: machine-readable session list, one array on
 /// stdout. This is the integration surface for widget frontends (eww etc.):
 /// poll this, render rows, and wire clicks to `seagents focus <pid>`.
-pub fn print_json() -> i32 {
-    let sessions = collect();
+pub fn print_json(sort: Sort) -> i32 {
+    let sessions = collect(sort);
     let arr: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {

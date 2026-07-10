@@ -43,14 +43,31 @@ fn main() {
             }
             std::process::exit(lead(cmd));
         }
-        Some("status") => match args.next().as_deref() {
-            Some("--json") => std::process::exit(status::print_json()),
-            None => std::process::exit(status::print()),
-            Some(_) => {
-                eprintln!("usage: seagents status [--json]");
-                std::process::exit(2);
+        Some("status") => {
+            let mut json = false;
+            let mut sort = status::Sort::Urgency;
+            for a in args {
+                match a.as_str() {
+                    "--json" => json = true,
+                    s if s.starts_with("--sort=") => match status::Sort::parse(&s[7..]) {
+                        Some(parsed) => sort = parsed,
+                        None => {
+                            eprintln!("usage: seagents status [--json] [--sort=urgency|dir|recent]");
+                            std::process::exit(2);
+                        }
+                    },
+                    _ => {
+                        eprintln!("usage: seagents status [--json] [--sort=urgency|dir|recent]");
+                        std::process::exit(2);
+                    }
+                }
             }
-        },
+            std::process::exit(if json {
+                status::print_json(sort)
+            } else {
+                status::print(sort)
+            });
+        }
         Some("focus") => {
             let pid = args.next().and_then(|s| s.parse::<u64>().ok());
             match pid {
@@ -150,7 +167,8 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  seagents [hud]                 the floating agent HUD (default)");
     eprintln!("  seagents run <cmd> [args...]   launch an agent, teeing its output");
-    eprintln!("  seagents status [--json]       show every tracked agent's state");
+    eprintln!("  seagents status [--json] [--sort=urgency|dir|recent]");
+    eprintln!("                                 show every tracked agent's state");
     eprintln!("  seagents focus <child_pid>     focus that agent's i3 window");
     eprintln!("  seagents update-manifests      fetch fresh detection rules from herdr.dev");
 }
