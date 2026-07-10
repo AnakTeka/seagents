@@ -655,13 +655,24 @@ fn run(cmd: Vec<String>) -> i32 {
                     .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
                 if seen.is_none() || seen != last_seen {
                     last_seen = seen;
-                    if let Some(state) =
+                    if let Some((state, acked)) =
                         status::track_session(&raw_path, &state_path, &cmd0, anchor_pid)
                     {
                         if let Some(prev) = prev {
                             notify_transition(prev, state, &dir0, &cmd0, con_id);
                         }
                         prev = Some(state);
+                        // Unacknowledged completion + the agent's window is
+                        // focused → the user is looking at it: done → idle.
+                        // (Focusing triggers a repaint, which is exactly what
+                        // woke this pass — so the check happens when needed.)
+                        if state == status::State::Idle
+                            && !acked
+                            && con_id.is_some()
+                            && focus::focused_con_id() == con_id
+                        {
+                            status::ack_session_path(&state_path);
+                        }
                     }
                 }
                 thread::sleep(std::time::Duration::from_secs(2));

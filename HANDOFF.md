@@ -16,7 +16,7 @@ Contrast with [herdr](https://github.com/ogulcancelik/herdr) (a herd/agent
 multiplexer we studied): herdr *owns* the PTYs — agents run inside herdr's panes.
 seagents does the opposite: you keep running `claude` in your normal Terminator/i3
 windows, and seagents watches them from the side. It shows a floating HUD of every
-agent's status (blocked / working / idle) and, on click, focuses that agent's real
+agent's status (blocked / done / working / idle) and, on click, focuses that agent's real
 i3 window.
 
 The core value: **at a glance, see which agent is blocked and waiting on you, and
@@ -160,8 +160,14 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.raw`** — the teed output byte stream (for detection);
   rotated down to its last ~1 MB once it passes 16 MB.
 - **`<wrapper_pid>.state`** — last observed state transition
-  (`{"state": "idle", "since": <unix>}`); powers the "idle for / waiting for"
-  column. **Maintained by the wrapper itself** (a monitor thread re-detects
+  (`{"state": "idle", "since": <unix>, "seen": bool}`); powers the
+  "idle for / waiting for" column and the **done** state: the wrapper marks a
+  working→idle completion `seen: false` (shown as 🔵 done, ranked just under
+  blocked) until acknowledged — by a HUD preview/jump of that agent, or by the
+  agent's window gaining focus — which flips it to plain idle without touching
+  the clock. Reader-written transitions are always `seen: true`, so sessions
+  from pre-monitor wrappers never show a stuck done.
+  **Maintained by the wrapper itself** (a monitor thread re-detects
   its own agent every 2s, skipping the pass while the tee is unchanged), so
   durations stay truthful with no HUD open. HUD/status polls also write it
   whenever their own detection disagrees — the writers race benignly on
@@ -228,7 +234,7 @@ terminal-class window, so a stray dialog doesn't get recorded).
 ### 5. `seagents hud` — the floating panel
 
 ratatui 0.28 TUI, polls `status::collect()` every 750 ms, color-codes rows
-(blocked=red, working=yellow, idle=green). Navigation previews (reveal agent
+(blocked=red, done=cyan, working=yellow, idle=green). Navigation previews (reveal agent
 window, then refocus the HUD so you keep navigating); Enter/click commits the jump.
 The HUD remembers its own window (captured lazily on first preview) to return focus
 to. Meant to run as an i3 floating + sticky window (see setup).

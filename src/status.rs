@@ -12,25 +12,31 @@ use std::path::Path;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
     Blocked,
+    /// Finished (engine says idle) but the user hasn't looked at it yet — an
+    /// unread marker, not a detection state. Downgrades to Idle on
+    /// acknowledgment (HUD preview/jump, or the agent's window gaining focus).
+    Done,
     Working,
     Idle,
     Unknown,
 }
 
 impl State {
-    /// Sort key — most urgent first.
+    /// Sort key — most urgent first. Done outranks working: it's actionable.
     pub(crate) fn rank(self) -> u8 {
         match self {
             State::Blocked => 0,
-            State::Working => 1,
-            State::Idle => 2,
-            State::Unknown => 3,
+            State::Done => 1,
+            State::Working => 2,
+            State::Idle => 3,
+            State::Unknown => 4,
         }
     }
 
     pub(crate) fn badge(self) -> &'static str {
         match self {
             State::Blocked => "🔴 blocked",
+            State::Done => "🔵 done",
             State::Working => "🟡 working",
             State::Idle => "🟢 idle",
             State::Unknown => "⚪ unknown",
@@ -40,6 +46,7 @@ impl State {
     pub(crate) fn word(self) -> &'static str {
         match self {
             State::Blocked => "blocked",
+            State::Done => "done",
             State::Working => "working",
             State::Idle => "idle",
             State::Unknown => "unknown",
@@ -203,7 +210,19 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         None => State::Unknown,
     };
 
-    let state_secs = state_duration(dir, wrapper_pid, state);
+    let now = unix_now();
+    let record = observe_state(
+        &dir.join(format!("{wrapper_pid}.state")),
+        state,
+        now,
+        false,
+    );
+    // Present unacknowledged completions as their own state.
+    let state = if state == State::Idle && !record.seen {
+        State::Done
+    } else {
+        state
+    };
 
     Some(Session {
         id: wrapper_pid,
@@ -212,50 +231,107 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         cwd: cwd.to_string(),
         cmd,
         pid: child_pid.unwrap_or(wrapper_pid),
-        state_secs,
+        state_secs: now.saturating_sub(record.since),
     })
 }
 
-/// How long the session has been in `state`, from the `.state` sidecar that
-/// records the last observed transition. The wrapper's own monitor thread
-/// (`track_session`, every 2 s for the session's whole life) is the primary
-/// writer, so the sidecar stays truthful even when no HUD is open; readers
-/// only write as a fallback for sessions launched by pre-monitor wrappers.
-fn state_duration(dir: &Path, wrapper_pid: u64, state: State) -> u64 {
-    let path = dir.join(format!("{wrapper_pid}.state"));
-    let now = unix_now();
-    now.saturating_sub(observe_state(&path, state, now))
+/// What the `.state` sidecar knows about a session: the last observed engine
+/// state, when it started, and whether the user has seen it since finishing
+/// (the "done vs idle" distinction).
+struct StateRecord {
+    since: u64,
+    seen: bool,
 }
 
 /// Record `state` into the sidecar if it differs from what's there; returns
-/// the `since` timestamp of the current state. Multiple observers (wrapper
-/// monitor + an open HUD) may race on a transition — both write since≈now, so
-/// the divergence is bounded by one poll interval. Harmless.
-fn observe_state(path: &Path, state: State, now: u64) -> u64 {
+/// the record for the current state. Multiple observers (wrapper monitor + an
+/// open HUD) may race on a transition — both write since≈now, so the
+/// divergence is bounded by one poll interval. Harmless.
+///
+/// `mark_unseen`: true only for the wrapper's own monitor — a working→idle
+/// transition it observes is stamped `seen: false` (the agent finished and
+/// nobody has looked yet). Readers (HUD/status fallback writes for
+/// pre-monitor sessions) always write `seen: true`, so unmonitored sessions
+/// simply never show "done" rather than showing it forever.
+fn observe_state(path: &Path, state: State, now: u64, mark_unseen: bool) -> StateRecord {
     let prev: Option<serde_json::Value> = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
     if let Some(p) = &prev {
         let prev_state = p["state"].as_str();
-        if prev_state == Some(state.word()) {
-            return p["since"].as_u64().unwrap_or(now);
-        }
-        // A transient Unknown sample (a render caught mid-repaint, e.g. the
-        // focus-in repaint a HUD preview triggers) must not reset a known
-        // state's clock. Only a definite state replaces a definite state.
-        if state == State::Unknown && prev_state.is_some_and(|s| s != "unknown") {
-            return p["since"].as_u64().unwrap_or(now);
+        let keep = prev_state == Some(state.word())
+            // A transient Unknown sample (a render caught mid-repaint, e.g.
+            // the focus-in repaint a HUD preview triggers) must not reset a
+            // known state's clock. Only a definite state replaces one.
+            || (state == State::Unknown && prev_state.is_some_and(|s| s != "unknown"));
+        if keep {
+            return StateRecord {
+                since: p["since"].as_u64().unwrap_or(now),
+                seen: p["seen"].as_bool().unwrap_or(true),
+            };
         }
     }
+    let finished_unwatched = mark_unseen
+        && state == State::Idle
+        && prev
+            .as_ref()
+            .and_then(|p| p["state"].as_str())
+            .is_some_and(|s| s == "working");
+    let record = StateRecord {
+        since: now,
+        seen: !finished_unwatched,
+    };
+    write_state_record(path, state, &record);
+    record
+}
+
+fn write_state_record(path: &Path, state: State, record: &StateRecord) {
+    let json = serde_json::json!({
+        "state": state.word(),
+        "since": record.since,
+        "seen": record.seen,
+    })
+    .to_string();
     // Atomic tmp+rename so a concurrent reader never sees a half-written
     // record; pid-suffixed so the wrapper monitor and a HUD poll can't
     // stomp each other's tmp file.
-    let record = serde_json::json!({ "state": state.word(), "since": now }).to_string();
     let tmp = path.with_extension(format!("state.tmp{}", std::process::id()));
-    if std::fs::write(&tmp, &record).is_ok() && std::fs::rename(&tmp, path).is_err() {
+    if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    now
+}
+
+/// Mark a finished session as seen (done → idle). Called from the HUD when
+/// the user previews or jumps to the agent, and from the wrapper's monitor
+/// when the agent's own window gains focus.
+pub(crate) fn ack_session_path(path: &Path) {
+    let Some(p) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return;
+    };
+    if p["seen"].as_bool() == Some(false) {
+        if let Some(state_word) = p["state"].as_str() {
+            let record = StateRecord {
+                since: p["since"].as_u64().unwrap_or(unix_now()),
+                seen: true,
+            };
+            // State word passes through unchanged; only the seen bit flips.
+            let state = match state_word {
+                "blocked" => State::Blocked,
+                "working" => State::Working,
+                "idle" => State::Idle,
+                _ => State::Unknown,
+            };
+            write_state_record(path, state, &record);
+        }
+    }
+}
+
+/// Ack by session id (the HUD's handle).
+pub(crate) fn ack_session(id: u64) {
+    ack_session_path(&crate::cache_dir().join(format!("{id}.state")));
 }
 
 fn unix_now() -> u64 {
@@ -267,15 +343,16 @@ fn unix_now() -> u64 {
 
 /// One detection pass over our *own* session, for the wrapper's monitor
 /// thread: re-classify from the teed tail and stamp the sidecar on
-/// transitions. This is what keeps "idle for" truthful while no HUD or
-/// status invocation is watching. Returns the detected state so the caller
-/// can react to transitions (notifications).
+/// transitions (marking a working→idle completion as unseen — the "done"
+/// state). This is what keeps "idle for" truthful while no HUD or status
+/// invocation is watching. Returns the detected engine state plus whether
+/// the completion has been seen, so the caller can notify and acknowledge.
 pub(crate) fn track_session(
     raw: &Path,
     state_path: &Path,
     cmd: &str,
     child_pid: u64,
-) -> Option<State> {
+) -> Option<(State, bool)> {
     let buf = read_tail(raw, 1024 * 1024)?;
     let (rows, cols) = live_pty_size(child_pid).unwrap_or((24, 80));
     let screen = crate::detect::render(&buf, rows, cols);
@@ -284,8 +361,8 @@ pub(crate) fn track_session(
     let state = State::from(
         crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
     );
-    observe_state(state_path, state, unix_now());
-    Some(state)
+    let record = observe_state(state_path, state, unix_now(), true);
+    Some((state, record.seen))
 }
 
 /// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
@@ -430,13 +507,43 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("1.state");
 
-        assert_eq!(observe_state(&path, State::Idle, 100), 100);
+        assert_eq!(observe_state(&path, State::Idle, 100, false).since, 100);
         // A mid-repaint Unknown sample must not reset the idle clock…
-        assert_eq!(observe_state(&path, State::Unknown, 150), 100);
-        assert_eq!(observe_state(&path, State::Idle, 200), 100);
+        assert_eq!(observe_state(&path, State::Unknown, 150, false).since, 100);
+        assert_eq!(observe_state(&path, State::Idle, 200, false).since, 100);
         // …but a real transition does.
-        assert_eq!(observe_state(&path, State::Blocked, 250), 250);
-        assert_eq!(observe_state(&path, State::Blocked, 300), 250);
+        assert_eq!(observe_state(&path, State::Blocked, 250, false).since, 250);
+        assert_eq!(observe_state(&path, State::Blocked, 300, false).since, 250);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn done_lifecycle_marks_unwatched_completion_and_acks() {
+        let dir = std::env::temp_dir().join(format!("seagents-done-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.state");
+
+        // Wrapper monitor observes: working, then idle → unseen completion.
+        assert!(observe_state(&path, State::Working, 100, true).seen);
+        let rec = observe_state(&path, State::Idle, 200, true);
+        assert!(!rec.seen, "working→idle by the wrapper should be unseen");
+        assert_eq!(rec.since, 200);
+
+        // A reader polling the same state keeps the unseen bit and the clock.
+        let rec = observe_state(&path, State::Idle, 260, false);
+        assert!(!rec.seen);
+        assert_eq!(rec.since, 200);
+
+        // Acknowledgment flips seen without touching the clock.
+        ack_session_path(&path);
+        let rec = observe_state(&path, State::Idle, 300, true);
+        assert!(rec.seen);
+        assert_eq!(rec.since, 200);
+
+        // A reader-written transition (pre-monitor session) is never unseen.
+        assert!(observe_state(&path, State::Working, 400, false).seen);
+        assert!(observe_state(&path, State::Idle, 500, false).seen);
 
         std::fs::remove_dir_all(&dir).ok();
     }

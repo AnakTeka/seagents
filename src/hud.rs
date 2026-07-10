@@ -214,6 +214,8 @@ fn preview_selected(app: &mut App) {
     let Some(s) = app.sessions.get(i) else {
         return;
     };
+    // Looking at it counts as seeing it: done → idle.
+    status::ack_session(s.id);
     match crate::focus::preview_window(s.pid, app.hud_con_id) {
         Ok(()) => app.message = format!("previewing {} · enter to jump", s.dir),
         Err(e) => app.message = e,
@@ -227,6 +229,7 @@ fn focus_selected(app: &mut App) {
     let Some(s) = app.sessions.get(i) else {
         return;
     };
+    status::ack_session(s.id);
     match crate::focus::focus_window(s.pid) {
         Ok(()) => app.message = format!("focused {} ({})", s.dir, s.cmd),
         Err(e) => app.message = e,
@@ -298,6 +301,7 @@ fn session_row(s: &Session) -> ListItem<'static> {
 fn state_color(state: State) -> Color {
     match state {
         State::Blocked => Color::Red,
+        State::Done => Color::Cyan,
         State::Working => Color::Yellow,
         State::Idle => Color::Green,
         State::Unknown => Color::Gray,
