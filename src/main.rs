@@ -253,11 +253,11 @@ pub(crate) fn manifest_health_warning() -> Option<String> {
             .is_some_and(|e| e.contains("requires engine"))
     });
     Some(if engine_drift {
-        "detection rules need a newer engine — re-sync src/vendor/herdr_detect (see VENDORED.md)"
+        "detection rules need a newer engine: re-sync src/vendor/herdr_detect (see VENDORED.md)"
             .to_string()
     } else {
         format!(
-            "manifest update failing for {} agent(s) — try `seagents update-manifests`",
+            "manifest update failing for {} agent(s), try `seagents update-manifests`",
             failing.len()
         )
     })
@@ -282,12 +282,12 @@ fn notify_transition(
     }
     let (summary, body, urgency) = match (prev, state) {
         (State::Working, State::Idle) => (
-            format!("{cmd} · {dir} — done"),
+            format!("{cmd} · {dir}: done"),
             "finished and waiting at the prompt".to_string(),
             "normal",
         ),
         (p, State::Blocked) if p != State::Blocked && p != State::Unknown => (
-            format!("{cmd} · {dir} — needs you"),
+            format!("{cmd} · {dir}: needs you"),
             "waiting for your input".to_string(),
             "critical",
         ),

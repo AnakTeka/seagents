@@ -296,7 +296,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.rows_top = body.y + 1;
 
     if app.sessions.is_empty() {
-        let empty = Paragraph::new("no agents tracked — launch one with `seagents run claude`")
+        let empty = Paragraph::new("no agents tracked; launch one with `seagents run claude`")
             .block(agent_block(app.sort))
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, body);
