@@ -282,10 +282,11 @@ fn focus_selected(app: &mut App) {
     }
 }
 
-/// Map a screen row to a session index, accounting for the border/header above
-/// the first agent row.
+/// Map a screen row to a session index, accounting for the border above the
+/// first agent row and the list's scroll offset (a scrolled list's first
+/// visible row is not session 0).
 fn row_at(app: &App, row: u16) -> Option<usize> {
-    let idx = row.checked_sub(app.rows_top)? as usize;
+    let idx = row.checked_sub(app.rows_top)? as usize + app.list.offset();
     (idx < app.sessions.len()).then_some(idx)
 }
 
@@ -297,13 +298,31 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     if app.sessions.is_empty() {
         let empty = Paragraph::new("no agents tracked; launch one with `seagents run claude`")
-            .block(agent_block(app.sort))
+            .block(agent_block(app.sort, 0, 0))
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, body);
     } else {
+        // Pre-apply the same scroll clamp the List does during render, so the
+        // clipped-row indicators describe *this* frame, not the previous one.
+        let visible = body.height.saturating_sub(2) as usize; // minus borders
+        let total = app.sessions.len();
+        let mut offset = app.list.offset();
+        if let Some(sel) = app.list.selected() {
+            if visible > 0 && sel >= offset + visible {
+                offset = sel + 1 - visible;
+            }
+            if sel < offset {
+                offset = sel;
+            }
+        }
+        offset = offset.min(total.saturating_sub(visible.min(total)));
+        *app.list.offset_mut() = offset;
+        let above = offset;
+        let below = total.saturating_sub(offset + visible);
+
         let items: Vec<ListItem> = app.sessions.iter().map(session_row).collect();
         let list = List::new(items)
-            .block(agent_block(app.sort))
+            .block(agent_block(app.sort, above, below))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▶ ");
         f.render_stateful_widget(list, body, &mut app.list);
@@ -313,20 +332,31 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(footer, chunks[1]);
 }
 
-fn agent_block(sort: status::Sort) -> Block<'static> {
-    use ratatui::widgets::block::Title;
-    Block::default()
+fn agent_block(sort: status::Sort, above: usize, below: usize) -> Block<'static> {
+    use ratatui::widgets::block::{Position, Title};
+    let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .title(" seagents ")
         // Persistent sort indicator, top-right — the footer flash on `s` is
         // gone by the next message, this isn't.
-        .title(
-            Title::from(Line::from(Span::styled(
-                format!(" {} ", sort.word()),
-                Style::default().fg(Color::DarkGray),
-            )))
-            .alignment(Alignment::Right),
-        )
+        .title(Title::from(dim(format!(" {} ", sort.word()))).alignment(Alignment::Right));
+    // Clipped-row indicators in the bottom border when the list scrolls.
+    if above > 0 {
+        block = block.title(
+            Title::from(dim(format!(" ▲ {above} more ")))
+                .alignment(Alignment::Left)
+                .position(Position::Bottom),
+        );
+    }
+    if below > 0 {
+        block = block.title(
+            Title::from(dim(format!(" ▼ {below} more ")))
+                .alignment(Alignment::Right)
+                .position(Position::Bottom),
+        );
+    }
+    block
 }
 
 fn session_row(s: &Session) -> ListItem<'static> {
