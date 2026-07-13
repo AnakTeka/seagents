@@ -96,7 +96,8 @@ seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
 ```
 
 HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
-keep focus on HUD); `Enter`/left-click = **jump** (commit focus to the agent);
+keep focus on HUD); `g`/`G` = first/last row (vim-style, also previews);
+`Enter`/left-click = **jump** (commit focus to the agent);
 `s` = cycle sort (urgency → dir → recent; remembered across launches);
 `r` = refresh now; `q`/`Esc` = quit.
 

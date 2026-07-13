@@ -150,6 +150,13 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     }
                     KeyCode::Down | KeyCode::Char('j') => move_selection(&mut app, 1),
                     KeyCode::Up | KeyCode::Char('k') => move_selection(&mut app, -1),
+                    // vim convention: g = first row, G = last row (with the
+                    // same preview-on-move behavior as j/k).
+                    KeyCode::Char('g') => jump_selection(&mut app, 0),
+                    KeyCode::Char('G') => {
+                        let last = app.sessions.len().saturating_sub(1);
+                        jump_selection(&mut app, last);
+                    }
                     KeyCode::Enter => focus_selected(&mut app),
                     KeyCode::Char('s') => {
                         app.sort = app.sort.next();
@@ -212,7 +219,7 @@ fn refresh(app: &mut App) {
 }
 
 fn help_line() -> String {
-    "j/k preview · enter jump · s sort · r refresh · q quit".to_string()
+    "j/k preview · g/G ends · enter jump · s sort · r refresh · q quit".to_string()
 }
 
 fn sort_pref_path() -> std::path::PathBuf {
@@ -233,6 +240,15 @@ fn save_sort(sort: status::Sort) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, sort.word());
+}
+
+/// Select an absolute row (g/G), previewing like relative navigation does.
+fn jump_selection(app: &mut App, idx: usize) {
+    if app.sessions.is_empty() {
+        return;
+    }
+    app.list.select(Some(idx.min(app.sessions.len() - 1)));
+    preview_selected(app);
 }
 
 fn move_selection(app: &mut App, delta: isize) {
