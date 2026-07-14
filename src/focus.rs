@@ -114,7 +114,12 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
     let node = focused_node()?;
     let xid = node.get("window").and_then(|w| w.as_u64());
     let class = node["window_properties"]["class"].as_str().unwrap_or("");
-    if xid.is_some() && looks_like_terminal(class) {
+    // Never record the HUD's own window as an agent's: it's terminal-class
+    // too, and preview flicker can leave it focused at capture time.
+    let role = node["window_properties"]["window_role"]
+        .as_str()
+        .unwrap_or("");
+    if xid.is_some() && looks_like_terminal(class) && role != "seagents-hud" {
         node["id"].as_u64().map(|con_id| (con_id, xid))
     } else {
         None

@@ -263,6 +263,38 @@ pub(crate) fn manifest_health_warning() -> Option<String> {
     })
 }
 
+/// Does this stdin chunk prove a *user* is interacting with our terminal?
+/// Not every stdin byte is typed: with focus reporting enabled, the terminal
+/// itself injects ESC[I / ESC[O (focus in/out). Capturing on those is actively
+/// wrong — ESC[O arrives exactly when the user switches AWAY, so the "focused
+/// window" query would record whichever window they switched to (seen live:
+/// two agents in one dir ending up with the same recorded window, or an
+/// agent recording the HUD after a preview flicker).
+///
+/// Rules: any focus-out in the chunk vetoes capture entirely (focus is in
+/// flux); focus-in alone doesn't count as user input (preview flicker sends
+/// it, then refocuses the HUD within milliseconds); anything else — real
+/// keys, mouse reports — counts.
+fn input_capture_eligible(chunk: &[u8]) -> bool {
+    let mut has_user_bytes = false;
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i] == 0x1b && i + 2 < chunk.len() && chunk[i + 1] == b'[' {
+            match chunk[i + 2] {
+                b'O' => return false,
+                b'I' => {
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        has_user_bytes = true;
+        i += 1;
+    }
+    has_user_bytes
+}
+
 /// The session's current window handle, read fresh from its meta (the input
 /// pump and focus paths heal it over time; launch-time copies go stale).
 fn meta_con_id(meta_path: &std::path::Path) -> Option<u64> {
@@ -475,6 +507,24 @@ fn rotate_tee(path: &std::path::Path) -> Option<File> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn input_capture_eligibility_rules() {
+        use super::input_capture_eligible;
+        // Real typing: eligible.
+        assert!(input_capture_eligible(b"hello"));
+        assert!(input_capture_eligible(b"\x1b[A")); // arrow key
+        // Terminal focus reports alone: not user input.
+        assert!(!input_capture_eligible(b"\x1b[I"));
+        // Focus-out vetoes the whole chunk — focus is in flux right now.
+        assert!(!input_capture_eligible(b"\x1b[O"));
+        assert!(!input_capture_eligible(b"x\x1b[O"));
+        assert!(!input_capture_eligible(b"\x1b[Ozzz"));
+        // Focus-in followed by real keys: the keys count.
+        assert!(input_capture_eligible(b"\x1b[Ihello"));
+        // Empty chunk: nothing to conclude.
+        assert!(!input_capture_eligible(b""));
+    }
+
+    #[test]
     fn rotate_tee_keeps_the_tail() {
         let dir = std::env::temp_dir().join(format!("seagents-rotate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -635,7 +685,7 @@ fn run(cmd: Vec<String>) -> i32 {
                         let _ = writer.flush();
                         let due = last_capture
                             .map_or(true, |t| t.elapsed().as_secs() >= 60);
-                        if due {
+                        if due && input_capture_eligible(&buf[..n]) {
                             last_capture = Some(std::time::Instant::now());
                             if let Some((con_id, xid)) = focus::focused_terminal_ids() {
                                 focus::record_window(&meta_path, con_id, xid);
