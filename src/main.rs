@@ -263,6 +263,14 @@ pub(crate) fn manifest_health_warning() -> Option<String> {
     })
 }
 
+/// The session's current window handle, read fresh from its meta (the input
+/// pump and focus paths heal it over time; launch-time copies go stale).
+fn meta_con_id(meta_path: &std::path::Path) -> Option<u64> {
+    let text = fs::read_to_string(meta_path).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&text).ok()?;
+    meta["con_id"].as_u64()
+}
+
 /// Desktop notification for a state transition worth interrupting the user
 /// for: the agent finished (working → idle) or is waiting on input
 /// (→ blocked). Suppressed while the agent's own window is focused — the
@@ -606,23 +614,40 @@ fn run(cmd: Vec<String>) -> i32 {
     });
 
     // Input pump: stdin -> master. Detached; the process exit reaps it.
-    thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
+    // Doubles as the window-identity healer: input can only arrive while our
+    // terminal is the focused X window, so whenever the user types we know
+    // exactly which window hosts this agent. Re-capture (throttled) keeps the
+    // meta's con_id/window_id correct through i3 restarts and launch-time
+    // capture misses — this is what lets focus use exact handles only.
+    {
+        let meta_path = meta_path.clone();
+        thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 8192];
+            let mut last_capture: Option<std::time::Instant> = None;
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if writer.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
+                        let due = last_capture
+                            .map_or(true, |t| t.elapsed().as_secs() >= 60);
+                        if due {
+                            last_capture = Some(std::time::Instant::now());
+                            if let Some((con_id, xid)) = focus::focused_terminal_ids() {
+                                focus::record_window(&meta_path, con_id, xid);
+                            }
+                        }
                     }
-                    let _ = writer.flush();
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
-        }
-    });
+        });
+    }
 
     // Resize pump: on SIGWINCH, re-read the outer size and push it to the inner
     // PTY so the child's TUI reflows.
@@ -653,6 +678,7 @@ fn run(cmd: Vec<String>) -> i32 {
     if let Some(anchor_pid) = child.process_id().map(u64::from) {
         let raw_path = raw_path.clone();
         let state_path = raw_path.with_extension("state");
+        let mon_meta_path = meta_path.clone();
         let cmd0 = std::path::Path::new(&cmd[0])
             .file_name()
             .and_then(|s| s.to_str())
@@ -683,6 +709,10 @@ fn run(cmd: Vec<String>) -> i32 {
                     if let Some((state, acked)) =
                         status::track_session(&raw_path, &state_path, &cmd0, anchor_pid)
                     {
+                        // Read the con_id fresh: the input pump and focus
+                        // fallback heal it in the meta over time, and a stale
+                        // copy here would break focused-window suppression.
+                        let con_id = meta_con_id(&mon_meta_path);
                         if let Some(prev) = prev {
                             notify_transition(prev, state, &dir0, &cmd0, con_id);
                         }

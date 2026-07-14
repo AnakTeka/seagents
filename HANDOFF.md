@@ -35,10 +35,9 @@ All four milestones are **code-complete and on `main`**:
 | focus the agent's i3 window | `seagents focus <child_pid>` | done; con_id fix **committed but not yet live-verified** |
 | floating HUD | `seagents hud` | done; works, j/k preview + click-to-focus |
 
-**Known-unverified:** the focus-by-`con_id` disambiguation (see Design Decisions)
-was the last change and hasn't been confirmed live by the user. Test: launch two
-idle claudes (both showing the generic `✳ Claude Code` title) in separate windows,
-open the HUD, and confirm clicking each focuses its *own* window (not the same one).
+Focus identity is exact-handle only (no title matching since 2026-07-14), so
+the old two-idle-claudes ambiguity concern is structurally gone; con_id focus
+and healing have been verified live.
 
 ---
 
@@ -118,9 +117,9 @@ Source layout under `src/`:
   (see its `VENDORED.md`): per-agent TOML rule manifests evaluated by a
   region/priority engine, self-updating from herdr.dev. This replaced our
   hand-written `is_blocked()` rules entirely.
-- **`src/focus.rs`** — `focus_window()` (con_id-first, title fallback),
-  `preview_window()`, `focused_con_id()`/`focused_terminal_con_id()`,
-  `session_for_child()`, i3 tree helpers, `core_title()`.
+- **`src/focus.rs`** — `focus_window()` (exact handles: con_id, then X window
+  id, with healing), `preview_window()`, `record_window()` (identity capture),
+  `focused_con_id()`/`focused_terminal_ids()`, i3 tree helpers.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 
 ### 1. `seagents run` — the transparent pty-tee launcher
@@ -225,16 +224,23 @@ outranks loose blocked heuristics, which is what kills the "chat text says
 
 ### 4. `seagents focus` — jump to the agent's i3 window
 
-**Resolution order:** (1) the `con_id` recorded in `.meta` at launch →
-`i3-msg [con_id=N] focus` — exact, no ambiguity; (2) the recorded **X window
-id** (`window_id` in meta) — con_ids die on an i3 *restart* (the tree is
-rebuilt) but X ids survive it, so this is the durable handle; (3) match the
-agent's current window title against the i3 tree (`core_title` strips the
-leading state glyph so a changing spinner doesn't break the match; titles are
-only emitted on change, so the full 1 MB tail is searched). Whenever a
-fallback finds the window, the fresh con_id is **healed back into the meta**
-so the fast path works again — an i3 restart costs one slow focus per
-session, not permanent breakage.
+**Exact handles only — no fuzzy matching.** X11 can't be asked "which window
+hosts this pty" (Terminator shares one process across windows, so
+`_NET_WM_PID` is useless); the only honest strategy is correlation at moments
+we *know* the user is interacting with the agent:
+
+- **At launch**: the focused terminal's `con_id` + **X window id** go into
+  the meta (`seagents run` was just typed there).
+- **On every input burst** (throttled to 1/min): typing proves the agent's
+  terminal is focused, so the input pump re-captures both ids — healing
+  stale handles within one keystroke of real use.
+
+Resolution: con_id (`i3-msg [con_id=N] focus`; fast, dies on an i3 *restart*)
+→ X window id (survives restarts; heals con_id when used) → a clear error
+telling the user to type into the agent once. The old title-matching fallback
+(parse the tee for the OSC title, fuzzy-match the i3 tree) was cut out
+entirely: it was ambiguous between idle agents and read the `.raw` stream for
+something that isn't a detection concern.
 
 Why con_id and not PID: i3 on X11 doesn't expose a usable per-window PID, and
 **Terminator shares one process across all its windows**, so PID→window is
@@ -278,9 +284,10 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - **Multiple agents as tabs in one Terminator window** share one `con_id` (one X
   window); i3 can't focus a tab within a window, so that case is ambiguous.
   Separate windows work perfectly.
-- **con_id capture assumes the launching terminal is focused** at `run` time (true
-  for interactive launches). If a dialog steals focus at that instant, `con_id` is
-  recorded as `null` and focus falls back to title matching.
+- **Window identity needs one interaction**: if a dialog steals focus at the
+  `run` instant, the ids are recorded as `null` — the first keystroke into the
+  agent heals them (input-driven re-capture). A session never typed into and
+  never focused can't be focused from the HUD until then.
 - **Mouse flicker on HUD preview** — with i3's default `mouse_warping output`, each
   preview warps the mouse to the agent's monitor and back. Setting `mouse_warping
   none` in i3 removes it, but that's a *global* i3 behavior change (undecided).
