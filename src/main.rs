@@ -424,6 +424,7 @@ fn write_meta(
     argv: &[String],
     size: &PtySize,
     con_id: Option<u64>,
+    window_id: Option<u64>,
 ) {
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -439,8 +440,11 @@ fn write_meta(
         "cols": size.cols,
         "rows": size.rows,
         // The i3 window this agent runs in, captured at launch — the reliable
-        // handle for focus (titles can collide between idle agents).
+        // handle for focus (titles can collide between idle agents). con_id is
+        // the fast handle but dies on an i3 restart; window_id is the X11 id,
+        // which survives one.
         "con_id": con_id,
+        "window_id": window_id,
     });
     if let Ok(s) = serde_json::to_string_pretty(&meta) {
         let _ = fs::write(path, s);
@@ -485,7 +489,10 @@ mod tests {
 fn run(cmd: Vec<String>) -> i32 {
     // Capture the launching terminal's i3 window up front, while it's still the
     // focused window (the user just typed the command into it).
-    let con_id = focus::focused_terminal_con_id();
+    let (con_id, window_id) = match focus::focused_terminal_ids() {
+        Some((con, xid)) => (Some(con), xid),
+        None => (None, None),
+    };
 
     let size = terminal_size();
 
@@ -544,7 +551,7 @@ fn run(cmd: Vec<String>) -> i32 {
     let (raw_path, meta_path) = session_paths();
     let tee = File::create(&raw_path).ok();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size, con_id);
+    write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
         eprintln!("seagents: teeing to {}", raw_path.display());
     }

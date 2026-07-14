@@ -225,10 +225,16 @@ outranks loose blocked heuristics, which is what kills the "chat text says
 
 ### 4. `seagents focus` — jump to the agent's i3 window
 
-**Primary path:** the `con_id` recorded in `.meta` at launch → `i3-msg [con_id=N]
-focus`. Exact, no ambiguity. **Fallback:** match the agent's current window title
-against the i3 tree (`core_title` strips the leading state glyph so a changing
-spinner doesn't break the match).
+**Resolution order:** (1) the `con_id` recorded in `.meta` at launch →
+`i3-msg [con_id=N] focus` — exact, no ambiguity; (2) the recorded **X window
+id** (`window_id` in meta) — con_ids die on an i3 *restart* (the tree is
+rebuilt) but X ids survive it, so this is the durable handle; (3) match the
+agent's current window title against the i3 tree (`core_title` strips the
+leading state glyph so a changing spinner doesn't break the match; titles are
+only emitted on change, so the full 1 MB tail is searched). Whenever a
+fallback finds the window, the fresh con_id is **healed back into the meta**
+so the fast path works again — an i3 restart costs one slow focus per
+session, not permanent breakage.
 
 Why con_id and not PID: i3 on X11 doesn't expose a usable per-window PID, and
 **Terminator shares one process across all its windows**, so PID→window is

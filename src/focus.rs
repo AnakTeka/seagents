@@ -23,8 +23,13 @@ pub fn focus(child_pid: u64) -> i32 {
 
 /// Locate and focus the agent's i3 window, returning a human-readable error
 /// instead of printing — so callers like the HUD stay in control of the screen.
+///
+/// Resolution order: recorded con_id → recorded X window id → title match.
+/// con_ids die on an i3 *restart* (the tree is rebuilt); X window ids survive
+/// it, so they're the durable handle. When a fallback finds the window, the
+/// meta's con_id is healed so the fast path works again.
 pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
-    let (meta, raw) = session_for_child(child_pid)
+    let (meta, raw, meta_path) = session_for_child(child_pid)
         .ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
 
     // Preferred: the exact i3 window recorded at launch. Unambiguous even when
@@ -33,17 +38,34 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
         if i3_focus(con_id) {
             return Ok(());
         }
-        // Recorded window is gone (or moved handlers) — fall through to title.
+        // Recorded con_id is gone — likely an i3 restart. Fall through.
     }
 
-    // Fallback for sessions launched before con_id was recorded: match by title.
-    let title = crate::status::read_tail(&raw, 256 * 1024)
+    let windows = i3_windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
+
+    // The X window id outlives i3 restarts (the window itself never died).
+    if let Some(xid) = meta["window_id"].as_u64() {
+        if let Some(win) = windows.iter().find(|w| w.xid == Some(xid)) {
+            if i3_focus(win.con_id) {
+                heal_con_id(&meta_path, meta, win.con_id);
+                return Ok(());
+            }
+        }
+    }
+
+    // Last resort: match by the agent's current terminal title. Titles are
+    // only emitted on change, so search the same 1 MB the detector keeps.
+    let title = crate::status::read_tail(&raw, 1024 * 1024)
         .as_deref()
         .and_then(crate::status::current_title)
-        .ok_or_else(|| format!("session {child_pid} has no title yet"))?;
+        .ok_or_else(|| {
+            format!(
+                "session {child_pid}: recorded window is gone (i3 restart?) and \
+                 no recent title to re-match; interact with the agent once and retry"
+            )
+        })?;
     let want = core_title(&title);
 
-    let windows = i3_windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
     let mut matches: Vec<&Win> = windows
         .iter()
         .filter(|w| core_title(&w.title) == want)
@@ -55,9 +77,19 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
         .ok_or_else(|| format!("no i3 window titled {title:?}"))?;
 
     if i3_focus(target.con_id) {
+        heal_con_id(&meta_path, meta, target.con_id);
         Ok(())
     } else {
         Err(format!("i3-msg focus failed for con_id {}", target.con_id))
+    }
+}
+
+/// After a fallback located the window, write the fresh con_id back into the
+/// meta so the next focus takes the fast, unambiguous path again.
+fn heal_con_id(meta_path: &std::path::Path, mut meta: serde_json::Value, con_id: u64) {
+    meta["con_id"] = serde_json::json!(con_id);
+    if let Ok(text) = serde_json::to_string_pretty(&meta) {
+        let _ = std::fs::write(meta_path, text);
     }
 }
 
@@ -79,15 +111,20 @@ pub(crate) fn focused_con_id() -> Option<u64> {
     focused_node().and_then(|n| n["id"].as_u64())
 }
 
-/// The focused window's con_id, but only if it's a terminal-class window.
-/// `seagents run` calls this at launch to record which window an agent lives in;
-/// the terminal guard filters out dialogs/browsers that may momentarily hold
-/// focus, so we never record the wrong window.
-pub(crate) fn focused_terminal_con_id() -> Option<u64> {
+/// The focused window's (con_id, X window id), but only if it's a
+/// terminal-class window. `seagents run` calls this at launch to record which
+/// window an agent lives in; the terminal guard filters out dialogs/browsers
+/// that may momentarily hold focus, so we never record the wrong window. The
+/// X id is the durable half: con_ids die on an i3 restart, X ids don't.
+pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
     let node = focused_node()?;
-    let is_window = node.get("window").and_then(|w| w.as_u64()).is_some();
+    let xid = node.get("window").and_then(|w| w.as_u64());
     let class = node["window_properties"]["class"].as_str().unwrap_or("");
-    (is_window && looks_like_terminal(class)).then(|| node["id"].as_u64())?
+    if xid.is_some() && looks_like_terminal(class) {
+        node["id"].as_u64().map(|con_id| (con_id, xid))
+    } else {
+        None
+    }
 }
 
 fn focused_node() -> Option<serde_json::Value> {
@@ -112,8 +149,8 @@ fn find_focused(node: &serde_json::Value) -> Option<&serde_json::Value> {
     None
 }
 
-/// Look up a session's meta and `.raw` path by child pid.
-fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
+/// Look up a session's meta, `.raw` path, and meta path by child pid.
+fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf, PathBuf)> {
     let dir = crate::cache_dir();
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let path = entry.path();
@@ -128,7 +165,8 @@ fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
         };
         if v["child_pid"].as_u64() == Some(child_pid) {
             let wrapper_pid = v["wrapper_pid"].as_u64()?;
-            return Some((v, dir.join(format!("{wrapper_pid}.raw"))));
+            let raw = dir.join(format!("{wrapper_pid}.raw"));
+            return Some((v, raw, path));
         }
     }
     None
@@ -158,6 +196,8 @@ fn looks_like_terminal(class: &str) -> bool {
 
 struct Win {
     con_id: u64,
+    /// The X11 window id (i3's "window" field) — stable across i3 restarts.
+    xid: Option<u64>,
     title: String,
     class: String,
 }
@@ -179,6 +219,7 @@ fn collect(node: &serde_json::Value, out: &mut Vec<Win>) {
         let props = &node["window_properties"];
         out.push(Win {
             con_id: node["id"].as_u64().unwrap_or(0),
+            xid: node["window"].as_u64(),
             title: props["title"].as_str().unwrap_or("").to_string(),
             class: props["class"].as_str().unwrap_or("").to_string(),
         });
