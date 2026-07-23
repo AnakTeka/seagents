@@ -336,12 +336,20 @@ fn notify_transition(
     if con_id.is_some() && focus::focused_con_id() == con_id {
         return;
     }
-    let _ = std::process::Command::new("notify-send")
+    // Reap in a detached thread: a dropped Child is never wait()ed, so each
+    // finished notify-send would otherwise linger as a zombie for the life of
+    // this wrapper process.
+    if let Ok(mut child) = std::process::Command::new("notify-send")
         .args(["-a", "seagents", "-u", urgency, "-t", "8000", &summary, &body])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// The job-control anchor (`seagents __lead <cmd...>`), running as the inner
