@@ -116,7 +116,9 @@ Source layout under `src/`:
 - **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
   (see its `VENDORED.md`): per-agent TOML rule manifests evaluated by a
   region/priority engine, self-updating from herdr.dev. This replaced our
-  hand-written `is_blocked()` rules entirely.
+  hand-written `is_blocked()` rules entirely. Where herdr's answer to a rule
+  differs from what seagents needs, `manifest/patches.rs` re-weights that one
+  rule by id as the manifest loads, so the rest keeps updating upstream.
 - **`src/focus.rs`** — `focus_window()` (exact handles: con_id, then X window
   id, with healing), `preview_window()`, `record_window()` (identity capture),
   `focused_con_id()`/`focused_terminal_ids()`, i3 tree helpers.

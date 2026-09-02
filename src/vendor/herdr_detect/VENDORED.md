@@ -20,6 +20,11 @@ re-sync of this directory.
 Local overrides: drop a manifest at `~/.config/seagents/agent-detection/<agent>.toml`
 to shadow both remote and bundled rules (herdr's hot-tuning workflow).
 
+Rule patches: `manifest/patches.rs` (seagents-local, not vendored) re-weights
+individual upstream rules by id as each bundled/remote manifest loads — the way
+to disagree with one rule without freezing the file behind an override. An
+explicit override is applied literally, patches skipped.
+
 ## Local modifications (re-apply after any re-sync)
 
 Substantive deltas are marked with `// seagents:` comments in the code; the
@@ -38,21 +43,26 @@ their record.
   `should_skip_state_update`.
 - `config.rs`: **not vendored** — seagents-local replacement for herdr's
   `crate::config` (`config_dir()`/`state_dir()` under seagents' XDG paths).
-- `manifest.rs`: `crate::config::` → `super::config::` (one site);
+- `manifest.rs`: `crate::config::` → `super::config::` (one site); added
+  `mod patches;` and the `patches::apply()` call in `loaded_manifest()`
+  (skipped for `ManifestSource::Override`);
   `#[allow(dead_code)]` on `manifest_summaries`, `explain`, `explain_for_label`
   and `reload_manifests` (unused vendored API surface, kept for parity — the
   binary reloads per agent via `reload_manifests_for_agents`).
 - `manifest_update.rs`: removed `auto_update()` (tokio/AppEvent coupling) —
   callers use `check_and_update()` + `agents_needing_cache_reload()` (raised to
   `pub(crate)`) + `manifest::reload_manifests_for_agents()` directly, which is
-  the work `auto_update()` did around its AppEvent; its two other tokio tests
-  rewritten the same way;
+  the work `auto_update()` did around its AppEvent; its three tokio/AppEvent
+  tests rewritten to drive `check_and_update()` directly;
   `tracing::warn!` → local `warn_log!` (stderr, gated on `SEAGENTS_DEBUG`);
-  `crate::config::` → `super::config::`; the async wrapper's test rewritten to
-  drive `check_and_update()` directly; `fetch_text` pins https catalogs to
-  https across redirects (`--proto '=https' --proto-redir '=https'`).
+  `crate::config::` → `super::config::`; `fetch_text` keeps plain
+  `std::process::Command` (upstream moved to its Windows window-hiding wrapper)
+  and pins https catalogs to https across redirects
+  (`--proto '=https' --proto-redir '=https'`).
 - `manifest/tests.rs`: `crate::config::`/`crate::detect::` paths retargeted
   into this module tree.
+- `manifest/patches.rs`: **not vendored** — seagents' rule re-weighting table.
+  Re-check every entry against the new rules on a re-sync.
 
 ## Re-sync procedure
 
@@ -61,4 +71,7 @@ their record.
    — then diff `herdr/src/detect/` against this directory.
 2. Re-copy upstream files and re-apply the modifications above (all
    mechanical), and update the pinned commit at the top of this file.
-3. `cargo test`, then live-verify with `seagents debug-screen`.
+3. Re-check `manifest/patches.rs`: each entry names an upstream rule id, and a
+   rule that was renamed, removed or reshaped upstream needs its patch revisited
+   (`patches_only_touch_their_own_manifest` catches an id that no longer exists).
+4. `cargo test`, then live-verify with `seagents debug-screen`.

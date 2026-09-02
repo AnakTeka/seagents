@@ -706,6 +706,13 @@ fn loaded_manifest(
     cached_remote_version: Option<String>,
     local_override_shadowing_remote: bool,
 ) -> Result<LoadedManifest, String> {
+    // seagents: rules whose verdict does not survive the move from herdr's
+    // question to ours are re-weighted here (see manifest/patches.rs). An
+    // explicit local override is left exactly as written.
+    let mut manifest = manifest;
+    if !matches!(source, ManifestSource::Override(_)) {
+        patches::apply(&mut manifest);
+    }
     let compiled_rules = compile_manifest(&manifest)?;
     Ok(LoadedManifest {
         manifest,
@@ -1545,6 +1552,9 @@ fn line_start_offset(content: &str, lines: &[&str], index: usize) -> usize {
         .sum::<usize>()
         .min(content.len())
 }
+
+// seagents: local rule re-weighting, applied to bundled and remote manifests.
+mod patches;
 
 #[cfg(test)]
 mod tests;

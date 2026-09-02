@@ -69,4 +69,58 @@ esc to cancel";
     fn idle_title_classifies_idle() {
         assert_eq!(claude_state("", "✳ Claude Code"), AgentState::Idle);
     }
+
+    /// The screen that prompted `manifest/patches.rs`: the turn ended hours
+    /// ago (`done 11:25 AM`) but a background dev server keeps the footer's
+    /// `· 1 shell ·` chip lit, which upstream reads as the agent working.
+    const BACKGROUND_SHELL_AT_PROMPT: &str = "\
+● Committed (505b77b) and the app is back up with the judgment-free verdicts.
+
+✻ Cooked for 2m 38s · done 11:25 AM · 1 shell still running
+──────────────────────────────────────────────
+❯
+──────────────────────────────────────────────
+  personal | Opus 4.8 [high] | ~/projects/acme/adhoc/20260612_doc_parser
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents";
+
+    #[test]
+    fn background_shell_at_the_prompt_is_idle() {
+        assert_eq!(
+            claude_state(
+                BACKGROUND_SHELL_AT_PROMPT,
+                "✳ Find BSC tagging configuration"
+            ),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn background_shell_during_a_live_turn_stays_working() {
+        // Same footer chip, but the turn is live — the demoted rule is not
+        // what decides this screen.
+        let screen = "\
+● Reading src/main.rs
+
+✻ Cooking… (12s · ↑ 1.2k tokens · esc to interrupt)
+──────────────────────────────────────────────
+❯
+──────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents";
+        assert_eq!(claude_state(screen, ""), AgentState::Working);
+        assert_eq!(claude_state(screen, "⠂ Claude Code"), AgentState::Working);
+    }
+
+    #[test]
+    fn background_shell_does_not_mask_a_permission_prompt() {
+        let screen = "\
+● Bash(rm -rf build/)
+
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+esc to cancel
+  ⏵⏵ bypass permissions on · 1 shell · ← for agents";
+        assert_eq!(claude_state(screen, "✳ Claude Code"), AgentState::Blocked);
+    }
 }
