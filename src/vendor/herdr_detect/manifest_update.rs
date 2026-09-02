@@ -23,7 +23,7 @@ macro_rules! warn_log {
     };
 }
 
-pub(crate) const MANIFEST_ENGINE_VERSION: u32 = 2;
+pub(crate) const MANIFEST_ENGINE_VERSION: u32 = 3;
 const DEFAULT_CATALOG_URL: &str = "https://herdr.dev/agent-detection/index.toml";
 const CATALOG_URL_ENV: &str = "HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL";
 const MAX_FETCH_BYTES: usize = 256 * 1024;
@@ -178,10 +178,41 @@ struct CatalogAgent {
 
 // seagents: herdr's `auto_update()` (an async event-channel wrapper around
 // `check_and_update()`) is removed here — callers invoke `check_and_update()`
-// directly and call `manifest::reload_manifests()` when `updated` is non-empty.
+// and then reload the cache for `agents_needing_cache_reload()`, which is the
+// only work auto_update did beyond emitting its AppEvent.
+
+pub(crate) fn agents_needing_cache_reload(output: &ManifestUpdateOutput) -> Vec<Agent> {
+    let loaded = super::manifest::manifest_summaries();
+    let mut activated = output
+        .updated
+        .iter()
+        .map(|commit| commit.agent)
+        .collect::<Vec<_>>();
+
+    for agent in &output.checked {
+        let agent = *agent;
+        let Some(status) = output.status.agent_status(agent) else {
+            continue;
+        };
+        if status.last_result != "current" && status.last_result != "updated" {
+            continue;
+        }
+        let loaded_version = loaded
+            .iter()
+            .find(|summary| summary.agent == agent)
+            .and_then(|summary| summary.cached_remote_version.as_deref());
+        let disk_version = cached_remote_version(agent).map(|version| version.to_string());
+        if loaded_version != disk_version.as_deref() && !activated.contains(&agent) {
+            activated.push(agent);
+        }
+    }
+
+    activated
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestUpdateOutput {
+    pub(crate) checked: Vec<Agent>,
     pub(crate) updated: Vec<ManifestUpdateCommit>,
     pub(crate) status: ManifestUpdateStatus,
 }
@@ -198,6 +229,7 @@ fn check_and_update_from_url(url: &str) -> Result<ManifestUpdateOutput, String> 
     status.last_check_unix = Some(check_time);
     status.last_result = Some("checked".to_string());
 
+    let checked = catalog.iter().map(|entry| entry.agent).collect::<Vec<_>>();
     let mut updated = Vec::new();
     for entry in catalog {
         let agent_id = agent_label(entry.agent).to_string();
@@ -256,7 +288,11 @@ fn check_and_update_from_url(url: &str) -> Result<ManifestUpdateOutput, String> 
         warn_log!("failed to save agent detection manifest update status: {err}");
         status.last_result = Some(format!("failed_to_save_status: {err}"));
     }
-    Ok(ManifestUpdateOutput { updated, status })
+    Ok(ManifestUpdateOutput {
+        checked,
+        updated,
+        status,
+    })
 }
 
 fn process_agent_manifest(
@@ -542,9 +578,13 @@ fn now_nanos() -> u128 {
 mod tests {
     use super::*;
     fn remote_manifest(version: &str, contains: &str) -> String {
+        remote_manifest_for("codex", version, contains)
+    }
+
+    fn remote_manifest_for(agent: &str, version: &str, contains: &str) -> String {
         format!(
             r#"
-id = "codex"
+id = "{agent}"
 version = "{version}"
 min_engine_version = 1
 updated_at = "2026-06-10T12:00:00Z"
@@ -606,7 +646,7 @@ contains = ["{contains}"]
     #[test]
     fn process_agent_manifest_commits_newer_manifest_atomically() {
         with_state_dir("commit-newer", || {
-            let content = remote_manifest("2026.06.10.5", "ready");
+            let content = remote_manifest("9999.01.01.1", "ready");
             let commit = process_agent_manifest(Agent::Codex, &content, 1)
                 .unwrap()
                 .unwrap();
@@ -614,7 +654,7 @@ contains = ["{contains}"]
             assert_eq!(commit.agent, Agent::Codex);
             assert_eq!(
                 commit.version,
-                ManifestVersion::parse("2026.06.10.5").unwrap()
+                ManifestVersion::parse("9999.01.01.1").unwrap()
             );
             assert_eq!(
                 fs::read_to_string(remote_manifest_path(Agent::Codex)).unwrap(),
@@ -647,7 +687,7 @@ path = "codex.toml"
             .unwrap();
             fs::write(
                 web_dir.join("codex.toml"),
-                remote_manifest("2026.06.10.5", "auto-update-ready"),
+                remote_manifest("9999.01.01.1", "auto-update-ready"),
             )
             .unwrap();
             std::env::set_var(
@@ -679,13 +719,179 @@ path = "codex.toml"
         });
     }
 
+    // seagents: rewritten from herdr's
+    // `auto_update_reloads_manifest_cache_when_remote_is_already_current` — the
+    // async `auto_update()` wrapper is removed, so the test drives its two steps
+    // (`check_and_update()` + `agents_needing_cache_reload()`) directly.
+    #[test]
+    fn cache_reload_serves_remote_that_was_already_current() {
+        with_state_dir("auto-update-reloads-current-cache", || {
+            let initial = remote_manifest("9999.01.01.1", "initial-ready");
+            process_agent_manifest(Agent::Codex, &initial, 1).unwrap();
+            super::super::manifest::reload_manifests();
+
+            let old_catalog_url = std::env::var_os(CATALOG_URL_ENV);
+            let web_dir = std::env::temp_dir().join(format!(
+                "herdr-manifest-update-current-web-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&web_dir);
+            fs::create_dir_all(&web_dir).unwrap();
+            fs::write(
+                web_dir.join("index.toml"),
+                r#"
+schema_version = 1
+
+[[agents]]
+id = "codex"
+path = "codex.toml"
+"#,
+            )
+            .unwrap();
+            let current = remote_manifest("9999.01.01.2", "current-ready");
+            fs::write(web_dir.join("codex.toml"), &current).unwrap();
+            fs::write(remote_manifest_path(Agent::Codex), current).unwrap();
+            std::env::set_var(
+                CATALOG_URL_ENV,
+                format!("file://{}", web_dir.join("index.toml").display()),
+            );
+
+            let output = check_and_update().expect("manifest update");
+            assert!(output.updated.is_empty());
+            let activated = agents_needing_cache_reload(&output);
+            super::super::manifest::reload_manifests_for_agents(&activated);
+
+            let explain = super::super::manifest::explain(Agent::Codex, "current-ready");
+            assert_eq!(explain.state, super::super::AgentState::Idle);
+            assert_eq!(explain.manifest_version.as_deref(), Some("9999.01.01.2"));
+            assert_eq!(
+                explain.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+                Some("idle")
+            );
+
+            match old_catalog_url {
+                Some(value) => std::env::set_var(CATALOG_URL_ENV, value),
+                None => std::env::remove_var(CATALOG_URL_ENV),
+            }
+            let _ = fs::remove_dir_all(&web_dir);
+        });
+    }
+
+    // seagents: rewritten from herdr's
+    // `auto_update_does_not_reload_agents_whose_check_failed` — same flow without
+    // the removed async `auto_update()` wrapper.
+    #[test]
+    fn cache_reload_skips_agents_whose_check_failed() {
+        with_state_dir("auto-update-skips-failed-agent", || {
+            let initial_codex = remote_manifest("9999.01.01.1", "codex-initial-ready");
+            process_agent_manifest(Agent::Codex, &initial_codex, 1).unwrap();
+            let initial_cursor =
+                remote_manifest_for("cursor", "9999.01.01.1", "cursor-initial-ready");
+            process_agent_manifest(Agent::Cursor, &initial_cursor, 1).unwrap();
+            super::super::manifest::reload_manifests();
+
+            let old_catalog_url = std::env::var_os(CATALOG_URL_ENV);
+            let web_dir = std::env::temp_dir().join(format!(
+                "herdr-manifest-update-partial-web-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&web_dir);
+            fs::create_dir_all(&web_dir).unwrap();
+            fs::write(
+                web_dir.join("index.toml"),
+                r#"
+schema_version = 1
+
+[[agents]]
+id = "codex"
+path = "codex.toml"
+
+[[agents]]
+id = "cursor"
+path = "missing-cursor.toml"
+"#,
+            )
+            .unwrap();
+            let current_codex = remote_manifest("9999.01.01.2", "codex-current-ready");
+            fs::write(web_dir.join("codex.toml"), &current_codex).unwrap();
+            fs::write(remote_manifest_path(Agent::Codex), current_codex).unwrap();
+            fs::write(
+                remote_manifest_path(Agent::Cursor),
+                remote_manifest_for("cursor", "9999.01.01.2", "cursor-current-ready"),
+            )
+            .unwrap();
+            std::env::set_var(
+                CATALOG_URL_ENV,
+                format!("file://{}", web_dir.join("index.toml").display()),
+            );
+
+            let output = check_and_update().expect("manifest update");
+            assert!(output.updated.is_empty());
+            let activated = agents_needing_cache_reload(&output);
+            assert_eq!(activated, vec![Agent::Codex]);
+            super::super::manifest::reload_manifests_for_agents(&activated);
+
+            let codex = super::super::manifest::explain(Agent::Codex, "codex-current-ready");
+            assert_eq!(codex.manifest_version.as_deref(), Some("9999.01.01.2"));
+            assert_eq!(
+                codex.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+                Some("idle")
+            );
+            let cursor = super::super::manifest::explain(Agent::Cursor, "cursor-initial-ready");
+            assert_eq!(cursor.manifest_version.as_deref(), Some("9999.01.01.1"));
+            assert_eq!(
+                cursor.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+                Some("idle")
+            );
+
+            match old_catalog_url {
+                Some(value) => std::env::set_var(CATALOG_URL_ENV, value),
+                None => std::env::remove_var(CATALOG_URL_ENV),
+            }
+            let _ = fs::remove_dir_all(&web_dir);
+        });
+    }
+
+    #[test]
+    fn cache_reload_ignores_retained_status_for_unchecked_agent() {
+        with_state_dir("cache-reload-ignores-retained-status", || {
+            let initial = remote_manifest("9999.01.01.1", "initial-ready");
+            process_agent_manifest(Agent::Codex, &initial, 1).unwrap();
+            super::super::manifest::reload_manifests();
+            fs::write(
+                remote_manifest_path(Agent::Codex),
+                remote_manifest("9999.01.01.2", "current-ready"),
+            )
+            .unwrap();
+
+            let mut status = ManifestUpdateStatus::default();
+            status.agents.insert(
+                "codex".to_string(),
+                AgentRemoteStatus {
+                    cached_version: Some("9999.01.01.1".to_string()),
+                    attempted_version: None,
+                    last_checked_unix: Some(1),
+                    last_result: "current".to_string(),
+                    last_error: None,
+                },
+            );
+            let output = ManifestUpdateOutput {
+                checked: vec![Agent::Cursor],
+                updated: Vec::new(),
+                status,
+            };
+
+            assert!(agents_needing_cache_reload(&output).is_empty());
+        });
+    }
+
     #[test]
     fn process_agent_manifest_rejects_downgrade_and_keeps_cached_manifest() {
         with_state_dir("reject-downgrade", || {
-            let current = remote_manifest("2026.06.10.5", "current");
+            let current = remote_manifest("9999.01.01.1", "current");
             process_agent_manifest(Agent::Codex, &current, 1).unwrap();
 
-            let older = remote_manifest("2026.06.10.4", "older");
+            let older = remote_manifest("9999.01.01.0", "older");
             assert!(process_agent_manifest(Agent::Codex, &older, 2).is_err());
             assert_eq!(
                 fs::read_to_string(remote_manifest_path(Agent::Codex)).unwrap(),
@@ -697,10 +903,10 @@ path = "codex.toml"
     #[test]
     fn process_agent_manifest_rejects_equal_version_content_change() {
         with_state_dir("reject-equal-change", || {
-            let current = remote_manifest("2026.06.10.5", "current");
+            let current = remote_manifest("9999.01.01.1", "current");
             process_agent_manifest(Agent::Codex, &current, 1).unwrap();
 
-            let changed = remote_manifest("2026.06.10.5", "changed");
+            let changed = remote_manifest("9999.01.01.1", "changed");
             assert!(process_agent_manifest(Agent::Codex, &changed, 2).is_err());
             assert_eq!(
                 fs::read_to_string(remote_manifest_path(Agent::Codex)).unwrap(),
@@ -712,7 +918,7 @@ path = "codex.toml"
     #[test]
     fn process_agent_manifest_skips_same_version_same_content() {
         with_state_dir("skip-same", || {
-            let current = remote_manifest("2026.06.10.5", "current");
+            let current = remote_manifest("9999.01.01.1", "current");
             process_agent_manifest(Agent::Codex, &current, 1).unwrap();
 
             let result = process_agent_manifest(Agent::Codex, &current, 2).unwrap();

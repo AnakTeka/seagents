@@ -177,9 +177,7 @@ fn usage() {
 fn update_manifests_now() -> i32 {
     match vendor::herdr_detect::manifest_update::check_and_update() {
         Ok(output) => {
-            if !output.updated.is_empty() {
-                vendor::herdr_detect::manifest::reload_manifests();
-            }
+            reload_updated_manifests(&output);
             for (agent, remote) in &output.status.agents {
                 let version = remote.cached_version.as_deref().unwrap_or("-");
                 match &remote.last_error {
@@ -193,6 +191,17 @@ fn update_manifests_now() -> i32 {
             eprintln!("manifest update failed: {err}");
             1
         }
+    }
+}
+
+/// Refresh the in-process manifest cache for every agent whose rules moved.
+/// Not just the ones this run committed: herdr and seagents share one remote
+/// cache directory, so a manifest the other tool fetched leaves `updated`
+/// empty while the loaded rules are stale.
+fn reload_updated_manifests(output: &vendor::herdr_detect::manifest_update::ManifestUpdateOutput) {
+    let activated = vendor::herdr_detect::manifest_update::agents_needing_cache_reload(output);
+    if !activated.is_empty() {
+        vendor::herdr_detect::manifest::reload_manifests_for_agents(&activated);
     }
 }
 
@@ -223,11 +232,9 @@ pub(crate) fn spawn_manifest_update() {
         }
         let _ = fs::write(&stamp, b"");
         if let Ok(output) = vendor::herdr_detect::manifest_update::check_and_update() {
-            if !output.updated.is_empty() {
-                // The manifest cache is behind an RwLock; the HUD's next poll
-                // picks up the new rules.
-                vendor::herdr_detect::manifest::reload_manifests();
-            }
+            // The manifest cache is behind an RwLock; the HUD's next poll
+            // picks up the new rules.
+            reload_updated_manifests(&output);
         }
     });
 }

@@ -156,7 +156,7 @@ line_regex = ["^exact line$"]
 #[test]
 fn remote_manifest_loads_between_local_override_and_bundled() {
     with_manifest_dirs("remote-source", || {
-        write_remote_codex(&remote_manifest("2026.06.10.5", "blocked", "remote-ready"));
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));
 
         let explain = explain(Agent::Codex, "remote-ready");
 
@@ -165,10 +165,10 @@ fn remote_manifest_loads_between_local_override_and_bundled() {
             explain.source,
             Some(ManifestSource::Remote { .. })
         ));
-        assert_eq!(explain.manifest_version.as_deref(), Some("2026.06.10.5"));
+        assert_eq!(explain.manifest_version.as_deref(), Some("9999.01.01.1"));
         assert_eq!(
             explain.cached_remote_version.as_deref(),
-            Some("2026.06.10.5")
+            Some("9999.01.01.1")
         );
     });
 }
@@ -176,7 +176,7 @@ fn remote_manifest_loads_between_local_override_and_bundled() {
 #[test]
 fn fallback_explain_preserves_active_manifest_version() {
     with_manifest_dirs("fallback-version", || {
-        write_remote_codex(&remote_manifest("2026.06.10.5", "blocked", "remote-ready"));
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));
 
         let explain = explain(Agent::Codex, "ordinary prompt text");
 
@@ -185,7 +185,7 @@ fn fallback_explain_preserves_active_manifest_version() {
             explain.fallback_reason.as_deref(),
             Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
         );
-        assert_eq!(explain.manifest_version.as_deref(), Some("2026.06.10.5"));
+        assert_eq!(explain.manifest_version.as_deref(), Some("9999.01.01.1"));
         assert!(matches!(
             explain.source,
             Some(ManifestSource::Remote { .. })
@@ -216,7 +216,7 @@ fn older_cached_remote_manifest_does_not_shadow_newer_bundled_manifest() {
 #[test]
 fn local_override_shadows_cached_remote_manifest() {
     with_manifest_dirs("local-shadows-remote", || {
-        write_remote_codex(&remote_manifest("2026.06.10.5", "blocked", "remote-ready"));
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));
         write_local_codex(&local_manifest("idle", "local-ready"));
 
         let explain = explain(Agent::Codex, "local-ready");
@@ -226,7 +226,7 @@ fn local_override_shadows_cached_remote_manifest() {
         assert!(explain.local_override_shadowing_remote);
         assert_eq!(
             explain.cached_remote_version.as_deref(),
-            Some("2026.06.10.5")
+            Some("9999.01.01.1")
         );
     });
 }
@@ -234,7 +234,7 @@ fn local_override_shadows_cached_remote_manifest() {
 #[test]
 fn invalid_local_override_falls_back_to_cached_remote_manifest() {
     with_manifest_dirs("invalid-local-remote-fallback", || {
-        write_remote_codex(&remote_manifest("2026.06.10.5", "blocked", "remote-ready"));
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));
         write_local_codex("id = ");
 
         let explain = explain(Agent::Codex, "remote-ready");
@@ -251,7 +251,7 @@ fn invalid_local_override_falls_back_to_cached_remote_manifest() {
 #[test]
 fn detection_uses_cached_manifest_until_explicit_reload() {
     with_manifest_dirs("cache-boundary", || {
-        write_remote_codex(&remote_manifest("2026.06.10.5", "blocked", "cached-ready"));
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "cached-ready"));
 
         let cached = explain(Agent::Codex, "cached-ready");
         assert_eq!(cached.state, AgentState::Blocked);
@@ -261,7 +261,7 @@ fn detection_uses_cached_manifest_until_explicit_reload() {
             Some("test")
         );
 
-        write_remote_codex_without_reload(&remote_manifest("2026.06.10.6", "working", "new-ready"));
+        write_remote_codex_without_reload(&remote_manifest("9999.01.01.2", "working", "new-ready"));
 
         let unchanged = explain(Agent::Codex, "new-ready");
         assert_eq!(unchanged.state, AgentState::Idle);
@@ -271,7 +271,7 @@ fn detection_uses_cached_manifest_until_explicit_reload() {
         );
         assert_eq!(
             unchanged.cached_remote_version.as_deref(),
-            Some("2026.06.10.5")
+            Some("9999.01.01.1")
         );
 
         reload_manifests();
@@ -280,7 +280,7 @@ fn detection_uses_cached_manifest_until_explicit_reload() {
         assert_eq!(reloaded.state, AgentState::Working);
         assert_eq!(
             reloaded.cached_remote_version.as_deref(),
-            Some("2026.06.10.6")
+            Some("9999.01.01.2")
         );
         assert_eq!(
             reloaded.matched_rule.as_ref().map(|rule| rule.id.as_str()),
@@ -357,6 +357,52 @@ fn devin_manifest_detects_idle_working_and_blocked_states() {
     );
     assert_eq!(permission_prompt.state, AgentState::Blocked);
     assert!(permission_prompt.visible_blocker);
+}
+
+#[test]
+fn muse_manifest_requires_complete_live_controls() {
+    let working = explain(
+        Agent::Muse,
+        "⟩ hello\n\n◆ Working (0s · esc to interrupt)\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(working.state, AgentState::Working);
+    assert!(working.visible_working);
+
+    let picker = explain(
+        Agent::Muse,
+        "Which option should I use?\n\n› 1. Alpha\n  2. Beta\n\nEnter to select · ↑/↓ to move · Tab for an optional note · Esc to interrupt\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(picker.state, AgentState::Blocked);
+    assert!(picker.visible_blocker);
+
+    let command_approval = explain(
+        Agent::Muse,
+        "Would you like to run the following command?\n\n$ printf muse-safe-probe\n\n› 1. Allow this stage once (y)\n  2. Always allow in this workspace: printf muse-safe-probe ... (p)\n  3. Abort the entire command (esc)\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(command_approval.state, AgentState::Blocked);
+    assert!(command_approval.visible_blocker);
+
+    let network_approval = explain(
+        Agent::Muse,
+        "network: example.com:443 https\nrequested by:\n$ curl -fsS https://example.com\n\n› 1. Yes, proceed (y)\n  2. Yes, don't ask again this session (p)  example.com:443 (https)\n  3. No, and tell Muse Code what to do differently (esc)\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(network_approval.state, AgentState::Blocked);
+    assert!(network_approval.visible_blocker);
+
+    let menu = explain(
+        Agent::Muse,
+        "Theme\n\n⟩ Default (active)\n  Dynamic\n\n↑↓ move · enter save · esc go back",
+    );
+    assert_eq!(menu.state, AgentState::Unknown);
+    assert!(menu.skip_state_update);
+    assert!(!menu.visible_blocker);
+
+    let ordinary_reply = explain(
+        Agent::Muse,
+        "⟩ say the phrase\n\n◆ Yes, proceed\n\n────────────────\n⟩\n────────────────\ngpt-5.4 · minimal · /workspace",
+    );
+    assert_eq!(ordinary_reply.state, AgentState::Idle);
+    assert!(ordinary_reply.visible_idle);
 }
 
 #[test]
@@ -543,6 +589,53 @@ fn bottom_non_empty_lines_uses_bottom_occurrence_for_repeated_text() {
     );
 }
 
+#[test]
+fn top_non_empty_lines_uses_top_occurrence_for_repeated_text() {
+    let content = "\nmarker\nold\n\nmiddle\nmarker\nnew\n";
+
+    assert_eq!(
+        region(
+            DetectionInput {
+                screen: content,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "top_non_empty_lines(2)"
+        ),
+        "\nmarker\nold\n"
+    );
+}
+
+#[test]
+fn top_non_empty_lines_requires_a_canonical_positive_bounded_count() {
+    let name = "top_non_empty_lines";
+    assert!(validate_region_name(&format!("{name}(1)")).is_ok());
+    assert!(validate_region_name(&format!("{name}({})", u16::MAX)).is_ok());
+    for count in ["0", "01", "+1", "65536", "999999999999999999999999"] {
+        assert!(
+            validate_region_name(&format!("{name}({count})")).is_err(),
+            "{name} accepted invalid count {count}"
+        );
+    }
+}
+
+#[test]
+fn top_non_empty_lines_requires_engine_three_when_declared() {
+    let manifest = r#"
+id = "grok"
+version = "1"
+min_engine_version = 2
+
+[[rules]]
+id = "background"
+state = "working"
+region = " top_non_empty_lines(1) "
+contains = ["active"]
+"#;
+
+    assert!(parse_manifest(manifest).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // OSC rule tests — exercise the new osc_title / osc_progress regions against
 // the bundled Claude and Codex manifests.
@@ -576,6 +669,21 @@ fn claude_osc_title_braille_prefix_is_working() {
         Some("osc_title_working")
     );
     assert!(result.visible_working);
+}
+
+#[test]
+fn claude_osc_title_half_circle_frames_are_working() {
+    for frame in ['◐', '◓', '◑', '◒'] {
+        let title = format!("{frame} Initial conversation with Claude");
+        let result = osc_explain(Agent::Claude, "", &title, "");
+        assert_eq!(result.state, AgentState::Working, "frame {frame}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("osc_title_working"),
+            "frame {frame}"
+        );
+        assert!(result.visible_working, "frame {frame}");
+    }
 }
 
 #[test]
@@ -639,6 +747,30 @@ fn claude_blocker_screen_outranks_osc_idle_title() {
 }
 
 #[test]
+fn claude_mcp_elicitation_is_blocked() {
+    // Regression for issue #3283: an MCP elicitation dialog has Accept/Decline
+    // controls and an "Esc to cancel" footer but no Enter hint, so no blocked
+    // rule matched and the static OSC title reported idle.
+    // Live capture uses curly quotes around the server name; the issue report
+    // transcribed straight quotes. Both must classify as blocked.
+    for screen in [
+        "MCP server \u{201c}my-server\u{201d} requests your input\n\nGrant temporary access to the demo gateway for 15 minutes?\n\n\u{276f} Accept    Decline\n\nEsc to cancel \u{b7} \u{2191}/\u{2193} to navigate\n",
+        "MCP server \"my-server\" requests your input\n\nserver-supplied message\n\n\u{276f} Accept    Decline\n\nEsc to cancel \u{b7} \u{2191}/\u{2193} to navigate\n",
+    ] {
+        let result = with_manifest_dirs("claude-mcp-elicitation", || {
+            osc_explain(Agent::Claude, screen, "\u{2733} Claude Code", "")
+        });
+        assert_eq!(result.state, AgentState::Blocked, "{result:#?}");
+        assert!(result.visible_blocker, "{result:#?}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|r| r.id.as_str()),
+            Some("mcp_elicitation_prompt"),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
 fn claude_empty_osc_empty_screen_is_idle_fallback() {
     // No OSC data, no matching screen rule → fallback idle (unchanged V3 behavior)
     let result = osc_explain(Agent::Claude, "", "", "");
@@ -687,6 +819,40 @@ fn codex_osc_title_plain_is_idle() {
 }
 
 #[test]
+fn codex_trust_directory_requires_live_top_region() {
+    let screen = "> You are in C:\\Users\\user\\project\n\n\
+        Do you trust the contents of this\n\
+        directory? Working with untrusted\n\
+        contents comes with higher risk of\n\
+        prompt injection. Trusting the\n\
+        directory allows project-local config,\n\
+        hooks, and exec policies to load.\n\n\
+        › 1. Yes, continue\n\
+          2. No, quit\n\n\
+        Press enter to continue\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("trust_directory")
+    );
+    assert!(result.visible_blocker);
+
+    let transcript = "› > You are in C:\\Users\\user\\project\n\n\
+        Do you trust the contents of this\n\
+        directory? Working with untrusted contents comes with higher risk.\n";
+    let result = osc_explain(Agent::Codex, transcript, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_ne!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("trust_directory")
+    );
+    assert!(!result.visible_blocker);
+}
+
+#[test]
 fn codex_background_terminal_screen_does_not_override_osc_idle() {
     // Background terminal tasks can be long-lived helpers such as dev servers.
     // They should not make Codex look busy once the foreground turn is idle.
@@ -698,6 +864,170 @@ fn codex_background_terminal_screen_does_not_override_osc_idle() {
         Some("osc_title_idle")
     );
     assert!(result.visible_idle);
+}
+
+#[test]
+fn codex_screen_working_fallback_handles_static_osc_title() {
+    let screen = "• I’ll run it and wait for completion.\n\n\
+        ◦ Working (1m 16s • esc to interrupt) · 1 background…\n\n\
+        › Use /skills to list available skills\n\n\
+        gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("screen_working_fallback")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_osc_working_remains_preferred_over_screen_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\n\
+        › Use /skills to list available skills\n\n\
+        gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "⠸ project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_working")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_screen_blocker_outranks_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        › 1. Yes, proceed\n\
+        Press enter to confirm or esc to cancel\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("live_strong_blocker")
+    );
+    assert!(result.visible_blocker);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_weak_blocker_without_current_prompt_is_blocked() {
+    let result = osc_explain(
+        Agent::Codex,
+        "do you want to continue? [y/n]\n",
+        "project",
+        "",
+    );
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("weak_blocker")
+    );
+}
+
+#[test]
+fn codex_current_prompt_keeps_weak_text_from_overriding_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        do you want to continue? [y/n]\n\
+        › Use /skills to list available skills\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("screen_working_fallback")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn codex_weak_blocker_ignores_finished_response_above_current_prompt() {
+    let screen = "• The `wt rm` transcript now shows [y/N] / esc, matching the real prompt.\n\n\
+        ─ Worked for 4m 59s ─\n\n\
+        › Ask Codex to do anything\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
+}
+
+#[test]
+fn codex_weak_blocker_ignores_wrapped_current_prompt_text() {
+    let screen = "› Explain why this prompt wraps before quoting the confirmation text\n\
+          [y/N] / esc and whether the docs should include it\n\n\
+          gpt-5.6-sol default · /work\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
+}
+
+#[test]
+fn codex_transcript_viewer_outranks_working_fallback() {
+    let screen = "• Working (4s • esc to interrupt)\n\
+        › transcript\n\
+        ↑/↓ to scroll · pgup/pgdn to move · home/end to jump · q to quit · esc to edit prev\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Unknown);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("transcript_viewer")
+    );
+    assert!(result.skip_state_update);
+    assert!(!result.visible_working);
+}
+
+#[test]
+fn codex_screen_working_fallback_ignores_stale_and_prompt_text() {
+    let screens = [
+        "◦ Working (1m 16s • esc to interrupt)\n\
+         ■ Conversation interrupted\n\
+         › Use /skills to list available skills\n\
+         gpt-5.6-sol default · /work\n",
+        "› Explain the text ◦ Working (1m 16s • esc to interrupt)\n\
+         gpt-5.6-sol default · /work\n",
+        "  ◦ Working (1m 16s • esc to interrupt)\n\
+         › Use /skills to list available skills\n\
+         gpt-5.6-sol default · /work\n",
+    ];
+
+    for screen in screens {
+        let result = osc_explain(Agent::Codex, screen, "project", "");
+        assert_eq!(result.state, AgentState::Idle);
+        assert_eq!(
+            result.matched_rule.as_ref().map(|r| r.id.as_str()),
+            Some("osc_title_idle")
+        );
+        assert!(result.visible_idle);
+        assert!(!result.visible_working);
+    }
+}
+
+#[test]
+fn codex_screen_working_fallback_ignores_interrupted_short_terminal() {
+    let screen = "◦ Working (1m 16s • esc to interrupt)\n\
+        ■ Conversation interrupted\n\
+        ›\n";
+    let result = osc_explain(Agent::Codex, screen, "project", "");
+
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|r| r.id.as_str()),
+        Some("osc_title_idle")
+    );
+    assert!(result.visible_idle);
+    assert!(!result.visible_working);
 }
 
 #[test]

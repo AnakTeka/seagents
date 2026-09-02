@@ -252,9 +252,12 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
     ("kilo", include_str!("manifests/kilo.toml")),
     ("kimi", include_str!("manifests/kimi.toml")),
     ("kiro", include_str!("manifests/kiro.toml")),
+    ("maki", include_str!("manifests/maki.toml")),
+    ("muse", include_str!("manifests/muse.toml")),
     ("opencode", include_str!("manifests/opencode.toml")),
     ("pi", include_str!("manifests/pi.toml")),
     ("qodercli", include_str!("manifests/qodercli.toml")),
+    ("qwen", include_str!("manifests/qwen.toml")),
     ("copilot", include_str!("manifests/github-copilot.toml")),
 ];
 
@@ -268,6 +271,7 @@ const MAX_MATCHERS_PER_GATE: usize = 32;
 const MAX_TOTAL_MATCHERS: usize = 1024;
 const MAX_MATCHER_CHARS: usize = 512;
 
+#[allow(dead_code)] // seagents: tests + upstream parity; the binary reloads per agent
 pub(crate) fn reload_manifests() -> Vec<AgentManifestSummary> {
     let _reload_guard = MANIFEST_RELOAD_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -281,6 +285,36 @@ pub(crate) fn reload_manifests() -> Vec<AgentManifestSummary> {
         Err(poisoned) => *poisoned.into_inner() = cache,
     }
     summaries
+}
+
+pub(crate) fn reload_manifests_for_agents(agents: &[Agent]) {
+    if agents.is_empty() {
+        return;
+    }
+
+    let _reload_guard = MANIFEST_RELOAD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock = manifest_cache();
+    let replacements = Agent::SCREEN_MANIFEST_AGENTS
+        .into_iter()
+        .filter(|agent| agents.contains(agent))
+        .map(|agent| (agent, load_manifest_uncached(agent)))
+        .collect::<Vec<_>>();
+    let mut cache = match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for (agent, replacement) in replacements {
+        if let Some((_, loaded)) = cache
+            .manifests
+            .iter_mut()
+            .find(|(cached_agent, _)| *cached_agent == agent)
+        {
+            *loaded = replacement;
+        }
+    }
 }
 
 fn manifest_cache() -> &'static RwLock<ManifestCache> {
@@ -924,6 +958,16 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
         }
         validate_region_name(&rule.region)
             .map_err(|err| format!("rule {} uses invalid region: {err}", rule.id))?;
+        if rule.region.trim().starts_with("top_non_empty_lines(")
+            && manifest
+                .min_engine_version
+                .is_some_and(|version| version < TOP_NON_EMPTY_LINES_ENGINE_VERSION)
+        {
+            return Err(format!(
+                "rule {} uses top_non_empty_lines but min_engine_version is below {}",
+                rule.id, TOP_NON_EMPTY_LINES_ENGINE_VERSION
+            ));
+        }
         validate_rule_gate(rule, &mut complexity)
             .map_err(|err| format!("rule {} has invalid matcher gates: {err}", rule.id))?;
     }
@@ -1077,7 +1121,8 @@ fn validate_region_name(spec: &str) -> Result<(), String> {
         | "osc_title"
         | "osc_progress" => Ok(()),
         _ if region_count(trimmed, "bottom_lines").is_some()
-            || region_count(trimmed, "bottom_non_empty_lines").is_some() =>
+            || region_count(trimmed, "bottom_non_empty_lines").is_some()
+            || top_region_count(trimmed).is_some() =>
         {
             Ok(())
         }
@@ -1274,6 +1319,9 @@ fn region<'a>(input: DetectionInput<'a>, spec: &str) -> &'a str {
             if let Some(count) = region_count(trimmed, "bottom_non_empty_lines") {
                 return bottom_non_empty_lines(content, count);
             }
+            if let Some(count) = top_region_count(trimmed) {
+                return top_non_empty_lines(content, count);
+            }
             ""
         }
     }
@@ -1284,6 +1332,23 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
         .and_then(|rest| rest.strip_prefix('('))
         .and_then(|rest| rest.strip_suffix(')'))
         .and_then(|count| count.parse::<usize>().ok())
+}
+
+const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
+const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
+
+fn top_region_count(spec: &str) -> Option<usize> {
+    let count = spec
+        .strip_prefix("top_non_empty_lines")?
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    if count.starts_with('0') || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    count
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count <= MAX_TOP_REGION_LINE_COUNT)
 }
 
 fn bottom_lines(content: &str, count: usize) -> &str {
@@ -1306,6 +1371,22 @@ fn bottom_non_empty_lines(content: &str, count: usize) -> &str {
         return "";
     };
     slice_from_line_index(content, &lines, start_index)
+}
+
+fn top_non_empty_lines(content: &str, count: usize) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(end_index) = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .take(count)
+        .last()
+        .map(|(index, _)| index)
+    else {
+        return "";
+    };
+    let byte_offset = line_start_offset(content, &lines, end_index + 1);
+    &content[..byte_offset]
 }
 
 fn after_last_prompt_marker(content: &str) -> &str {
