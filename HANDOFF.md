@@ -78,8 +78,22 @@ for_window [window_role="seagents-hud"] floating enable, sticky enable, border p
 Under alacritty (which has no window roles) the same two lines are:
 
 ```conf
-bindsym $mod+o exec --no-startup-id alacritty --class Alacritty,seagents-hud -e seagents hud
-for_window [instance="seagents-hud"] floating enable, sticky enable, border pixel 1, resize set 480 340, move position center
+bindsym $mod+o exec --no-startup-id alacritty --class seagents-hud -e seagents hud
+for_window [instance="^seagents-hud$"] floating enable, sticky enable, border pixel 1, resize set 480 340, move position center
+```
+
+A single `--class <name>` sets **both** halves of WM_CLASS (verified:
+`--class sgprobe` → `class=sgprobe instance=sgprobe`), which is why no comma is
+needed here — and that matters, because **a comma in an i3 `exec` line is i3's
+own command separator**. `--class Alacritty,seagents-hud` unquoted makes i3 run
+`exec ... alacritty --class Alacritty` (no `-e`, so you get a shell in a
+HUD-shaped window) and then fail to parse `seagents-hud -e seagents hud`, which
+raises the "configured command could not be run successfully" nagbar. If you do
+want to keep `Alacritty` as the general class so Alacritty-wide rules still
+apply, quote the whole argument:
+
+```conf
+bindsym $mod+o exec --no-startup-id "alacritty --class Alacritty,seagents-hud -e seagents hud"
 ```
 
 Then reload i3 (`$mod+Shift+c` or `i3-msg reload`). Any other terminal works
