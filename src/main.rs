@@ -611,14 +611,16 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     // terminal at creation and is unique per agent, so it identifies the
     // window with no focus involved at all.
     // Strongest first:
-    //   1. our own /proc ancestry ↔ the window's _NET_WM_PID — exact, and free
-    //      of focus and of handles, but only on a one-process-per-window
-    //      terminal (Terminator shares one process across all its windows, so
-    //      this abstains there);
-    //   2. the handle `restore` minted and passed as --window;
-    //   3. the focused terminal, which is right when a human just typed the
+    //   1. the window id the terminal put in our environment — exact, instant,
+    //      and correct even when one process owns many windows;
+    //   2. our own /proc ancestry ↔ the window's _NET_WM_PID — also exact, but
+    //      only on a one-process-per-window terminal (Terminator shares one
+    //      process across all its windows, so this abstains there);
+    //   3. the handle `restore` minted and passed as --window;
+    //   4. the focused terminal, which is right when a human just typed the
     //      command into it and wrong for anything spawned programmatically.
-    let (con_id, window_id) = focus::window_ids_by_pid()
+    let (con_id, window_id) = focus::window_ids_from_env()
+        .or_else(focus::window_ids_by_pid)
         .map(|(con, xid)| (Some(con), xid))
         .or_else(|| window.as_ref().and_then(|h| focus::window_ids_for_handle(h)))
         .or_else(|| focus::focused_terminal_ids().map(|(con, xid)| (Some(con), xid)))

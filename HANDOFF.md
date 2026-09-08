@@ -283,17 +283,27 @@ we *know* the user is interacting with the agent:
   terminal is focused, so the input pump re-captures both ids — healing
   stale handles within one keystroke of real use.
 
-**On a one-process-per-window terminal, none of that correlation is needed.**
-`window_ids_by_pid()` walks this process's `/proc` ancestry and asks X (via
-`xdotool search --pid`) which window each ancestor owns — `seagents run` is a
-descendant of the terminal that owns its window, so the answer is exact, with
-no focus and no handle involved. It is tried *first* at launch. Terminator
-shares one process across every window it owns (measured: 25 windows, all
-`_NET_WM_PID = 3965`), so the lookup finds many windows for one pid and abstains
-rather than guessing — which is why the handle and focus paths still sit behind
-it. Under alacritty it answers directly, and the "type into the agent once"
-caveat disappears. `xdotool` is optional: without it the lookup returns nothing
-and the old paths carry on.
+**Most terminals make all that correlation unnecessary**, and two paths ahead of
+it try to say so:
+
+1. **`window_ids_from_env()`** — the terminal simply tells its child which
+   window it is: `ALACRITTY_WINDOW_ID`, or the old xterm `WINDOWID`. Measured on
+   alacritty, the value equals i3's window id for every window. This is the best
+   source available — instant, no subprocess, no focus, no handle — and it stays
+   exact when one process owns many windows, so it works under
+   `alacritty --daemon`. The id is validated against the i3 tree, so a value
+   inherited somewhere it no longer applies is declined rather than believed.
+   Terminator sets neither variable.
+2. **`window_ids_by_pid()`** — walks this process's `/proc` ancestry and asks X
+   (via `xdotool search --pid`) which window each ancestor owns; `seagents run`
+   is a descendant of the terminal owning its window. Exact on a
+   one-process-per-window terminal. Terminator shares one process across every
+   window (measured: 25 windows, all `_NET_WM_PID = 3965`), so it finds many
+   windows for one pid and abstains rather than guessing. `xdotool` is optional;
+   without it this yields nothing and the paths below carry on.
+
+Under alacritty either path answers directly and the "type into the agent once"
+caveat disappears.
 
 Resolution: con_id (`i3-msg [con_id=N] focus`; fast, dies on an i3 *restart*)
 → X window id (survives restarts; heals con_id when used) → a clear error
@@ -347,7 +357,8 @@ WM_CLASS captured with it — so a restore puts each window back in the terminal
 it was actually running in, and a half-migrated setup (some agents in
 Terminator, some in alacritty, swallowing on different properties) comes back
 correctly. `SEAGENTS_TERMINAL` overrides that globally with a built-in recipe
-(`terminator`, `alacritty` — both verified end to end); anything else uses
+(`terminator`, `alacritty`, `alacritty-daemon` — all verified end to end);
+anything else uses
 `SEAGENTS_TERMINAL_CMD` (a template over `{handle}`, `{cwd}`, `{cmd}`) together
 with `SEAGENTS_TERMINAL_MATCH=role|instance|class`.
 Those two go together on purpose: set the command without saying how to match
@@ -450,8 +461,11 @@ so three live out of four captured restores exactly one.
   which reports the id on every identity change — `--resume`, `/clear`, compact.
   Deliberately not wired in here: it means injecting `--settings` into every
   `claude` launch, which is the orchestration milestone's call to make.
-- **Only `terminator` and `alacritty` have built-in launch recipes.** Both are
-  verified by `tools/test-restore.sh`. Any other terminal needs
+- **Only `terminator`, `alacritty` and `alacritty-daemon` have built-in launch
+  recipes.** All three are verified by `tools/test-restore.sh`.
+  `alacritty-daemon` needs a daemon already running (`alacritty --daemon`) and
+  reachable — `alacritty msg` finds it via `ALACRITTY_SOCKET` or the default
+  socket path; without one it fails per window with "no socket found". Any other terminal needs
   `SEAGENTS_TERMINAL_CMD` *and* `SEAGENTS_TERMINAL_MATCH` — seagents errors
   rather than guessing, because guessing wrong shows up as placeholders that
   never fill and no error at all.
@@ -527,6 +541,7 @@ SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud
 # does nothing would otherwise compare equal). Run it for each terminal recipe.
 tools/test-restore.sh terminator
 tools/test-restore.sh alacritty
+tools/test-restore.sh alacritty-daemon
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a

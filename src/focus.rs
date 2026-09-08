@@ -128,6 +128,35 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
     }
 }
 
+/// Environment variables through which a terminal tells its child which window
+/// it is running in. `WINDOWID` is the old xterm convention, still set by a
+/// number of terminals; alacritty sets its own.
+const WINDOW_ID_VARS: [&str; 2] = ["ALACRITTY_WINDOW_ID", "WINDOWID"];
+
+/// The (con_id, X window id) of our window, straight from the environment the
+/// terminal handed us.
+///
+/// This beats every other strategy when it is available: no focus, no handle,
+/// no `/proc` walk, no polling, and — unlike `_NET_WM_PID` — it stays exact on
+/// a terminal that runs many windows from one process. Measured on alacritty:
+/// the value equals i3's window id for every window, in daemon mode too, where
+/// `_NET_WM_PID` is shared and useless. Terminator sets neither variable, which
+/// is why the fallbacks below still exist.
+///
+/// The id is validated against the i3 tree, so a value inherited from somewhere
+/// that no longer applies (a detached multiplexer, a window since closed) is
+/// declined rather than believed.
+pub(crate) fn window_ids_from_env() -> Option<(u64, Option<u64>)> {
+    let xid: u64 = WINDOW_ID_VARS
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find_map(|v| v.trim().parse().ok())?;
+    i3_windows()?
+        .into_iter()
+        .find(|w| w.xid == Some(xid))
+        .map(|w| (w.con_id, w.xid))
+}
+
 /// The (con_id, X window id) of the window hosting **this process**, found by
 /// matching our own `/proc` ancestry against windows' `_NET_WM_PID`.
 ///

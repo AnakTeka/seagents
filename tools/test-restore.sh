@@ -8,7 +8,7 @@
 # IPC socket, with HOME pointed at a scratch directory so the real cache and
 # snapshot are never touched.
 #
-#   tools/test-restore.sh [terminator|alacritty]     (default: terminator)
+#   tools/test-restore.sh [terminator|alacritty|alacritty-daemon]
 #
 # The terminal argument matters: the stored layout is terminal-agnostic and the
 # swallow criterion is chosen at restore time (window_role for Terminator, a
@@ -25,14 +25,16 @@ set -u
 SEA="$(cd "$(dirname "$0")/.." && pwd)/target/release/seagents"
 [ -x "$SEA" ] || { echo "build first: cargo build --release"; exit 1; }
 TERM_UNDER_TEST=${1:-terminator}
-command -v "$TERM_UNDER_TEST" >/dev/null || { echo "$TERM_UNDER_TEST not installed"; exit 1; }
+TERM_BIN=${TERM_UNDER_TEST%-daemon}
+command -v "$TERM_BIN" >/dev/null || { echo "$TERM_BIN not installed"; exit 1; }
+ASOCK=/tmp/sg-alacritty-test.sock
 export SEAGENTS_TERMINAL=$TERM_UNDER_TEST
 
 DISP=:9
 WL=wl-seagents-test
 SOCK=/tmp/sg-i3-test.sock          # short: UNIX socket paths cap at ~108 bytes
 ROOT=$(mktemp -d /tmp/seagents-restore-test.XXXXXX)
-WESTON= XWAYLAND= I3=
+WESTON= XWAYLAND= I3= DAEMON=
 
 # Terminals differ in which property carries the handle, so ask i3 on both.
 # Deliberately no `pkill -f`: its pattern matches this script's own command
@@ -47,10 +49,10 @@ kill_agents() {
 
 cleanup() {
   kill_agents
-  for pid in $I3 $XWAYLAND $WESTON; do kill "$pid" 2>/dev/null; done
+  for pid in $DAEMON $I3 $XWAYLAND $WESTON; do kill "$pid" 2>/dev/null; done
   sleep 1
-  for pid in $I3 $XWAYLAND $WESTON; do kill -9 "$pid" 2>/dev/null; done
-  rm -rf "$ROOT" "$SOCK"
+  for pid in $DAEMON $I3 $XWAYLAND $WESTON; do kill -9 "$pid" 2>/dev/null; done
+  rm -rf "$ROOT" "$SOCK" "$ASOCK"
 }
 trap cleanup EXIT
 
@@ -81,6 +83,17 @@ sleep 3
 i3-msg -t get_workspaces >/dev/null 2>&1 || {
   echo "nested i3 did not start:"; cat "$ROOT/i3.log"; exit 1; }
 
+if [ "$TERM_UNDER_TEST" = alacritty-daemon ]; then
+  rm -f "$ASOCK"
+  alacritty --daemon --socket "$ASOCK" > "$ROOT/daemon.log" 2>&1 &
+  DAEMON=$!
+  sleep 3
+  [ -S "$ASOCK" ] || { echo "alacritty daemon did not start"; cat "$ROOT/daemon.log"; exit 1; }
+  # `restore` spawns a bare `alacritty msg`, which finds the daemon through
+  # this variable.
+  export ALACRITTY_SOCKET="$ASOCK"
+fi
+
 dump() {  # the shape of workspace 7: nesting, layouts, percentages
   i3-msg -t get_tree | python3 -c "
 import json,sys
@@ -97,12 +110,20 @@ launch() {  # handle, cwd, grep-token
   local inner="seagents run --window '$1' -- sleep 3600"
   case $TERM_UNDER_TEST in
     terminator) terminator -u --role "$1" --working-directory="$2" \
-                  -x /bin/sh -c "$inner" >/dev/null 2>&1 & ;;
+                  -x /bin/sh -c "$inner" >/dev/null 2>&1 &
+                AGENT_PIDS="$AGENT_PIDS $!" ;;
     alacritty)  alacritty --class "Alacritty,$1" --working-directory "$2" \
-                  -e /bin/sh -c "$inner" >/dev/null 2>&1 & ;;
+                  -e /bin/sh -c "$inner" >/dev/null 2>&1 &
+                AGENT_PIDS="$AGENT_PIDS $!" ;;
+    # A daemon client runs in the foreground and exits immediately; there is no
+    # process of ours to record. Recording $! here would capture the last
+    # background job — the daemon — and kill_agents would shoot it.
+    alacritty-daemon)
+                alacritty msg --socket "$ASOCK" create-window \
+                  --class "Alacritty,$1" --working-directory "$2" \
+                  -e /bin/sh -c "$inner" 2>/dev/null ;;
     *) echo "no launch recipe for $TERM_UNDER_TEST"; return 1 ;;
   esac
-  AGENT_PIDS="$AGENT_PIDS $!"
   for _ in $(seq 1 60); do
     i3-msg -t get_tree | grep -q "seagents-$3" && return 0
     sleep 0.25
@@ -110,17 +131,21 @@ launch() {  # handle, cwd, grep-token
   echo "timed out waiting for window $1"; return 1
 }
 
-# Identity check: on a one-process-per-window terminal, `run` must find its own
-# window from /proc ancestry alone — no --window handle, and focus parked
-# elsewhere. Terminator shares one process across every window, so the pid
-# lookup abstains there by design and this is skipped.
+# Identity check: `run` must find its own window with no --window handle and
+# focus parked elsewhere — from ALACRITTY_WINDOW_ID, or failing that from /proc
+# ancestry. Terminator supplies neither (no window-id variable, and one process
+# behind every window), so it falls back to focus capture and this is skipped.
 if [ "$TERM_UNDER_TEST" != terminator ]; then
   i3-msg 'workspace --no-auto-back-and-forth "8"' >/dev/null
   case $TERM_UNDER_TEST in
     alacritty) alacritty --class "Alacritty,seagents-t9" --working-directory /tmp \
-                 -e /bin/sh -c "seagents run -- sleep 3600" >/dev/null 2>&1 & ;;
+                 -e /bin/sh -c "seagents run -- sleep 3600" >/dev/null 2>&1 &
+               AGENT_PIDS="$AGENT_PIDS $!" ;;
+    alacritty-daemon)
+               alacritty msg --socket "$ASOCK" create-window \
+                 --class "Alacritty,seagents-t9" --working-directory /tmp \
+                 -e /bin/sh -c "seagents run -- sleep 3600" 2>/dev/null ;;
   esac
-  AGENT_PIDS="$AGENT_PIDS $!"
   for _ in $(seq 1 60); do
     i3-msg -t get_tree | grep -q "seagents-t9" && break
     sleep 0.25
@@ -141,9 +166,9 @@ for f in glob.glob(os.environ['HOME']+'/.cache/seagents/*.meta'):
     d=json.load(open(f))
     if d.get('cwd')=='/tmp': print(d.get('con_id'))" | head -1)
   if [ -n "$want" ] && [ "$want" = "$got" ]; then
-    echo "PASS: run() identified its own window by _NET_WM_PID (con_id $got)"
+    echo "PASS: run() identified its own window with no handle or focus (con_id $got)"
   else
-    echo "FAIL: pid identity got '$got', window is '$want'"; exit 1
+    echo "FAIL: identity got '$got', window is '$want'"; exit 1
   fi
   kill_agents; sleep 2
   AGENT_PIDS=""

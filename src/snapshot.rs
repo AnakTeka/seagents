@@ -668,6 +668,27 @@ fn terminal(handle: &str, cwd: &str, inner: &str, class: &str) -> Result<Termina
             ],
             matcher: WindowMatch::Instance,
         }),
+        // One process hosting every window. Cheaper per window, and no longer
+        // costs anything in identity: a window created this way still tells its
+        // child `ALACRITTY_WINDOW_ID`, so `run` identifies itself exactly even
+        // though `_NET_WM_PID` is shared. Needs a daemon already running
+        // (`alacritty --daemon`), otherwise `msg` exits with "no socket found".
+        "alacritty-daemon" => Ok(Terminal {
+            argv: vec![
+                "alacritty".into(),
+                "msg".into(),
+                "create-window".into(),
+                "--class".into(),
+                format!("Alacritty,{handle}"),
+                "--working-directory".into(),
+                cwd.into(),
+                "-e".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                inner.into(),
+            ],
+            matcher: WindowMatch::Instance,
+        }),
         other => Err(format!(
             "SEAGENTS_TERMINAL={other} has no built-in launch recipe; set \
              SEAGENTS_TERMINAL_CMD (with {{handle}}, {{cwd}}, {{cmd}}) and \
