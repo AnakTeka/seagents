@@ -188,6 +188,9 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
 
         if last_refresh.elapsed() >= REFRESH {
             refresh(&mut app);
+            // An open HUD keeps the reboot snapshot fresh even for agents
+            // whose wrappers predate it (they never call it themselves).
+            crate::snapshot::maybe_capture_async();
             last_refresh = Instant::now();
         }
     }

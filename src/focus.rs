@@ -126,6 +126,65 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
     }
 }
 
+/// The (con_id, X window id) of the window whose `prop` equals `value` — the
+/// focus-free identity capture used by windows seagents launched itself.
+/// `prop` is the i3 `window_properties` key the terminal actually sets
+/// (`window_role`, `instance`, `class`).
+///
+/// A terminal launched a moment ago may not have reached the i3 tree yet (the
+/// shell inside it can start before the window is mapped), so this polls
+/// briefly rather than answering "not there" on the first look. Returns None if
+/// the handle never appears, or if two windows carry it — an ambiguous handle
+/// is worse than none, and the input-driven re-capture will heal it on the
+/// first keystroke.
+pub(crate) fn window_ids_for_handle(
+    prop: &str,
+    value: &str,
+) -> Option<(Option<u64>, Option<u64>)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut hits = Vec::new();
+        if let Some(tree) = i3_tree() {
+            collect_handle(&tree, prop, value, &mut hits);
+        }
+        match hits.len() {
+            1 => return Some((Some(hits[0].0), hits[0].1)),
+            0 if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn collect_handle(
+    node: &serde_json::Value,
+    prop: &str,
+    value: &str,
+    out: &mut Vec<(u64, Option<u64>)>,
+) {
+    if node["window_properties"][prop].as_str() == Some(value) {
+        if let Some(con_id) = node["id"].as_u64() {
+            out.push((con_id, node["window"].as_u64()));
+        }
+    }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(children) = node[key].as_array() {
+            for child in children {
+                collect_handle(child, prop, value, out);
+            }
+        }
+    }
+}
+
+fn i3_tree() -> Option<serde_json::Value> {
+    let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 fn focused_node() -> Option<serde_json::Value> {
     let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
     let tree: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;

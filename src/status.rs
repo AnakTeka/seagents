@@ -161,6 +161,9 @@ pub(crate) fn collect(sort: Sort) -> Vec<Session> {
 /// Scan `~/.cache/seagents/*.meta`, classify each session, print a table.
 pub fn print(sort: Sort) -> i32 {
     let sessions = collect(sort);
+    // Cheap piggyback: any `status` invocation also keeps the reboot snapshot
+    // fresh, which matters for agents whose wrappers predate it.
+    crate::snapshot::maybe_capture();
     if sessions.is_empty() {
         println!("no agents tracked");
         return 0;
@@ -190,6 +193,7 @@ pub fn print(sort: Sort) -> i32 {
 /// poll this, render rows, and wire clicks to `seagents focus <pid>`.
 pub fn print_json(sort: Sort) -> i32 {
     let sessions = collect(sort);
+    crate::snapshot::maybe_capture();
     let arr: Vec<serde_json::Value> = sessions
         .iter()
         .map(|s| {

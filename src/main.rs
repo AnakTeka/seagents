@@ -16,6 +16,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 mod detect;
 mod focus;
 mod hud;
+mod snapshot;
 mod status;
 mod vendor;
 
@@ -24,12 +25,38 @@ fn main() {
     let _bin = args.next();
     match args.next().as_deref() {
         Some("run") => {
-            let cmd: Vec<String> = args.collect();
+            // `--window <handle>` (before the agent's own argv) names the i3
+            // window this agent will live in. `restore` passes it because a
+            // window it spawned itself may not be focused yet when we look —
+            // see `window_ids_for_handle`.
+            let mut window: Option<String> = None;
+            let mut cmd: Vec<String> = Vec::new();
+            let mut rest = args.peekable();
+            while let Some(arg) = rest.peek() {
+                match arg.as_str() {
+                    "--window" => {
+                        rest.next();
+                        match rest.next() {
+                            Some(r) => window = Some(r),
+                            None => {
+                                eprintln!("seagents run: --window needs a value");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    "--" => {
+                        rest.next();
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            cmd.extend(rest);
             if cmd.is_empty() {
-                eprintln!("usage: seagents run <cmd> [args...]");
+                eprintln!("usage: seagents run [--window <handle>] <cmd> [args...]");
                 std::process::exit(2);
             }
-            std::process::exit(run(cmd));
+            std::process::exit(run(cmd, window));
         }
         // Hidden: the in-PTY job-control anchor `run` wraps around the agent.
         // The PTY session leader must not BE the agent: a lone process group in
@@ -150,6 +177,16 @@ fn main() {
         // Refresh detection manifests from herdr.dev right now (the HUD also
         // does this in the background at most once a day).
         Some("update-manifests") => std::process::exit(update_manifests_now()),
+        // Reboot survival: the layout snapshot is written continuously by
+        // every wrapper, so these two are only ever "now" and "put it back".
+        Some("snapshot") => {
+            let rest: Vec<String> = args.collect();
+            std::process::exit(snapshot::snapshot_cmd(&rest));
+        }
+        Some("restore") => {
+            let rest: Vec<String> = args.collect();
+            std::process::exit(snapshot::restore_cmd(&rest));
+        }
         Some("hud") | None => std::process::exit(hud::run()),
         Some("help") | Some("-h") | Some("--help") => {
             usage();
@@ -170,6 +207,10 @@ fn usage() {
     eprintln!("  seagents status [--json] [--sort=urgency|dir|recent]");
     eprintln!("                                 show every tracked agent's state");
     eprintln!("  seagents focus <child_pid>     focus that agent's i3 window");
+    eprintln!("  seagents snapshot [--refresh] [--print]");
+    eprintln!("                                 capture the agent layout now (also automatic)");
+    eprintln!("  seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]");
+    eprintln!("                                 rebuild that layout, resuming each session");
     eprintln!("  seagents update-manifests      fetch fresh detection rules from herdr.dev");
 }
 
@@ -559,12 +600,23 @@ mod tests {
     }
 }
 
-fn run(cmd: Vec<String>) -> i32 {
-    // Capture the launching terminal's i3 window up front, while it's still the
-    // focused window (the user just typed the command into it).
-    let (con_id, window_id) = match focus::focused_terminal_ids() {
-        Some((con, xid)) => (Some(con), xid),
-        None => (None, None),
+fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
+    // Capture the i3 window this agent lives in.
+    //
+    // Typed by hand, that's the focused window — the user just typed the
+    // command into it. Launched by `restore`, focus is a race we would lose:
+    // the terminal is still mapping when its shell reaches us, so the focused
+    // window is whatever was focused *before*, and several restored agents
+    // would all record the same wrong con_id. The handle is set by the
+    // terminal at creation and is unique per agent, so it identifies the
+    // window with no focus involved at all.
+    let (con_id, window_id) = match &window {
+        Some(handle) => focus::window_ids_for_handle(snapshot::window_match().key(), handle)
+            .unwrap_or((None, None)),
+        None => match focus::focused_terminal_ids() {
+            Some((con, xid)) => (Some(con), xid),
+            None => (None, None),
+        },
     };
 
     let size = terminal_size();
@@ -795,6 +847,12 @@ fn run(cmd: Vec<String>) -> i32 {
                         }
                     }
                 }
+                // Keep the reboot snapshot current. Globally throttled, so
+                // all but one wrapper per interval pay a single stat() here —
+                // and it lives outside the output-changed guard on purpose:
+                // moving a window to another workspace changes the layout
+                // without producing a byte of agent output.
+                crate::snapshot::maybe_capture();
                 thread::sleep(std::time::Duration::from_secs(2));
             }
         });

@@ -34,6 +34,7 @@ All four milestones are **code-complete and on `main`**:
 | status detection | `seagents status` | done; blocked/working/idle verified live |
 | focus the agent's i3 window | `seagents focus <child_pid>` | done; con_id fix **committed but not yet live-verified** |
 | floating HUD | `seagents hud` | done; works, j/k preview + click-to-focus |
+| reboot survival | `seagents snapshot` / `restore` | done; round-trip verified in a nested X (`tools/test-restore.sh`) |
 
 Focus identity is exact-handle only (no title matching since 2026-07-14), so
 the old two-idle-claudes ambiguity concern is structurally gone; con_id focus
@@ -89,6 +90,12 @@ seagents status [--json] [--sort=urgency|dir|recent]
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
 seagents focus <child_pid> focus that agent's i3 window
+seagents snapshot [--refresh] [--print]
+                           capture the agent layout now (it is also captured
+                           continuously; --refresh re-resolves session ids)
+seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]
+                           rebuild that layout after a reboot, each window
+                           resuming its own conversation
 seagents update-manifests  fetch fresh detection rules from herdr.dev now
 seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
                            dev tool: render a .raw + the engine's explain verdict
@@ -123,6 +130,8 @@ Source layout under `src/`:
   id, with healing), `preview_window()`, `record_window()` (identity capture),
   `focused_con_id()`/`focused_terminal_ids()`, i3 tree helpers.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
+- **`src/snapshot.rs`** — the reboot snapshot: `capture()`, layout emission
+  with i3 swallow criteria, `resolve_session_ids()`, `restore_cmd()`.
 
 ### 1. `seagents run` — the transparent pty-tee launcher
 
@@ -191,9 +200,14 @@ Per session, keyed by the wrapper's pid:
     "argv": ["claude"],
     "started": 1783468316,
     "cols": 212, "rows": 53,        // launch geometry (fallback for rendering)
-    "con_id": 103471613296720       // i3 window recorded at launch (focus handle)
+    "con_id": 103471613296720,      // i3 window recorded at launch (focus handle)
+    "window_id": 30728026,          // X11 id (survives an i3 restart)
+    "session_id": "5c603939-…",     // the agent's own conversation, for restore
+    "session_id_source": "proc"     // how it was learned: "proc" | "title"
   }
   ```
+  `session_id` is filled in lazily by the snapshot capture (see §6), not by
+  `run` — nothing at launch time knows it yet.
 
 Sessions self-reap: `read_session()` deletes both files when the child process is
 gone (`/proc/<child_pid>` missing). So the HUD/status only ever show live agents;
@@ -258,6 +272,87 @@ window, then refocus the HUD so you keep navigating); Enter/click commits the ju
 The HUD remembers its own window (captured lazily on first preview) to return focus
 to. Meant to run as an i3 floating + sticky window (see setup).
 
+### 6. `seagents snapshot` / `restore` — surviving a reboot
+
+`restore` rebuilds the workspaces your agents were on and relaunches each
+window on **its own conversation** (`claude --resume <id>`), so a reboot costs
+you the processes but not the layout or the context. Three problems:
+
+**The layout must outlive the processes.** `~/.cache/seagents/` self-reaps — the
+first `status` after a boot deletes every `.meta` whose child pid is gone, which
+is all of them. So the snapshot lives at `state_dir()/layout.json` and is written
+*continuously*: every wrapper's monitor thread offers a capture each tick,
+globally throttled by the file's own mtime to one write per 30 s. The HUD's poll
+loop and every `status` invocation offer one too — which is what covers agents
+whose wrappers were started before this existed and so never call it themselves.
+An unplanned reboot loses at most 30 s of layout change, and there is no command
+to remember.
+
+**A window must be re-fillable.** i3's `append_layout` matches placeholders by
+*swallow criteria*, and an ordinary terminal window offers nothing stable:
+Terminator windows all share one class, carry no role, and show a title Claude
+overwrites on the first repaint. Restored windows are therefore launched
+carrying a minted handle, `seagents-<tag>`, and the placeholder swallows on that
+alone.
+
+*Which* X11 property carries the handle is the terminal's business — Terminator
+has `--role` and no `--class`; alacritty (and most others) are the reverse — so
+the **stored layout is terminal-agnostic**: leaves keep a `tag`, and the swallow
+criterion is built at restore time from `WindowMatch`. `SEAGENTS_TERMINAL`
+selects a built-in recipe (`terminator`, `alacritty` — both verified end to
+end); anything else uses `SEAGENTS_TERMINAL_CMD` (a template over `{handle}`,
+`{cwd}`, `{cmd}`) together with `SEAGENTS_TERMINAL_MATCH=role|instance|class`.
+Those two go together on purpose: set the command without saying how to match
+the window it opens and every placeholder silently stays empty. We emit the layout
+JSON ourselves rather than shelling to `i3-save-tree`, and installing that tool
+would not change it: it dumps a workspace whole (browsers and editors included)
+where we need agents only with percentages renormalized, and it can only propose
+criteria from a window's *current* class/instance/title — precisely the three
+that don't discriminate here — commented out for hand-editing. The criterion
+that works is a role we mint for a window that doesn't exist yet. Its output is
+also not valid JSON, and it would be a subprocess per workspace every 30 s from
+a thread that already holds the parsed tree.
+
+Because `restore` launches those windows itself, it also passes `--window` to
+`seagents run`, which then identifies its own window **by handle instead of by
+focus**. Focus-based capture is a race a spawned window loses: the shell inside
+reaches `run` while the terminal is still mapping, so several restored agents
+would all record whichever window was focused *before* — one con_id shared by
+many sessions. (Capture guards against that anyway: when two live sessions name
+one window, the earliest launch keeps it and the rest are reported unplaced,
+which the input-driven re-capture heals on the next keystroke.)
+
+**A window must know which conversation it was.** Nothing in a `.meta` records
+it, so `resolve_session_ids()` recovers it from two sources, strongest first,
+and caches the answer into the `.meta` so the pass is a no-op afterwards:
+
+1. **`/proc` file descriptors** — a running Claude holds a directory fd on
+   `/tmp/claude-<uid>/<project-slug>/<session-uuid>/`, validated against the
+   transcript actually existing. Exact, but only present once a session has used
+   that scratch area: 14 of 20 live sessions on the dev machine.
+2. **Window title ↔ transcript `aiTitle`** — Claude writes the conversation's
+   generated title into both the transcript and the terminal's title, so a
+   transcript in the same project carrying the window's title is almost
+   certainly the one. The title comes from the **i3 tree**, not from re-deriving
+   the last OSC title out of the tee (two live sessions here have a stray `;`
+   title later in the stream than their real one). Accepted only when it
+   identifies exactly one *unclaimed* transcript whose mtime is at least the
+   wrapper's start time — two windows in a project can show the same title (a
+   resumed session and its parent), and the wrong conversation is worse than
+   none.
+
+Together: 17 of the dev machine's 19 placed agents resolved, the two refusals
+being a genuinely ambiguous duplicate title and a session still showing the
+default "Claude Code". **Matching on transcript mtime was tried and rejected —
+it was wrong 3 times out of 3.** It is not a fallback, it is a coin flip.
+
+`restore` is safe to run twice and safe to run when only half the agents died: a
+conversation already on screen is skipped by id, and agents without an id are
+matched *by count* per launch signature (project + argv, ignoring `--resume`),
+so three live out of four captured restores exactly one.
+
+---
+
 ---
 
 ## Key design decisions (and why)
@@ -293,6 +388,28 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - **Mouse flicker on HUD preview** — with i3's default `mouse_warping output`, each
   preview warps the mouse to the agent's monitor and back. Setting `mouse_warping
   none` in i3 removes it, but that's a *global* i3 behavior change (undecided).
+- **`restore` reproduces a layout exactly only when nothing is running.** i3
+  appends a layout to a *workspace*; there is no way to drop a placeholder into
+  a container that already holds live windows. The post-reboot case (nothing
+  alive) is exact — verified by `tools/test-restore.sh`. Restoring alongside
+  survivors puts the missing windows at workspace level instead, and says so.
+- **A `/clear` invalidates a cached `session_id`.** Both resolvers describe the
+  transcript a session is writing *now*; `/clear` starts a new one under a new
+  id, and the cached value in the `.meta` goes stale until `snapshot --refresh`.
+  The durable fix is Claude's `SessionStart` hook (see ORCHESTRATION-SPEC),
+  which reports the id on every identity change — `--resume`, `/clear`, compact.
+  Deliberately not wired in here: it means injecting `--settings` into every
+  `claude` launch, which is the orchestration milestone's call to make.
+- **Only `terminator` and `alacritty` have built-in launch recipes.** Both are
+  verified by `tools/test-restore.sh`. Any other terminal needs
+  `SEAGENTS_TERMINAL_CMD` *and* `SEAGENTS_TERMINAL_MATCH` — seagents errors
+  rather than guessing, because guessing wrong shows up as placeholders that
+  never fill and no error at all.
+- **Floating agents restore tiled** — placeholder matching is per-container, and
+  an agent that comes back tiled is a smaller surprise than one that doesn't.
+- **Restored windows land on whichever workspace is focused when they spawn**,
+  so don't switch workspaces during a restore. (`restore` focuses each target
+  workspace before appending and spawning; it can't stop you moving.)
 - **Detection covers herdr's agent roster** — any agent with a bundled manifest
   (claude, codex, gemini, cursor, copilot, …) is classified when launched via
   `seagents run <agent>`; unrecognized commands show as ⚪ unknown.
@@ -320,6 +437,12 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 - ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
   locks AGPL-3.0-or-later; LICENSE file added.
 - Sweep **orphan `.raw`** files that have no `.meta` (only pre-`meta`-era leftovers).
+- **Wire the `SessionStart` hook** so `session_id` is exact for every new
+  session (and survives `/clear`) instead of being recovered after the fact —
+  ORCHESTRATION-SPEC already specs it; today's two resolvers are the bridge for
+  sessions that predate it.
+- Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once
+  it has been through a real reboot, or keep running it by hand.
 - Optional: **eww** port of the HUD for a prettier always-on widget.
 - Optional: read **herdr's socket API** to fold herdr-hosted agents into the same
   HUD (the user runs both herdr and seagents).
@@ -346,6 +469,14 @@ python3 tools/test-jobctl.py
 # Debug the HUD post-mortem (its terminal vanishes with it):
 SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud
 # appends every crossterm input event + the exit reason
+# Regression-test snapshot/restore. Restore rearranges workspaces and opens
+# windows, so it runs inside a nested, isolated desktop (headless weston +
+# rootful Xwayland on :9 + its own i3, with HOME pointed at a scratch dir);
+# agents are `sleep`, so nothing real is launched. Fails with a tree diff, and
+# refuses to pass if the pre-restore kill left anything alive (a restore that
+# does nothing would otherwise compare equal). Run it for each terminal recipe.
+tools/test-restore.sh terminator
+tools/test-restore.sh alacritty
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a
