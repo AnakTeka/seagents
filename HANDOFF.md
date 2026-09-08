@@ -55,8 +55,10 @@ install -Dm755 target/release/seagents ~/.local/bin/seagents   # ensure ~/.local
 ```
 
 Runtime deps on the machine: **i3wm**, **i3-msg** (ships with i3), a terminal
-emulator. Everything else is vendored via Cargo. `xprop`/`xdotool` were present on
-the dev machine but seagents currently only shells out to **`i3-msg`**.
+emulator. Everything else is vendored via Cargo. **`xdotool`** is optional but
+worth having: it is what lets a one-process-per-window terminal identify an
+agent's window exactly (§4); without it seagents falls back to the correlation
+paths.
 
 Auto-track every agent by aliasing `claude` (zsh):
 
@@ -73,9 +75,24 @@ bindsym $mod+o exec --no-startup-id terminator --role=seagents-hud -e "seagents 
 for_window [window_role="seagents-hud"] floating enable, sticky enable, border pixel 1, resize set 480 340, move position center
 ```
 
-Then reload i3 (`$mod+Shift+c` or `i3-msg reload`). If you use a terminal other
-than Terminator, swap the launch command but keep a matchable `window_role`/title;
-seagents itself is terminal-agnostic.
+Under alacritty (which has no window roles) the same two lines are:
+
+```conf
+bindsym $mod+o exec --no-startup-id alacritty --class Alacritty,seagents-hud -e seagents hud
+for_window [instance="seagents-hud"] floating enable, sticky enable, border pixel 1, resize set 480 340, move position center
+```
+
+Then reload i3 (`$mod+Shift+c` or `i3-msg reload`). Any other terminal works
+too — keep a matchable `window_role` **or** WM_CLASS instance of
+`seagents-hud`, which is what `focused_terminal_ids()` checks so the HUD never
+records itself as an agent's window.
+
+**Terminal choice matters more than it looks.** Terminator runs every window
+from one process, which is why window identity needs correlation at all (see
+§4). A terminal that gives each window its own process — alacritty, or kitty
+launched as fresh instances — lets `seagents run` identify its own window
+exactly, from `/proc` ancestry, with no focus race and no unidentifiable
+windows.
 
 ---
 
@@ -128,7 +145,8 @@ Source layout under `src/`:
   rule by id as the manifest loads, so the rest keeps updating upstream.
 - **`src/focus.rs`** — `focus_window()` (exact handles: con_id, then X window
   id, with healing), `preview_window()`, `record_window()` (identity capture),
-  `focused_con_id()`/`focused_terminal_ids()`, i3 tree helpers.
+  `focused_con_id()`/`focused_terminal_ids()`, `window_ids_by_pid()`,
+  `window_ids_for_handle()`, i3 tree helpers.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 - **`src/snapshot.rs`** — the reboot snapshot: `capture()`, layout emission
   with i3 swallow criteria, `resolve_session_ids()`, `restore_cmd()`.
@@ -251,6 +269,18 @@ we *know* the user is interacting with the agent:
   terminal is focused, so the input pump re-captures both ids — healing
   stale handles within one keystroke of real use.
 
+**On a one-process-per-window terminal, none of that correlation is needed.**
+`window_ids_by_pid()` walks this process's `/proc` ancestry and asks X (via
+`xdotool search --pid`) which window each ancestor owns — `seagents run` is a
+descendant of the terminal that owns its window, so the answer is exact, with
+no focus and no handle involved. It is tried *first* at launch. Terminator
+shares one process across every window it owns (measured: 25 windows, all
+`_NET_WM_PID = 3965`), so the lookup finds many windows for one pid and abstains
+rather than guessing — which is why the handle and focus paths still sit behind
+it. Under alacritty it answers directly, and the "type into the agent once"
+caveat disappears. `xdotool` is optional: without it the lookup returns nothing
+and the old paths carry on.
+
 Resolution: con_id (`i3-msg [con_id=N] focus`; fast, dies on an i3 *restart*)
 → X window id (survives restarts; heals con_id when used) → a clear error
 telling the user to type into the agent once. The old title-matching fallback
@@ -298,10 +328,14 @@ alone.
 *Which* X11 property carries the handle is the terminal's business — Terminator
 has `--role` and no `--class`; alacritty (and most others) are the reverse — so
 the **stored layout is terminal-agnostic**: leaves keep a `tag`, and the swallow
-criterion is built at restore time from `WindowMatch`. `SEAGENTS_TERMINAL`
-selects a built-in recipe (`terminator`, `alacritty` — both verified end to
-end); anything else uses `SEAGENTS_TERMINAL_CMD` (a template over `{handle}`,
-`{cwd}`, `{cmd}`) together with `SEAGENTS_TERMINAL_MATCH=role|instance|class`.
+criterion is built at restore time from `WindowMatch`. The terminal is chosen **per agent**, from the
+WM_CLASS captured with it — so a restore puts each window back in the terminal
+it was actually running in, and a half-migrated setup (some agents in
+Terminator, some in alacritty, swallowing on different properties) comes back
+correctly. `SEAGENTS_TERMINAL` overrides that globally with a built-in recipe
+(`terminator`, `alacritty` — both verified end to end); anything else uses
+`SEAGENTS_TERMINAL_CMD` (a template over `{handle}`, `{cwd}`, `{cmd}`) together
+with `SEAGENTS_TERMINAL_MATCH=role|instance|class`.
 Those two go together on purpose: set the command without saying how to match
 the window it opens and every placeholder silently stays empty. We emit the layout
 JSON ourselves rather than shelling to `i3-save-tree`, and installing that tool
@@ -381,7 +415,9 @@ so three live out of four captured restores exactly one.
 - **Multiple agents as tabs in one Terminator window** share one `con_id` (one X
   window); i3 can't focus a tab within a window, so that case is ambiguous.
   Separate windows work perfectly.
-- **Window identity needs one interaction**: if a dialog steals focus at the
+- **Window identity needs one interaction — on a shared-process terminal
+  only.** Under alacritty the `_NET_WM_PID` lookup answers exactly and this
+  does not arise. Under Terminator, if a dialog steals focus at the
   `run` instant, the ids are recorded as `null` — the first keystroke into the
   agent heals them (input-driven re-capture). A session never typed into and
   never focused can't be focused from the HUD until then.

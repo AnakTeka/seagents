@@ -110,10 +110,49 @@ launch() {  # handle, cwd, grep-token
   echo "timed out waiting for window $1"; return 1
 }
 
+# Identity check: on a one-process-per-window terminal, `run` must find its own
+# window from /proc ancestry alone — no --window handle, and focus parked
+# elsewhere. Terminator shares one process across every window, so the pid
+# lookup abstains there by design and this is skipped.
+if [ "$TERM_UNDER_TEST" != terminator ]; then
+  i3-msg 'workspace --no-auto-back-and-forth "8"' >/dev/null
+  case $TERM_UNDER_TEST in
+    alacritty) alacritty --class "Alacritty,seagents-t9" --working-directory /tmp \
+                 -e /bin/sh -c "seagents run -- sleep 3600" >/dev/null 2>&1 & ;;
+  esac
+  AGENT_PIDS="$AGENT_PIDS $!"
+  for _ in $(seq 1 60); do
+    i3-msg -t get_tree | grep -q "seagents-t9" && break
+    sleep 0.25
+  done
+  sleep 3
+  i3-msg 'workspace --no-auto-back-and-forth "7"' >/dev/null   # park focus elsewhere
+  sleep 1
+  want=$(i3-msg -t get_tree | python3 -c "
+import json,sys
+def walk(n):
+    wp=n.get('window_properties') or {}
+    if wp.get('instance')=='seagents-t9': print(n['id']); return
+    for c in n.get('nodes',[])+n.get('floating_nodes',[]): walk(c)
+walk(json.load(sys.stdin))")
+  got=$(python3 -c "
+import json,glob,os
+for f in glob.glob(os.environ['HOME']+'/.cache/seagents/*.meta'):
+    d=json.load(open(f))
+    if d.get('cwd')=='/tmp': print(d.get('con_id'))" | head -1)
+  if [ -n "$want" ] && [ "$want" = "$got" ]; then
+    echo "PASS: run() identified its own window by _NET_WM_PID (con_id $got)"
+  else
+    echo "FAIL: pid identity got '$got', window is '$want'"; exit 1
+  fi
+  kill_agents; sleep 2
+  AGENT_PIDS=""
+fi
+
 i3-msg 'workspace --no-auto-back-and-forth "7"' >/dev/null
 launch seagents-t1 /tmp t1
 launch seagents-t2 "$HOME" t2
-i3-msg 'split v' >/dev/null          # t3 lands nested beside t2
+i3-msg 'split v' >/dev/null
 launch seagents-t3 /etc t3
 sleep 1
 

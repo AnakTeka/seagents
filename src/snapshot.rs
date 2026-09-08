@@ -436,6 +436,9 @@ struct Place {
     workspace: String,
     output: String,
     title: String,
+    /// WM_CLASS general class — which terminal this agent is actually running
+    /// in, so `restore` can put it back in the same one.
+    class: String,
 }
 
 /// Index the tree: con_id → placement, and X window id → con_id (the durable
@@ -477,6 +480,10 @@ fn walk_index(
                     title: node["window_properties"]["title"]
                         .as_str()
                         .unwrap_or(name)
+                        .to_string(),
+                    class: node["window_properties"]["class"]
+                        .as_str()
+                        .unwrap_or_default()
                         .to_string(),
                 },
             );
@@ -593,7 +600,7 @@ struct Terminal {
 /// the criterion that finds the resulting window are one decision — set the
 /// command without saying how to match it and every placeholder silently stays
 /// empty.
-fn terminal(handle: &str, cwd: &str, inner: &str) -> Result<Terminal, String> {
+fn terminal(handle: &str, cwd: &str, inner: &str, class: &str) -> Result<Terminal, String> {
     if let Ok(template) = std::env::var("SEAGENTS_TERMINAL_CMD") {
         let matcher = match std::env::var("SEAGENTS_TERMINAL_MATCH") {
             Ok(m) => WindowMatch::parse(&m).ok_or_else(|| {
@@ -617,7 +624,14 @@ fn terminal(handle: &str, cwd: &str, inner: &str) -> Result<Terminal, String> {
         return Ok(Terminal { argv, matcher });
     }
 
-    let name = std::env::var("SEAGENTS_TERMINAL").unwrap_or_else(|_| "terminator".to_string());
+    // Explicit env wins; otherwise the terminal the agent was actually running
+    // in when captured, so a restore reproduces what was there — which is what
+    // makes a half-migrated setup (some agents in one terminal, some in
+    // another) come back correctly.
+    let name = std::env::var("SEAGENTS_TERMINAL")
+        .ok()
+        .or_else(|| recipe_for_class(class))
+        .unwrap_or_else(|| "terminator".to_string());
     match name.as_str() {
         "terminator" => Ok(Terminal {
             argv: vec![
@@ -662,10 +676,19 @@ fn terminal(handle: &str, cwd: &str, inner: &str) -> Result<Terminal, String> {
     }
 }
 
-/// The matcher alone, for callers that only need to recognize a window
-/// (`seagents run --window`) rather than launch one.
-pub(crate) fn window_match() -> WindowMatch {
-    terminal("", "", "")
+/// The built-in recipe matching a captured window's WM_CLASS, if there is one.
+fn recipe_for_class(class: &str) -> Option<String> {
+    match class.to_ascii_lowercase().as_str() {
+        "terminator" => Some("terminator".to_string()),
+        "alacritty" => Some("alacritty".to_string()),
+        _ => None,
+    }
+}
+
+/// The swallow criterion for one captured agent — i.e. which property the
+/// terminal that will relaunch it is going to set.
+fn matcher_for(class: &str) -> WindowMatch {
+    terminal("", "", "", class)
         .map(|t| t.matcher)
         .unwrap_or(WindowMatch::Instance)
 }
@@ -807,18 +830,22 @@ fn leaf_tag(node: &Value) -> Option<String> {
 /// Turn the stored layout into what i3's `append_layout` expects: every leaf's
 /// `tag` becomes a swallow criterion on whichever property this terminal
 /// actually sets.
-fn to_i3_nodes(nodes: &[Value], matcher: WindowMatch) -> Vec<Value> {
+fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<Value> {
     nodes
         .iter()
         .map(|node| {
             let mut out = node.clone();
             if let Some(tag) = leaf_tag(node) {
+                let matcher = matchers
+                    .get(&tag)
+                    .copied()
+                    .unwrap_or(WindowMatch::Instance);
                 out.as_object_mut().map(|o| o.remove("tag"));
                 out["swallows"] = json!([{
                     matcher.key(): format!("^{}$", handle_for(&tag))
                 }]);
             } else if let Some(kids) = node["nodes"].as_array() {
-                out["nodes"] = json!(to_i3_nodes(kids, matcher));
+                out["nodes"] = json!(to_i3_nodes(kids, matchers));
             }
             out
         })
@@ -950,6 +977,9 @@ fn capture(refresh: bool) -> Result<Value, String> {
                     "dir": s.dir(),
                     "argv": s.argv,
                     "session_id": s.session_id,
+                    "terminal_class": located
+                        .get(&s.wrapper_pid)
+                        .map(|c| places[c].class.clone()),
                 })
             })
             .collect();
@@ -1156,11 +1186,6 @@ pub fn restore_cmd(args: &[String]) -> i32 {
             .or_insert(0) += 1;
     }
 
-    // Which property the placeholders should swallow on is the terminal's
-    // choice, resolved once here — a stored layout is deliberately terminal-
-    // agnostic, so the same snapshot restores under Terminator or alacritty.
-    let matcher = window_match();
-
     let empty = Vec::new();
     let mut launched = 0usize;
     let mut skipped = 0usize;
@@ -1200,6 +1225,19 @@ pub fn restore_cmd(args: &[String]) -> i32 {
             .filter_map(|a| a["tag"].as_str().map(str::to_string))
             .collect();
         let layout = prune_layout(ws["layout"].as_array().unwrap_or(&empty), &keep);
+        // Per agent, not per restore: mid-migration a workspace can hold
+        // windows from two different terminals, which swallow on different
+        // properties.
+        let matchers: HashMap<String, WindowMatch> = todo
+            .iter()
+            .filter_map(|a| {
+                let tag = a["tag"].as_str()?;
+                Some((
+                    tag.to_string(),
+                    matcher_for(a["terminal_class"].as_str().unwrap_or_default()),
+                ))
+            })
+            .collect();
 
         println!(
             "workspace {name}: {} window{}",
@@ -1219,7 +1257,7 @@ pub fn restore_cmd(args: &[String]) -> i32 {
             &name,
             ws["output"].as_str().unwrap_or_default(),
             &layout,
-            matcher,
+            &matchers,
         ) {
             eprintln!("seagents: workspace {name}: {e}");
             continue;
@@ -1230,7 +1268,12 @@ pub fn restore_cmd(args: &[String]) -> i32 {
             }
             let tag = a["tag"].as_str().unwrap_or_default();
             let cwd = a["cwd"].as_str().unwrap_or_default();
-            if let Err(e) = spawn_terminal(tag, cwd, &resume_argv(a)) {
+            if let Err(e) = spawn_terminal(
+                tag,
+                cwd,
+                &resume_argv(a),
+                a["terminal_class"].as_str().unwrap_or_default(),
+            ) {
                 eprintln!("seagents: {}: {e}", a["dir"].as_str().unwrap_or("?"));
                 continue;
             }
@@ -1336,7 +1379,7 @@ fn place_workspace(
     name: &str,
     output: &str,
     layout: &[Value],
-    matcher: WindowMatch,
+    matchers: &HashMap<String, WindowMatch>,
 ) -> Result<(), String> {
     i3_msg(&format!(
         "workspace --no-auto-back-and-forth {}",
@@ -1359,7 +1402,7 @@ fn place_workspace(
     // array.
     let file = std::env::temp_dir().join(format!("seagents-restore-{}.json", std::process::id()));
     let mut text = String::new();
-    for node in to_i3_nodes(layout, matcher) {
+    for node in to_i3_nodes(layout, matchers) {
         text.push_str(&serde_json::to_string_pretty(&node).map_err(|e| e.to_string())?);
         text.push('\n');
     }
@@ -1413,7 +1456,7 @@ fn quote_i3(s: &str) -> String {
 ///
 /// `SEAGENTS_TERMINAL_CMD` overrides the whole invocation for terminals other
 /// than Terminator; `{role}`, `{cwd}` and `{cmd}` are substituted.
-fn spawn_terminal(tag: &str, cwd: &str, argv: &[String]) -> Result<(), String> {
+fn spawn_terminal(tag: &str, cwd: &str, argv: &[String], class: &str) -> Result<(), String> {
     let handle = handle_for(tag);
     // `--window` so the wrapper identifies its own window by handle rather than
     // by winning a focus race it cannot win.
@@ -1422,7 +1465,7 @@ fn spawn_terminal(tag: &str, cwd: &str, argv: &[String]) -> Result<(), String> {
         shell_quote(&handle),
         argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
     );
-    let term = terminal(&handle, cwd, &inner)?;
+    let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
         return Err("terminal command is empty".to_string());
     };
@@ -1516,14 +1559,22 @@ mod tests {
         let nodes = pruned["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["tag"].as_str(), Some("abc"));
-        // The criterion is chosen when the layout is handed to i3, not stored.
-        let role = to_i3_nodes(nodes, WindowMatch::Role);
+        // The criterion is chosen when the layout is handed to i3, not stored,
+        // and it is per agent — a half-migrated workspace holds windows from
+        // two terminals that swallow on different properties.
+        let role = to_i3_nodes(
+            nodes,
+            &HashMap::from([("abc".to_string(), WindowMatch::Role)]),
+        );
         assert_eq!(
             role[0]["swallows"][0]["window_role"].as_str(),
             Some("^seagents-abc$")
         );
         assert!(role[0].get("tag").is_none());
-        let instance = to_i3_nodes(nodes, WindowMatch::Instance);
+        let instance = to_i3_nodes(
+            nodes,
+            &HashMap::from([("abc".to_string(), WindowMatch::Instance)]),
+        );
         assert_eq!(
             instance[0]["swallows"][0]["instance"].as_str(),
             Some("^seagents-abc$")
@@ -1584,6 +1635,23 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(leaf_tag(&kept[0]).as_deref(), Some("b"));
         assert_eq!(kept[0]["percent"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn the_swallow_property_follows_the_terminal_the_agent_was_running_in() {
+        // No SEAGENTS_TERMINAL override in the test environment, so the
+        // captured WM_CLASS decides.
+        if std::env::var_os("SEAGENTS_TERMINAL").is_none()
+            && std::env::var_os("SEAGENTS_TERMINAL_CMD").is_none()
+        {
+            assert_eq!(matcher_for("Terminator"), WindowMatch::Role);
+            assert_eq!(matcher_for("Alacritty"), WindowMatch::Instance);
+            // Unknown terminal: fall back to the Terminator recipe, whose
+            // property is a role.
+            assert_eq!(matcher_for("Xterm"), WindowMatch::Role);
+        }
+        assert_eq!(recipe_for_class("alacritty").as_deref(), Some("alacritty"));
+        assert_eq!(recipe_for_class("Konsole"), None);
     }
 
     #[test]

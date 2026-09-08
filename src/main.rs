@@ -610,14 +610,19 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     // would all record the same wrong con_id. The handle is set by the
     // terminal at creation and is unique per agent, so it identifies the
     // window with no focus involved at all.
-    let (con_id, window_id) = match &window {
-        Some(handle) => focus::window_ids_for_handle(snapshot::window_match().key(), handle)
-            .unwrap_or((None, None)),
-        None => match focus::focused_terminal_ids() {
-            Some((con, xid)) => (Some(con), xid),
-            None => (None, None),
-        },
-    };
+    // Strongest first:
+    //   1. our own /proc ancestry ↔ the window's _NET_WM_PID — exact, and free
+    //      of focus and of handles, but only on a one-process-per-window
+    //      terminal (Terminator shares one process across all its windows, so
+    //      this abstains there);
+    //   2. the handle `restore` minted and passed as --window;
+    //   3. the focused terminal, which is right when a human just typed the
+    //      command into it and wrong for anything spawned programmatically.
+    let (con_id, window_id) = focus::window_ids_by_pid()
+        .map(|(con, xid)| (Some(con), xid))
+        .or_else(|| window.as_ref().and_then(|h| focus::window_ids_for_handle(h)))
+        .or_else(|| focus::focused_terminal_ids().map(|(con, xid)| (Some(con), xid)))
+        .unwrap_or((None, None));
 
     let size = terminal_size();
 

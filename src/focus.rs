@@ -115,21 +115,112 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
     let xid = node.get("window").and_then(|w| w.as_u64());
     let class = node["window_properties"]["class"].as_str().unwrap_or("");
     // Never record the HUD's own window as an agent's: it's terminal-class
-    // too, and preview flicker can leave it focused at capture time.
-    let role = node["window_properties"]["window_role"]
-        .as_str()
-        .unwrap_or("");
-    if xid.is_some() && looks_like_terminal(class) && role != "seagents-hud" {
+    // too, and preview flicker can leave it focused at capture time. Check
+    // both properties — the HUD is launched with `--role` under Terminator and
+    // with a WM_CLASS instance under terminals that have no roles.
+    let is_hud = ["window_role", "instance"]
+        .iter()
+        .any(|p| node["window_properties"][*p].as_str() == Some("seagents-hud"));
+    if xid.is_some() && looks_like_terminal(class) && !is_hud {
         node["id"].as_u64().map(|con_id| (con_id, xid))
     } else {
         None
     }
 }
 
-/// The (con_id, X window id) of the window whose `prop` equals `value` — the
-/// focus-free identity capture used by windows seagents launched itself.
-/// `prop` is the i3 `window_properties` key the terminal actually sets
-/// (`window_role`, `instance`, `class`).
+/// The (con_id, X window id) of the window hosting **this process**, found by
+/// matching our own `/proc` ancestry against windows' `_NET_WM_PID`.
+///
+/// This is the identity capture with no correlation in it at all: no focus, no
+/// minted handle, nothing to race. `seagents run` is a descendant of the
+/// terminal that owns the window, so walking up from our own pid and asking X
+/// which window each ancestor owns answers the question directly.
+///
+/// It only works on a terminal that runs **one process per window**. Terminator
+/// shares a single process across every window it owns (verified: fourteen
+/// windows, all `_NET_WM_PID = 3965`), so the lookup finds many windows for one
+/// ancestor and gives up rather than guessing — which is exactly why the
+/// handle and focus paths still exist behind it.
+///
+/// Needs `xdotool`; without it this simply returns None and the caller falls
+/// back. Ancestors are tried nearest-first, so a shell between us and the
+/// terminal costs one extra lookup rather than a wrong answer.
+pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
+    let windows = i3_windows()?;
+    let known: std::collections::HashSet<u64> =
+        windows.iter().filter_map(|w| w.xid).collect();
+
+    for pid in ancestors(std::process::id() as u64) {
+        let Ok(out) = Command::new("xdotool")
+            .args(["search", "--pid", &pid.to_string()])
+            .output()
+        else {
+            return None; // xdotool missing — nothing to fall through to here.
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let hits: Vec<u64> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            // X clients own windows i3 never manages (icon/group leaders);
+            // only the ones in the tree are real candidates.
+            .filter(|x| known.contains(x))
+            .collect();
+        match hits.len() {
+            0 => continue,
+            1 => {
+                let xid = hits[0];
+                return windows
+                    .iter()
+                    .find(|w| w.xid == Some(xid))
+                    .map(|w| (w.con_id, w.xid));
+            }
+            // One process, many windows: a shared-process terminal. Ambiguous.
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// This process's pid chain, nearest ancestor first, stopping at init.
+fn ancestors(mut pid: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    // Bounded: a /proc loop would otherwise hang the launch path.
+    for _ in 0..32 {
+        let Some(parent) = parent_pid(pid) else { break };
+        if parent <= 1 {
+            break;
+        }
+        out.push(parent);
+        pid = parent;
+    }
+    out
+}
+
+fn parent_pid(pid: u64) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm can hold spaces and parens; ppid is the 2nd field after the last ')'.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Every X11 property a terminal might use to carry a handle we minted.
+/// Terminator has `--role` and no `--class`; most others are the reverse.
+pub(crate) const HANDLE_PROPS: [&str; 3] = ["window_role", "instance", "class"];
+
+/// The (con_id, X window id) of the window carrying `value` in any of
+/// [`HANDLE_PROPS`] — the handle-based identity capture, for windows seagents
+/// launched itself on a terminal where [`window_ids_by_pid`] cannot help.
+///
+/// All three properties are searched rather than the one this terminal is
+/// configured to set, because the handle is a minted unique string: whichever
+/// property it turns up in, it identifies the same window, and searching
+/// broadly means `run` needs no knowledge of how it was launched.
 ///
 /// A terminal launched a moment ago may not have reached the i3 tree yet (the
 /// shell inside it can start before the window is mapped), so this polls
@@ -137,16 +228,15 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
 /// the handle never appears, or if two windows carry it — an ambiguous handle
 /// is worse than none, and the input-driven re-capture will heal it on the
 /// first keystroke.
-pub(crate) fn window_ids_for_handle(
-    prop: &str,
-    value: &str,
-) -> Option<(Option<u64>, Option<u64>)> {
+pub(crate) fn window_ids_for_handle(value: &str) -> Option<(Option<u64>, Option<u64>)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let mut hits = Vec::new();
         if let Some(tree) = i3_tree() {
-            collect_handle(&tree, prop, value, &mut hits);
+            collect_handle(&tree, value, &mut hits);
         }
+        hits.sort();
+        hits.dedup();
         match hits.len() {
             1 => return Some((Some(hits[0].0), hits[0].1)),
             0 if std::time::Instant::now() < deadline => {
@@ -157,13 +247,11 @@ pub(crate) fn window_ids_for_handle(
     }
 }
 
-fn collect_handle(
-    node: &serde_json::Value,
-    prop: &str,
-    value: &str,
-    out: &mut Vec<(u64, Option<u64>)>,
-) {
-    if node["window_properties"][prop].as_str() == Some(value) {
+fn collect_handle(node: &serde_json::Value, value: &str, out: &mut Vec<(u64, Option<u64>)>) {
+    let carries = HANDLE_PROPS
+        .iter()
+        .any(|p| node["window_properties"][*p].as_str() == Some(value));
+    if carries {
         if let Some(con_id) = node["id"].as_u64() {
             out.push((con_id, node["window"].as_u64()));
         }
@@ -171,7 +259,7 @@ fn collect_handle(
     for key in ["nodes", "floating_nodes"] {
         if let Some(children) = node[key].as_array() {
             for child in children {
-                collect_handle(child, prop, value, out);
+                collect_handle(child, value, out);
             }
         }
     }
