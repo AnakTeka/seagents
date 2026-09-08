@@ -117,7 +117,8 @@ seagents [hud]              floating agent HUD (also the default with no args)
 seagents run <cmd> [args]   launch an agent, teeing its output (this is how tracking happens)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
-                           (--json: machine-readable, for eww/widget frontends;
+                           (--json: machine-readable, for eww/widget frontends,
+                            incl. each agent's conversation `title`;
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
 seagents focus <child_pid> focus that agent's i3 window
@@ -136,7 +137,16 @@ HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
 keep focus on HUD); `g`/`G` = first/last row (vim-style, also previews);
 `Enter`/left-click = **jump** (commit focus to the agent);
 `s` = cycle sort (urgency → dir → recent; remembered across launches);
-`r` = refresh now; `q`/`Esc` = quit.
+`t` = cycle the name columns — **both** (directory + title, the default) →
+**title** only → **dir** only (remembered across launches);
+`?` = the full key list, as an overlay (the footer hint is one line and a
+floating window clips it); `r` = refresh now; `q`/`Esc` = quit.
+
+While the `?` overlay is up it owns the keyboard: any key but `q` dismisses it
+rather than acting, so a keystroke aimed at the overlay can't navigate the list
+underneath. It draws over the agent list (no room for both in a floating
+window), and if the window is too short for all nine bindings the bottom border
+says `▼ n more` — otherwise `q / esc` would silently fall off the end.
 
 ---
 
@@ -148,7 +158,8 @@ Source layout under `src/`:
   `session_paths()`, `write_meta()`, `terminal_size()`; manifest-update helpers.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()`, `print()`,
   `read_session()` (detection + reaping), OSC-title parsing (`all_titles`,
-  `current_title`), `live_pty_size()`, `read_tail()`.
+  `current_title`, `strip_title_glyph`, `conversation_title`),
+  `live_pty_size()`, `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
   vendored engine's verdicts on live-capture scenarios.
 - **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
@@ -325,6 +336,41 @@ ratatui 0.28 TUI, polls `status::collect()` every 750 ms, color-codes rows
 window, then refocus the HUD so you keep navigating); Enter/click commits the jump.
 The HUD remembers its own window (captured lazily on first preview) to return focus
 to. Meant to run as an i3 floating + sticky window (see setup).
+
+**Rows are named by directory, conversation title, or both (`t`).** The title is
+the one Claude generates for the session — the human-readable line
+`claude --resume` lists — which it also stamps into the terminal title behind a
+state glyph (`✳ Detection update`). `read_session()` already parses that title
+for the detection engine, so surfacing it costs nothing extra: it is
+glyph-stripped by `status::conversation_title()` and carried on `Session.title`
+(also emitted by `status --json`, for widget frontends). Two consequences worth
+knowing:
+
+- A session that hasn't named its conversation yet shows Claude's own banner
+  (`Claude Code`), which says less than the directory does — that placeholder
+  comes back **empty**, and the row falls back to the directory. Same for the
+  stray punctuation-only titles some live tees carry.
+- Titles are sentences where directories are words, so the row layout is a
+  **ladder of candidate layouts** (`session_line`) rather than a fixed set of
+  columns: the first that fits the width wins, and the optional columns drop
+  widest-first — the command (`claude` on nearly every row), then the state
+  word (the coloured dot already carries the state). The duration is allocated
+  first and never sacrificed.
+- In **both** mode the title yields *last*, not first. A 47-column window
+  cannot hold four columns, and a `both` mode that dropped the title there
+  would silently be `dir` mode — so the command and the state word are spent on
+  the title before the row falls back to the directory alone. For the same
+  reason the directory column is capped against the *window* (`width / 3`) and
+  not just at 18 columns: one `20260612_doc_parser` on screen otherwise left a
+  43-column row no room for a title at all.
+- Column widths are measured once per frame (`Cols::measure`) and shared by
+  every row, so the columns line up; a frame in which no agent has named its
+  conversation draws no title column at all rather than a block of blanks.
+
+Both view modes persist in `state_dir()` — one word per file (`hud-sort`,
+`hud-label`: `urgency|dir|recent`, `both|title|dir`) — so the setting survives
+closing the HUD window. `draw()` is covered headlessly through ratatui's
+`TestBackend` (the *event loop* still needs a real terminal).
 
 ### 6. `seagents snapshot` / `restore` — surviving a reboot
 

@@ -279,15 +279,6 @@ fn transcript_titles(path: &Path) -> Vec<String> {
     out
 }
 
-/// Strip the leading state glyph Claude prefixes onto its window title
-/// (`✳ `, `◐ `, …) so the remainder can be compared to a transcript's
-/// `aiTitle`.
-fn strip_title_glyph(title: &str) -> &str {
-    title
-        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'')
-        .trim()
-}
-
 /// Work out which conversation each live Claude window is running.
 ///
 /// Two sources, strongest first — and the result is cached into the `.meta`,
@@ -371,7 +362,7 @@ fn resolve_session_ids(
         let Some(title) = titles.get(&s.wrapper_pid) else {
             continue;
         };
-        let title = strip_title_glyph(title).to_string();
+        let title = crate::status::strip_title_glyph(title).to_string();
         if title.is_empty() {
             continue;
         }
@@ -1525,15 +1516,6 @@ mod tests {
         assert!(!is_uuid("5c603939-bf27-47c8-8b0f-13731d2cc6e"));
         assert!(!is_uuid("not-a-uuid"));
         assert!(!is_uuid("5c603939zbf27-47c8-8b0f-13731d2cc6eb"));
-    }
-
-    #[test]
-    fn strips_the_state_glyph_off_a_window_title() {
-        assert_eq!(strip_title_glyph("✳ Detection update"), "Detection update");
-        assert_eq!(strip_title_glyph("◐ QC-1 Kas & Bank"), "QC-1 Kas & Bank");
-        assert_eq!(strip_title_glyph("Detection update"), "Detection update");
-        // A title that opens with punctuation keeps it.
-        assert_eq!(strip_title_glyph("✳ \"quoted\" thing"), "\"quoted\" thing");
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub(crate) struct Session {
     /// terminal's focus-in report triggers a repaint), so a preview from the
     /// HUD would reset an output-mtime clock.
     pub(crate) state_secs: u64,
+    /// The conversation's own name, as the agent stamps it into the window
+    /// title: Claude writes its generated `aiTitle` there (behind a state
+    /// glyph), which is the human-readable line `claude --resume` lists. Glyph
+    /// stripped; empty when the agent hasn't named the conversation yet, so a
+    /// caller showing it can fall back to the directory.
+    pub(crate) title: String,
 }
 
 /// The three questions the list can be ordered to answer.
@@ -205,6 +211,7 @@ pub fn print_json(sort: Sort) -> i32 {
                 "cmd": s.cmd,
                 "pid": s.pid,
                 "state_secs": s.state_secs,
+                "title": s.title,
             })
         })
         .collect();
@@ -244,7 +251,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
     }
 
     // 1 MB tail: big enough to contain a full screen repaint for rendering.
-    let state = match read_tail(&raw, 1024 * 1024) {
+    let (state, title) = match read_tail(&raw, 1024 * 1024) {
         Some(buf) => {
             // Prefer the child's *live* pty size (accurate, survives resize and
             // missing meta); fall back to meta, then a sane default.
@@ -258,9 +265,11 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
             let detection = crate::vendor::herdr_detect::detect_agent_with_osc(
                 agent, &screen, &title, "",
             );
-            State::from(detection.state)
+            // The same title the engine classifies on is also the one the HUD
+            // can label the row with — parsed once, used twice.
+            (State::from(detection.state), conversation_title(&title))
         }
-        None => State::Unknown,
+        None => (State::Unknown, String::new()),
     };
 
     let now = unix_now();
@@ -285,6 +294,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         cmd,
         pid: child_pid.unwrap_or(wrapper_pid),
         state_secs: now.saturating_sub(record.since),
+        title,
     })
 }
 
@@ -489,6 +499,36 @@ pub(crate) fn current_title(data: &[u8]) -> Option<String> {
         .find(|t| !t.trim().is_empty())
 }
 
+/// Titles an agent shows before it has named the conversation: its own product
+/// banner, which says strictly less than the launch directory does. Treated as
+/// no title at all.
+const PLACEHOLDER_TITLES: &[&str] = &["Claude Code"];
+
+/// The conversation's display name, out of a raw window title.
+///
+/// Claude stamps the conversation's generated `aiTitle` into the terminal title
+/// behind a state glyph, so dropping the glyph leaves exactly the line
+/// `claude --resume` lists. Comes back empty when there is nothing to show — a
+/// not-yet-named session's banner, or one of the punctuation-only titles Claude
+/// sometimes emits — so the caller can fall back to the directory.
+pub(crate) fn conversation_title(raw: &str) -> String {
+    let title = strip_title_glyph(raw);
+    if PLACEHOLDER_TITLES.contains(&title) {
+        String::new()
+    } else {
+        title.to_string()
+    }
+}
+
+/// Strip the leading state glyph Claude prefixes onto its window title
+/// (`✳ `, `◐ `, …) so the remainder can be compared to a transcript's
+/// `aiTitle` — or shown as the conversation's name.
+pub(crate) fn strip_title_glyph(title: &str) -> &str {
+    title
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'')
+        .trim()
+}
+
 /// Collect the text of every OSC 0/1/2 (title) sequence in the stream, in order.
 fn all_titles(data: &[u8]) -> Vec<String> {
     let mut titles = Vec::new();
@@ -552,6 +592,29 @@ mod tests {
         // working spinner, then Claude clears the title → still the spinner title
         let data = b"\x1b]2;\xe2\xa0\x82 Claude Code\x07\x1b]2;\x07";
         assert_eq!(current_title(data).as_deref(), Some("⠂ Claude Code"));
+    }
+
+    #[test]
+    fn strips_the_state_glyph_off_a_window_title() {
+        assert_eq!(strip_title_glyph("\u{2733} Detection update"), "Detection update");
+        assert_eq!(strip_title_glyph("\u{25d0} QC-1 Kas & Bank"), "QC-1 Kas & Bank");
+        assert_eq!(strip_title_glyph("Detection update"), "Detection update");
+        // A title that opens with punctuation keeps it.
+        assert_eq!(strip_title_glyph("\u{2733} \"quoted\" thing"), "\"quoted\" thing");
+    }
+
+    #[test]
+    fn conversation_title_drops_glyphs_placeholders_and_junk() {
+        // The real thing: what `claude --resume` shows, behind a state glyph.
+        assert_eq!(
+            conversation_title("\u{2733} I3wm workspace restoration on reboot"),
+            "I3wm workspace restoration on reboot"
+        );
+        // A session that hasn't named its conversation yet, and the stray
+        // punctuation-only titles seen in live tees: nothing to show.
+        assert_eq!(conversation_title("\u{2733} Claude Code"), "");
+        assert_eq!(conversation_title(";"), "");
+        assert_eq!(conversation_title(""), "");
     }
 
     #[test]
