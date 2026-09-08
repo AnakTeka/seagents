@@ -339,11 +339,24 @@ fn draw(f: &mut Frame, app: &mut App) {
         let above = offset;
         let below = total.saturating_sub(offset + visible);
 
-        let items: Vec<ListItem> = app.sessions.iter().map(session_row).collect();
+        // Width a row actually gets: the block's borders take two columns, and
+        // `highlight_symbol` reserves its own width on *every* row, not just
+        // the selected one.
+        let row_width = body
+            .width
+            .saturating_sub(2)
+            .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16)
+            as usize;
+        let time_w = duration_width(&app.sessions);
+        let items: Vec<ListItem> = app
+            .sessions
+            .iter()
+            .map(|s| session_row(s, row_width, time_w))
+            .collect();
         let list = List::new(items)
             .block(agent_block(app.sort, above, below))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("▶ ");
+            .highlight_symbol(HIGHLIGHT_SYMBOL);
         f.render_stateful_widget(list, body, &mut app.list);
     }
 
@@ -378,29 +391,93 @@ fn agent_block(sort: status::Sort, above: usize, below: usize) -> Block<'static>
     block
 }
 
-fn session_row(s: &Session) -> ListItem<'static> {
+/// Rendered on every row, selected or not — ratatui reserves its width across
+/// the whole list, so it comes out of the space each row has to lay out in.
+const HIGHLIGHT_SYMBOL: &str = "▶ ";
+
+/// The duration column's width: the widest value on screen, so every row
+/// allocates the same space and the columns to its left line up. Sizing each
+/// row to its own duration instead makes the directory column ragged.
+fn duration_width(sessions: &[Session]) -> usize {
+    sessions
+        .iter()
+        .map(|s| crate::status::humanize_secs(s.state_secs).chars().count())
+        .max()
+        .unwrap_or(3)
+}
+
+fn session_row(s: &Session, width: usize, time_w: usize) -> ListItem<'static> {
+    ListItem::new(session_line(s, width, time_w))
+}
+
+/// One agent row, laid out to fit `width` columns.
+///
+/// Computed rather than fixed, because the HUD is meant to live in a small
+/// floating window: the previous fixed 45-column row silently lost its last two
+/// columns in a 47-column window (borders take 2, the highlight symbol 2), and
+/// what got clipped was the duration — `15h35m` rendered as `15h3` and, far
+/// worse, `52m` rendered as `5`, a plausible wrong number rather than an
+/// obviously cut one.
+///
+/// So the duration is allocated **first** and never sacrificed (how long an
+/// agent has been waiting on you is the question the HUD exists to answer),
+/// and optional columns drop as the window narrows: the command first (it is
+/// `claude` on nearly every row), then the state word (the coloured dot already
+/// carries the state). The directory takes whatever is left.
+fn session_line(s: &Session, width: usize, time_w: usize) -> Line<'static> {
     let color = state_color(s.state);
-    let line = Line::from(vec![
-        Span::styled("● ", Style::default().fg(color)),
-        Span::styled(format!("{:<8}", s.state.word()), Style::default().fg(color)),
-        Span::raw("  "),
-        Span::styled(
-            format!("{:<16}", truncate(&s.dir, 16)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            format!("{:<8}", truncate(&s.cmd, 8)),
+    let time = crate::status::humanize_secs(s.state_secs);
+
+    const DOT: usize = 2;
+    const GAP: usize = 2;
+    const CMD: usize = 6;
+    const DIR_MIN: usize = 8;
+    let time_w = time_w.max(time.chars().count());
+    let state_w = 7;
+
+    let with_cmd = DOT + state_w + GAP + DIR_MIN + 1 + CMD + GAP + time_w;
+    let with_state = DOT + state_w + GAP + DIR_MIN + GAP + time_w;
+    let (show_state, show_cmd) = if width >= with_cmd {
+        (true, true)
+    } else if width >= with_state {
+        (true, false)
+    } else {
+        (false, false)
+    };
+
+    let fixed = DOT
+        + if show_state { state_w + GAP } else { 0 }
+        + if show_cmd { CMD + 1 } else { 0 }
+        + GAP
+        + time_w;
+    let dir_w = width.saturating_sub(fixed).max(1);
+
+    let mut spans = vec![Span::styled("● ", Style::default().fg(color))];
+    if show_state {
+        spans.push(Span::styled(
+            format!("{:<state_w$}", s.state.word()),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::raw(" ".repeat(GAP)));
+    }
+    spans.push(Span::styled(
+        format!("{:<dir_w$}", truncate(&s.dir, dir_w)),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if show_cmd {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{:<CMD$}", truncate(&s.cmd, CMD)),
             Style::default().fg(Color::Gray),
-        ),
-        // Time in current state: idle-for on green rows, waiting-on-you-for
-        // on red ones.
-        Span::styled(
-            format!("  {:>6}", crate::status::humanize_secs(s.state_secs)),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    ListItem::new(line)
+        ));
+    }
+    // Time in current state: idle-for on green rows, waiting-on-you-for on red
+    // ones. Right-aligned against the edge, and always rendered whole.
+    spans.push(Span::styled(
+        format!("{:>pad$}", time, pad = GAP + time_w),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
 }
 
 fn state_color(state: State) -> Color {
@@ -420,5 +497,100 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::{Session, State};
+
+    fn session(dir: &str, secs: u64) -> Session {
+        Session {
+            id: 1,
+            state: State::Blocked,
+            dir: dir.to_string(),
+            cwd: format!("/home/me/{dir}"),
+            cmd: "claude".to_string(),
+            pid: 2,
+            state_secs: secs,
+        }
+    }
+
+    /// Lay a row out and flatten it the way the terminal would.
+    fn rendered(s: &Session, width: usize, time_w: usize) -> String {
+        session_line(s, width, time_w)
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_row_never_overflows_the_width_it_is_given() {
+        // The List clips silently, so an overflowing row is a wrong row.
+        for width in 20..=120 {
+            let row = rendered(&session("20260612_doc_parser", 56_100), width, 6);
+            assert!(
+                row.chars().count() <= width,
+                "width {width}: row is {} columns: {row:?}",
+                row.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn the_duration_is_never_truncated() {
+        // The regression this guards: in the 47-column HUD window only 43
+        // columns reached the row, and the old fixed layout rendered 15h35m as
+        // 15h3 and 52m as 5.
+        for secs in [45, 3_120, 56_100, 72_300, 300_000] {
+            let want = crate::status::humanize_secs(secs);
+            for width in 20..=120 {
+                let row = rendered(&session("20260612_doc_parser", secs), width, 6);
+                assert!(
+                    row.ends_with(&want),
+                    "width {width}, {want}: row ended {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn columns_line_up_across_rows_whatever_the_durations_are() {
+        let sessions = vec![
+            session("seagents", 52 * 60),
+            session("20260612_doc_parser", 56_100),
+            session("mode-agent", 45),
+        ];
+        let time_w = duration_width(&sessions);
+        assert_eq!(time_w, 6, "widest is 15h35m");
+        let cmd_at: Vec<_> = sessions
+            .iter()
+            .map(|s| rendered(s, 45, time_w).find("claude"))
+            .collect();
+        assert!(cmd_at.iter().all(|c| c.is_some()), "{cmd_at:?}");
+        assert!(
+            cmd_at.windows(2).all(|w| w[0] == w[1]),
+            "command column is ragged: {cmd_at:?}"
+        );
+    }
+
+    #[test]
+    fn columns_drop_widest_first_as_the_window_narrows() {
+        let s = session("seagents", 56_100);
+        let wide = rendered(&s, 60, 6);
+        assert!(wide.contains("blocked") && wide.contains("claude"), "{wide:?}");
+        // The real 47-column HUD: everything still fits.
+        let mid = rendered(&s, 45, 6);
+        assert!(mid.contains("blocked") && mid.contains("claude"), "{mid:?}");
+        assert!(mid.ends_with("15h35m"), "{mid:?}");
+        // Narrower: command goes first.
+        let no_cmd = rendered(&s, 30, 6);
+        assert!(no_cmd.contains("blocked") && !no_cmd.contains("claude"), "{no_cmd:?}");
+        // Narrowest: only the dot, the directory and the duration.
+        let narrow = rendered(&s, 22, 6);
+        assert!(!narrow.contains("blocked"), "{narrow:?}");
+        assert!(narrow.ends_with("15h35m"), "{narrow:?}");
     }
 }
