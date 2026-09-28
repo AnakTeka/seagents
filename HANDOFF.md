@@ -158,8 +158,7 @@ Source layout under `src/`:
   `session_paths()`, `write_meta()`, `terminal_size()`; manifest-update helpers.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()`, `print()`,
   `read_session()` (detection + reaping), OSC-title parsing (`all_titles`,
-  `current_title`, `strip_title_glyph`, `conversation_title`),
-  `live_pty_size()`, `read_tail()`.
+  `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
   vendored engine's verdicts on live-capture scenarios.
 - **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
@@ -171,7 +170,12 @@ Source layout under `src/`:
 - **`src/focus.rs`** — `focus_window()` (exact handles: con_id, then X window
   id, with healing), `preview_window()`, `record_window()` (identity capture),
   `focused_con_id()`/`focused_terminal_ids()`, `window_ids_by_pid()`,
-  `window_ids_for_handle()`, i3 tree helpers.
+  `window_ids_for_handle()`.
+- **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
+  `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
+- **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
+  `parent_pid()`, `ancestors()`, `live_pty_size()`.
+- **`src/clock.rs`** — `unix_now()`, the unit of every stored timestamp.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 - **`src/snapshot.rs`** — the reboot snapshot: `capture()`, layout emission
   with i3 swallow criteria, `resolve_session_ids()`, `restore_cmd()`.

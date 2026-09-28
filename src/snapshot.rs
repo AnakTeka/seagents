@@ -48,6 +48,8 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+use crate::i3;
+
 /// One layout write per this many seconds, across all wrappers. Short enough
 /// that moving a window between workspaces is captured before you walk away,
 /// long enough that twenty monitor threads offering a capture every 2s cost
@@ -130,7 +132,7 @@ fn live_sessions() -> Vec<Live> {
         let Some(child_pid) = v["child_pid"].as_u64() else {
             continue;
         };
-        if !Path::new(&format!("/proc/{child_pid}")).exists() {
+        if !crate::procfs::alive(child_pid) {
             continue;
         }
         out.push(Live {
@@ -211,11 +213,15 @@ fn session_id_from_proc(child_pid: u64, project_dir: &Path) -> Option<String> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().filter(|p| p.bytes().all(|b| b.is_ascii_digit())) else {
+        let Some(pid) = name
+            .to_str()
+            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u64>().ok())
+        else {
             continue;
         };
         // The agent is a child of the `__lead` anchor we recorded.
-        if parent_pid(pid) != Some(child_pid) {
+        if crate::procfs::parent_pid(pid) != Some(child_pid) {
             continue;
         }
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
@@ -243,14 +249,6 @@ fn session_id_from_proc(child_pid: u64, project_dir: &Path) -> Option<String> {
     } else {
         None
     }
-}
-
-fn parent_pid(pid: &str) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm can contain spaces and parens; ppid is the 2nd field after the
-    // final ')'.
-    let rest = stat.rsplit_once(") ")?.1;
-    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Every `aiTitle` recorded in a transcript. Claude writes the conversation's
@@ -408,17 +406,6 @@ fn resolve_session_ids(
 // ---------------------------------------------------------------------------
 // The i3 tree
 // ---------------------------------------------------------------------------
-
-fn i3_tree() -> Option<Value> {
-    let out = Command::new("i3-msg")
-        .args(["-t", "get_tree"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
-}
 
 /// Where a window sits: the workspace it is on, the output that workspace is
 /// displayed on, and the title it is currently showing.
@@ -903,7 +890,7 @@ pub(crate) fn maybe_capture_async() {
 /// want to report on what was captured.
 fn capture(refresh: bool) -> Result<Value, String> {
     let mut sessions = live_sessions();
-    let tree = i3_tree().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
+    let tree = i3::tree().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
     let (places, by_xid) = index_tree(&tree);
 
     // Locate every agent on screen first: the window it lives in supplies the
@@ -1005,7 +992,7 @@ fn capture(refresh: bool) -> Result<Value, String> {
 
     let snapshot = json!({
         "version": 1,
-        "captured": unix_now(),
+        "captured": crate::clock::unix_now(),
         "focused_workspace": focused_workspace(&tree),
         "workspaces": workspaces,
         "unplaced": unplaced,
@@ -1027,13 +1014,6 @@ fn workspace_sort_key(name: &str) -> (u8, u64, String) {
         Ok(n) => (0, n, name.to_string()),
         Err(_) => (1, 0, name.to_string()),
     }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1277,10 @@ pub fn restore_cmd(args: &[String]) -> i32 {
         // Leave the user looking where they were looking, not on whichever
         // workspace happened to be restored last.
         if let Some(ws) = snapshot["focused_workspace"].as_str() {
-            let _ = i3_msg(&format!("workspace --no-auto-back-and-forth {}", quote_i3(ws)));
+            let _ = i3::msg(&format!(
+                "workspace --no-auto-back-and-forth {}",
+                i3::quote(ws)
+            ));
         }
     }
 
@@ -1393,16 +1376,16 @@ fn place_workspace(
     layout: &[Value],
     matchers: &HashMap<String, WindowMatch>,
 ) -> Result<(), String> {
-    i3_msg(&format!(
+    i3::msg(&format!(
         "workspace --no-auto-back-and-forth {}",
-        quote_i3(name)
+        i3::quote(name)
     ))?;
-    if !output.is_empty() && active_outputs().len() > 1 {
+    if !output.is_empty() && i3::active_outputs().len() > 1 {
         // Best-effort: a monitor that isn't plugged in now is not an error.
-        let _ = i3_msg(&format!("move workspace to output {}", quote_i3(output)));
-        i3_msg(&format!(
+        let _ = i3::msg(&format!("move workspace to output {}", i3::quote(output)));
+        i3::msg(&format!(
             "workspace --no-auto-back-and-forth {}",
-            quote_i3(name)
+            i3::quote(name)
         ))?;
     }
     if layout.is_empty() {
@@ -1419,44 +1402,9 @@ fn place_workspace(
         text.push('\n');
     }
     std::fs::write(&file, text).map_err(|e| format!("writing {}: {e}", file.display()))?;
-    let result = i3_msg(&format!("append_layout {}", file.display()));
+    let result = i3::msg(&format!("append_layout {}", file.display()));
     let _ = std::fs::remove_file(&file);
     result
-}
-
-fn active_outputs() -> Vec<String> {
-    let Ok(out) = Command::new("i3-msg").args(["-t", "get_outputs"]).output() else {
-        return Vec::new();
-    };
-    serde_json::from_slice::<Value>(&out.stdout)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.iter()
-                .filter(|o| o["active"].as_bool() == Some(true))
-                .filter_map(|o| o["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn i3_msg(command: &str) -> Result<(), String> {
-    let out = Command::new("i3-msg")
-        .arg(command)
-        .output()
-        .map_err(|e| format!("i3-msg: {e}"))?;
-    let body = String::from_utf8_lossy(&out.stdout);
-    if out.status.success() && !body.contains("\"success\": false") && !body.contains("\"success\":false")
-    {
-        return Ok(());
-    }
-    Err(format!("i3-msg {command} failed: {}", body.trim()))
-}
-
-/// i3's command parser takes double-quoted strings; workspace and output names
-/// can contain spaces.
-fn quote_i3(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Launch one restored window.

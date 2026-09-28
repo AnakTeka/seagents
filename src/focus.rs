@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::i3;
+
 /// `seagents focus <child_pid>` — bring the agent's terminal window to the
 /// front. CLI wrapper: prints any error and maps to an exit code.
 pub fn focus(child_pid: u64) -> i32 {
@@ -39,7 +41,7 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
         .ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
 
     if let Some(con_id) = meta["con_id"].as_u64() {
-        if i3_focus(con_id) {
+        if i3::focus(con_id) {
             return Ok(());
         }
         // Recorded con_id is gone — likely an i3 restart. Fall through.
@@ -47,9 +49,9 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
 
     if let Some(xid) = meta["window_id"].as_u64() {
         let windows =
-            i3_windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
+            i3::windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
         if let Some(win) = windows.iter().find(|w| w.xid == Some(xid)) {
-            if i3_focus(win.con_id) {
+            if i3::focus(win.con_id) {
                 record_window(&meta_path, win.con_id, Some(xid));
                 return Ok(());
             }
@@ -94,7 +96,7 @@ pub(crate) fn record_window(meta_path: &std::path::Path, con_id: u64, xid: Optio
 pub(crate) fn preview_window(child_pid: u64, return_to: Option<u64>) -> Result<(), String> {
     focus_window(child_pid)?;
     if let Some(id) = return_to {
-        i3_focus(id);
+        i3::focus(id);
     }
     Ok(())
 }
@@ -102,7 +104,7 @@ pub(crate) fn preview_window(child_pid: u64, return_to: Option<u64>) -> Result<(
 /// The con_id of the currently focused window (used to remember the HUD so we
 /// can return focus to it after a preview).
 pub(crate) fn focused_con_id() -> Option<u64> {
-    focused_node().and_then(|n| n["id"].as_u64())
+    i3::focused_node().and_then(|n| n["id"].as_u64())
 }
 
 /// The focused window's (con_id, X window id), but only if it's a
@@ -111,7 +113,7 @@ pub(crate) fn focused_con_id() -> Option<u64> {
 /// that may momentarily hold focus, so we never record the wrong window. The
 /// X id is the durable half: con_ids die on an i3 restart, X ids don't.
 pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
-    let node = focused_node()?;
+    let node = i3::focused_node()?;
     let xid = node.get("window").and_then(|w| w.as_u64());
     let class = node["window_properties"]["class"].as_str().unwrap_or("");
     // Never record the HUD's own window as an agent's: it's terminal-class
@@ -151,7 +153,7 @@ pub(crate) fn window_ids_from_env() -> Option<(u64, Option<u64>)> {
         .iter()
         .filter_map(|v| std::env::var(v).ok())
         .find_map(|v| v.trim().parse().ok())?;
-    i3_windows()?
+    i3::windows()?
         .into_iter()
         .find(|w| w.xid == Some(xid))
         .map(|w| (w.con_id, w.xid))
@@ -175,11 +177,11 @@ pub(crate) fn window_ids_from_env() -> Option<(u64, Option<u64>)> {
 /// back. Ancestors are tried nearest-first, so a shell between us and the
 /// terminal costs one extra lookup rather than a wrong answer.
 pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
-    let windows = i3_windows()?;
+    let windows = i3::windows()?;
     let known: std::collections::HashSet<u64> =
         windows.iter().filter_map(|w| w.xid).collect();
 
-    for pid in ancestors(std::process::id() as u64) {
+    for pid in crate::procfs::ancestors(std::process::id() as u64) {
         let Ok(out) = Command::new("xdotool")
             .args(["search", "--pid", &pid.to_string()])
             .output()
@@ -212,32 +214,6 @@ pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
     None
 }
 
-/// This process's pid chain, nearest ancestor first, stopping at init.
-fn ancestors(mut pid: u64) -> Vec<u64> {
-    let mut out = Vec::new();
-    // Bounded: a /proc loop would otherwise hang the launch path.
-    for _ in 0..32 {
-        let Some(parent) = parent_pid(pid) else { break };
-        if parent <= 1 {
-            break;
-        }
-        out.push(parent);
-        pid = parent;
-    }
-    out
-}
-
-fn parent_pid(pid: u64) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm can hold spaces and parens; ppid is the 2nd field after the last ')'.
-    stat.rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
 /// Every X11 property a terminal might use to carry a handle we minted.
 /// Terminator has `--role` and no `--class`; most others are the reverse.
 pub(crate) const HANDLE_PROPS: [&str; 3] = ["window_role", "instance", "class"];
@@ -261,7 +237,7 @@ pub(crate) fn window_ids_for_handle(value: &str) -> Option<(Option<u64>, Option<
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let mut hits = Vec::new();
-        if let Some(tree) = i3_tree() {
+        if let Some(tree) = i3::tree() {
             collect_handle(&tree, value, &mut hits);
         }
         hits.sort();
@@ -294,36 +270,6 @@ fn collect_handle(node: &serde_json::Value, value: &str, out: &mut Vec<(u64, Opt
     }
 }
 
-fn i3_tree() -> Option<serde_json::Value> {
-    let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
-}
-
-fn focused_node() -> Option<serde_json::Value> {
-    let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
-    let tree: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    find_focused(&tree).cloned()
-}
-
-fn find_focused(node: &serde_json::Value) -> Option<&serde_json::Value> {
-    if node["focused"].as_bool() == Some(true) {
-        return Some(node);
-    }
-    for key in ["nodes", "floating_nodes"] {
-        if let Some(children) = node[key].as_array() {
-            for child in children {
-                if let Some(found) = find_focused(child) {
-                    return Some(found);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Look up a session's meta (and its path) by child pid.
 fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
     let dir = crate::cache_dir();
@@ -348,52 +294,6 @@ fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
 fn looks_like_terminal(class: &str) -> bool {
     let c = class.to_lowercase();
     c.contains("term") || c.contains("kitty") || c.contains("alacritty") || c.contains("ghostty")
-}
-
-struct Win {
-    con_id: u64,
-    /// The X11 window id (i3's "window" field) — stable across i3 restarts.
-    xid: Option<u64>,
-}
-
-/// Read every leaf window from the i3 tree via `i3-msg -t get_tree`.
-fn i3_windows() -> Option<Vec<Win>> {
-    let out = Command::new("i3-msg").args(["-t", "get_tree"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let tree: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let mut windows = Vec::new();
-    collect(&tree, &mut windows);
-    Some(windows)
-}
-
-fn collect(node: &serde_json::Value, out: &mut Vec<Win>) {
-    if node.get("window").and_then(|w| w.as_u64()).is_some() {
-        out.push(Win {
-            con_id: node["id"].as_u64().unwrap_or(0),
-            xid: node["window"].as_u64(),
-        });
-    }
-    for key in ["nodes", "floating_nodes"] {
-        if let Some(children) = node[key].as_array() {
-            for child in children {
-                collect(child, out);
-            }
-        }
-    }
-}
-
-/// Focus a window by con_id. Returns true on i3 success.
-fn i3_focus(con_id: u64) -> bool {
-    Command::new("i3-msg")
-        .arg(format!("[con_id={con_id}] focus"))
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout).contains("\"success\":true")
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -13,9 +13,12 @@ use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
+mod clock;
 mod detect;
 mod focus;
 mod hud;
+mod i3;
+mod procfs;
 mod snapshot;
 mod status;
 mod vendor;
@@ -522,16 +525,12 @@ fn write_meta(
     con_id: Option<u64>,
     window_id: Option<u64>,
 ) {
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let meta = serde_json::json!({
         "wrapper_pid": std::process::id(),
         "child_pid": child_pid,
         "cwd": cwd.to_string_lossy(),
         "argv": argv,
-        "started": started,
+        "started": clock::unix_now(),
         // Geometry so the daemon can re-render the raw stream at the right size.
         "cols": size.cols,
         "rows": size.rows,

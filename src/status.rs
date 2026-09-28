@@ -240,9 +240,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
     // Liveness: is the child process still around? If not, the session has
     // ended — reap its files and drop it entirely rather than showing a corpse.
     let raw = dir.join(format!("{wrapper_pid}.raw"));
-    let alive = child_pid
-        .map(|p| Path::new(&format!("/proc/{p}")).exists())
-        .unwrap_or(false);
+    let alive = child_pid.is_some_and(crate::procfs::alive);
     if !alive {
         let _ = std::fs::remove_file(meta_path);
         let _ = std::fs::remove_file(&raw);
@@ -256,7 +254,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
             // Prefer the child's *live* pty size (accurate, survives resize and
             // missing meta); fall back to meta, then a sane default.
             let (rows, cols) = child_pid
-                .and_then(live_pty_size)
+                .and_then(crate::procfs::live_pty_size)
                 .or_else(|| Some((v["rows"].as_u64()? as u16, v["cols"].as_u64()? as u16)))
                 .unwrap_or((24, 80));
             let screen = crate::detect::render(&buf, rows, cols);
@@ -272,7 +270,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         None => (State::Unknown, String::new()),
     };
 
-    let now = unix_now();
+    let now = crate::clock::unix_now();
     let record = observe_state(
         &dir.join(format!("{wrapper_pid}.state")),
         state,
@@ -377,7 +375,7 @@ pub(crate) fn ack_session_path(path: &Path) {
     if p["seen"].as_bool() == Some(false) {
         if let Some(state_word) = p["state"].as_str() {
             let record = StateRecord {
-                since: p["since"].as_u64().unwrap_or(unix_now()),
+                since: p["since"].as_u64().unwrap_or(crate::clock::unix_now()),
                 seen: true,
             };
             // State word passes through unchanged; only the seen bit flips.
@@ -397,13 +395,6 @@ pub(crate) fn ack_session(id: u64) {
     ack_session_path(&crate::cache_dir().join(format!("{id}.state")));
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// One detection pass over our *own* session, for the wrapper's monitor
 /// thread: re-classify from the teed tail and stamp the sidecar on
 /// transitions (marking a working→idle completion as unseen — the "done"
@@ -417,14 +408,14 @@ pub(crate) fn track_session(
     child_pid: u64,
 ) -> Option<(State, bool)> {
     let buf = read_tail(raw, 1024 * 1024)?;
-    let (rows, cols) = live_pty_size(child_pid).unwrap_or((24, 80));
+    let (rows, cols) = crate::procfs::live_pty_size(child_pid).unwrap_or((24, 80));
     let screen = crate::detect::render(&buf, rows, cols);
     let title = current_title(&buf).unwrap_or_default();
     let agent = crate::vendor::herdr_detect::identify_agent(cmd);
     let state = State::from(
         crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
     );
-    let record = observe_state(state_path, state, unix_now(), true);
+    let record = observe_state(state_path, state, crate::clock::unix_now(), true);
     Some((state, record.seen))
 }
 
@@ -451,27 +442,6 @@ fn basename(p: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(p)
         .to_string()
-}
-
-/// Read the child's live terminal size via TIOCGWINSZ on its pty (fd 0), found
-/// through /proc. Returns (rows, cols). Read-only; `O_NOCTTY` avoids acquiring
-/// the pty as our controlling terminal.
-fn live_pty_size(child_pid: u64) -> Option<(u16, u16)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(format!("/proc/{child_pid}/fd/0"))
-        .ok()?;
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
-    if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        Some((ws.ws_row, ws.ws_col))
-    } else {
-        None
-    }
 }
 
 /// Read at most `max` bytes from the end of a file — enough to hold the most
