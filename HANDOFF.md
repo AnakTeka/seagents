@@ -262,7 +262,10 @@ Source layout under `src/`:
   region/priority engine, self-updating from herdr.dev. This replaced our
   hand-written `is_blocked()` rules entirely. Where herdr's answer to a rule
   differs from what seagents needs, `manifest/patches.rs` re-weights that one
-  rule by id as the manifest loads, so the rest keeps updating upstream.
+  rule by id as the manifest loads, so the rest keeps updating upstream; for
+  a screen no re-weighting fixes it adds a `seagents_`-prefixed rule (Codex's
+  folder-trust dialog drawn over an update notice, which upstream reads as
+  idle — and `stop`'s `/exit` + Enter then *trusted the folder*).
 - **`src/window.rs`** — window identity and focus (§4): `focus()` (the
   `focus` command), `focus_window()` (exact handles: con_id, then X window id,
   with healing), `preview_window()`, `record_window()` (identity capture),

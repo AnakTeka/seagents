@@ -39,7 +39,38 @@ const PRIORITIES: &[(&str, &str, i32)] = &[
     ("claude", "background_shell_working", 200),
 ];
 
-/// Apply seagents' priority patches to a freshly parsed manifest.
+/// `(manifest id, rules)`: rules seagents adds, in the manifest's own TOML.
+/// An addition is for a screen upstream reads wrong in a way no re-weighting
+/// fixes; its id says it is seagents', so a re-sync can tell whether
+/// upstream has caught up.
+const ADDED: &[(&str, &str)] = &[
+    // Codex's folder-trust dialog (0.152, a never-trusted directory) is a
+    // gate: whatever is typed into it picks an answer — `stop`'s `/exit` +
+    // Enter picked "1. Yes, continue" and wrote the directory's trust into
+    // the user's config.toml (measured in a scratch CODEX_HOME). Upstream's
+    // `trust_directory` wants `> You are in …` as the screen's first line,
+    // but when an update notice is up the dialog is drawn over its box and
+    // the row reads `>─You are in …──╮`, so that rule misses and the screen
+    // falls through to idle. The dialog's own last lines are unmistakable.
+    (
+        "codex",
+        r#"
+[[rules]]
+id = "seagents_trust_directory"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+  { contains = ["1. Yes, continue"] },
+  { contains = ["2. No, quit"] },
+]
+"#,
+    ),
+];
+
+/// Apply seagents' patches to a freshly parsed manifest.
 pub(super) fn apply(manifest: &mut AgentManifest) {
     for (manifest_id, rule_id, priority) in PRIORITIES {
         if manifest.id != *manifest_id {
@@ -47,6 +78,16 @@ pub(super) fn apply(manifest: &mut AgentManifest) {
         }
         for rule in manifest.rules.iter_mut().filter(|rule| rule.id == *rule_id) {
             rule.priority = *priority;
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct Rules {
+        rules: Vec<super::ManifestRule>,
+    }
+    for (manifest_id, text) in ADDED {
+        if manifest.id == *manifest_id {
+            let added: Rules = toml::from_str(text).expect("seagents' added rules parse (pinned by a test)");
+            manifest.rules.extend(added.rules);
         }
     }
 }
@@ -105,10 +146,50 @@ mod tests {
             let patched = priorities(&manifest) != before;
             assert_eq!(
                 patched,
-                agent_label(agent) == "claude",
+                agent_label(agent) == "claude" || agent_label(agent) == "codex",
                 "unexpected patch state for {}",
                 agent_label(agent)
             );
         }
+    }
+
+    /// The screen as the wrapper's tee rendered it (codex 0.152, 160x45,
+    /// an update notice up): the dialog drawn over the notice's box.
+    const CODEX_TRUST_OVER_NOTICE: &str = "\
+>─You are in /tmp/tmp.kh4YMKOEFu/proj2──╮
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection. Trusting the directory allows
+  project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue";
+
+    /// The verdict `manifest`, exactly as given, reaches on `screen`.
+    fn verdict(manifest: &AgentManifest, screen: &str) -> crate::vendor::herdr_detect::AgentState {
+        use super::super::*;
+        let loaded = LoadedManifest {
+            manifest: manifest.clone(),
+            compiled_rules: compile_manifest(manifest).unwrap(),
+            source: ManifestSource::Bundled,
+            warning: None,
+            cached_remote_version: None,
+            local_override_shadowing_remote: false,
+        };
+        let input = DetectionInput { screen, osc_title: "", osc_progress: "" };
+        evaluate_loaded_manifest(Agent::Codex, input, loaded, false).state
+    }
+
+    #[test]
+    fn codex_trust_dialog_is_a_gate_even_over_an_update_notice() {
+        use crate::vendor::herdr_detect::AgentState;
+        let mut manifest = bundled_manifest(Agent::Codex).expect("bundled codex manifest");
+        assert_ne!(verdict(&manifest, CODEX_TRUST_OVER_NOTICE), AgentState::Blocked, "upstream caught up: drop the patch");
+        apply(&mut manifest);
+        assert_eq!(verdict(&manifest, CODEX_TRUST_OVER_NOTICE), AgentState::Blocked);
+        // The question alone — quoted in a reply, say — is not the gate.
+        let quoted = "• Codex asks: Do you trust the contents of this directory?\n\n› Ask Codex to do anything";
+        assert_ne!(verdict(&manifest, quoted), AgentState::Blocked);
     }
 }
