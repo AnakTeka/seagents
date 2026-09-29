@@ -1021,10 +1021,14 @@ tools/test-restore.sh terminator
 tools/test-restore.sh alacritty
 tools/test-restore.sh alacritty-daemon
 
-# Integration-test spawn → wait → status → lineage/caps → focus → exit, with a
-# real Claude (`--model haiku`, one-line prompts: a few cents a run) in
+# Integration-test spawn → wait → status → send (idle-paired, multi-line) →
+# lineage/caps and the socket's lineage rule → focus → stop, with a real
+# Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.
-# Keeps the real CLAUDE_CONFIG_DIR for auth. PASS/FAIL per step.
+# Keeps the real CLAUDE_CONFIG_DIR for auth, but drops any CLAUDECODE /
+# CLAUDE_CODE_* it was started with (run from inside a Claude session, the
+# agents under test would otherwise start as that session's children, which
+# outside tmux never write a transcript). PASS/FAIL per step.
 tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon]
 ```
 
