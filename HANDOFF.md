@@ -215,8 +215,9 @@ Source layout under `src/`:
     keyboard protocol), `decode_keys()`.
 - **`src/send.rs`** — `seagents send` / `stop`, the socket's client, and its
   wire format (`Request`, `Reply`, `Refusal` → exit codes).
-- **`src/hook.rs`** — the agent's lifecycle hooks (§6): `inject_settings()`
-  (the one merged `--settings` `run` hands a hook-capable agent) and `run()`,
+- **`src/hook.rs`** — the agent's lifecycle hooks (§6): `inject()` (the one
+  merged hook flag `run` hands a hook-capable agent — Claude's `--settings`
+  JSON, Codex's trusted `-c hooks=…`, per the adapter's `[hooks] inject`) and `run()`,
   the hidden `__hook` command that records each event in `.agent`.
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
@@ -241,6 +242,8 @@ Source layout under `src/`:
   `model.rs` (the common record model), `claude.rs` (the one Claude JSONL
   parser: a line's cheap `head()` for the index, its `records()`, the
   subagent sidecars, and `interrupted_since()` for the turn ledger),
+  `codex.rs` (the same four for a Codex rollout, plus `sniff()`, which
+  `Format::detect` uses for `read --transcript`),
   `index.rs` (the lazy, incrementally extended offset index cached under
   `sessions/`), `mainline.rs` (the tree, the main line, `resume()` for a
   cursor), `render.rs` (the collapse rules); `Transcript` in `mod.rs` ties
@@ -303,16 +306,18 @@ Source layout under `src/`:
   detection engine's agent id for `argv[0]`; `~/.config/seagents/agents/<agent>.toml`
   replaces the bundled file whole (an unparseable override is an error, not a
   silent default); unknown agents get the generic state-only adapter. Bundled:
-  `claude`, and a conservative `codex` (no hooks, screen turns) until its
-  `notify` hook is verified. `run` reads it to decide on hook injection
-  (`settings_flag`, `hookless_flags`, `identity`/`turns`) and to turn a
-  seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
+  `claude` and `codex` (§11). `run` reads it to decide on hook injection
+  (`[hooks]`: how — `inject = "settings" | "config"` — the flag's spellings,
+  the events, `hookless_flags`; and `identity`/`turns`) and to turn a
+  seed into argv (`Launch::seed_args()`); `restore` reads `[restore]` (the
+  argv that resumes a conversation, and the stale words it replaces);
+  `spawn` reads the permission flag
   and mode order; `capabilities()` is what `status --json` reports per agent
   (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
   and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
   when a body goes by reference: `long_prompt`, `inline_max_chars`,
   `inline_max_lines`); `[read] transcript` names the transcript format
-  (`claude`) that `read` and the turn ledger's interrupt check parse —
+  (`claude`, `codex`) that `read` and the turn ledger's interrupt check parse —
   `read` is a capability where there is one and a way to learn the path.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
@@ -682,18 +687,21 @@ one window, the earliest launch keeps it and the rest are reported unplaced,
 which the input-driven re-capture heals on the next keystroke.)
 
 **A window must know which conversation it was.** The agent says so itself.
-For an agent whose adapter takes hooks (Claude Code: `settings_flag`,
-`identity`/`turns = "hook"`), `run` hands the child one extra `--settings`
-carrying three hooks — `SessionStart`, `UserPromptSubmit`, `Stop` — each
+For an agent whose adapter takes hooks (`[hooks] inject`,
+`identity`/`turns = "hook"`: Claude Code, Codex), `run` hands the child one
+extra flag (Claude: `--settings`; Codex: `-c hooks=…`, §11) carrying three hooks — `SessionStart`, `UserPromptSubmit`, `Stop` — each
 running `'<abs path of this binary>' __hook` (absolute, so the agent's `PATH`
 doesn't matter). Every payload carries `session_id` and `transcript_path`;
 `__hook` finds its session by walking its own `/proc` ancestry (hook sh →
 claude → `__lead` → wrapper) to the first pid with a live `.meta`
 (`registry::enclosing_session`), and records the event in `.agent`. The
 snapshot capture copies `.agent`'s `session_id` into the layout, and `restore`
-resumes it (`resume_argv`: any stale `--resume`/`-c` flag dropped, and
-`--resume <id>` inserted before a `--` — after one it would be read as prompt
-text, and nothing after one is touched). Because `/clear` (and compact, and a resume) fires `SessionStart`
+resumes it (`resume_argv`, per the adapter's `[restore]`: the stale
+selection words dropped — Claude's `--resume`/`-r`/`--continue`/`-c`, Codex's
+`resume`/`fork`/`--last`, each with its id — and the resume argv inserted
+right after the command: Claude's `--resume <id>`, Codex's `resume <id>`
+subcommand; so before any `--`, after which it would be read as prompt text
+and nothing is touched. An adapter with no `resume` restores fresh). Because `/clear` (and compact, and a resume) fires `SessionStart`
 again with the new conversation, the id is always the one the window is
 writing *now* — the stale-after-`/clear` problem the old resolvers had is gone,
 and so is their `~/.claude/projects` hardcoding, which pointed at the wrong
@@ -966,7 +974,9 @@ removed.
 ### 10. `seagents read` — the conversation
 
 Content comes from the agent's own transcript (the path its hooks
-reported in `.agent`; `--transcript PATH` reads any file), never the screen.
+reported in `.agent`; `--transcript PATH` reads any file, its format told
+from its first lines — a Codex rollout wraps every line in `{timestamp,
+type, payload}`, a Claude transcript never does), never the screen.
 Everything is parsed into the **common record model** (`transcript/model.rs`):
 `user`/`assistant`/`thinking` `{text}`, `tool_use {id, name, input[,
 subagent]}`, `tool_result {tool_use_id, text, bytes[, is_error]}`, each with
@@ -1019,6 +1029,62 @@ are indexed), rebuilt when the file is shorter than that or its first 4 KiB
 no longer hash the same. Measured on the largest transcript here (53 MB):
 `read --tail 20` in 65 ms cold, 6 ms warm; the whole main line as NDJSON in
 90 ms.
+
+### 11. Codex — the second adapter
+
+Measured on codex-cli 0.152.0 (2026-09-29), live in tmux with a scratch
+`CODEX_HOME` (seagents never writes `~/.codex`; only Codex's own sessions
+and logs land there). `src/adapters/codex.toml` carries the facts:
+
+- **Hooks are Claude's.** Same events (`SessionStart`, `UserPromptSubmit`,
+  `Stop`, plus `PreToolUse`, `PermissionRequest`, `PostToolUse`,
+  `Pre/PostCompact`, `SessionEnd`, `SubagentStart/Stop`, and an `Interrupt`
+  Claude lacks), same payload fields; `transcript_path` is the rollout
+  (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`),
+  `permission_mode` is reported in Claude's vocabulary. So `__hook` is
+  unchanged. `SessionStart` fires at the first prompt, not at launch (a
+  resumed session's too, `source: "resume"`); every event carries the path.
+- **Configured under `[hooks]` in config.toml, or a `-c` override** —
+  which Codex keeps as its own "session flags" layer
+  (`/<session-flags>/config.toml`) beside the user's. **A hook runs only
+  once trusted** (`codex exec` silently skips untrusted ones; the TUI stops
+  at "Hooks need review"): `hooks.state."<layer>:<event_snake>:<group>:<handler>".trusted_hash`
+  = `sha256:` of the canonical JSON of the hook's normalized identity
+  (codex-rs `hook_hash`; reproduced exactly, pinned by a test against the
+  hash Codex wrote in `/hooks`). Codex reads that state from the user layer
+  *and* the session-flags layer, so `run` passes ONE `-c hooks={…}` holding
+  our three hooks and their trust — no `--dangerously-bypass-hook-trust`
+  (which would also run the user's unreviewed hooks), nothing written. A
+  dotted `-c 'hooks.state."…".trusted_hash=…'` does not work (Codex splits
+  keys on every `.`), hence the one inline table. A user's own `-c hooks…`
+  overrides are applied in order, as Codex would, and merged into it.
+- **Seed**: `codex -- <prompt>` submits it as the first turn. **Exit**:
+  `/exit` (or `/quit`), instant. **Paste**: bracketed paste + 300 ms + Enter
+  submits; a large paste shows as `[Pasted Content N chars]` but is
+  submitted whole as the user's words (4,392 chars / 31 lines, acted on), so
+  Codex takes no prompt files.
+- **Esc** fires `Interrupt` and no `Stop`, and writes `turn_aborted` to the
+  rollout — even pressed before the first token (Claude's known gap). The
+  ledger reads the rollout record (`codex::interrupted_since`), the same
+  seam as Claude's, so the `Interrupt` hook is not injected.
+- **Session variables** a Codex shell tool sees: `CODEX_CI`,
+  `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_PERMISSION_PROFILE`,
+  `CODEX_SANDBOX*`, … — stripped by the launcher; `CODEX_HOME` is the user's.
+- **Folder trust**: a never-trusted directory opens on "Do you trust the
+  contents of this directory?"; answering writes `[projects."…"]` into
+  config.toml. The detector must call it `blocked` (patched, §3) — typed
+  input answers it.
+- **Resume**: `codex resume <id> …` takes every TUI option, and a `-c`
+  before the subcommand still applies (our hooks fire in the resumed
+  session). No permission-mode flag (`-a`/`-s` instead), so `spawn` passes
+  none: a child runs at the user's configured Codex default.
+- **The rollout** is a log, not a tree: no uuids, no parents. Nodes are its
+  lines (uuid = byte offset + 1), chained; `thread_rolled_back {num_turns}`
+  hangs off the node before the user turns it drops, so they become a side
+  branch the main line skips. A "user" message is the user's only when its
+  `content_item_kinds` say `user.*` (older rollouts: not one of Codex's
+  context tags) — environment context, AGENTS.md, `<turn_aborted>` are
+  filed under the user role too.
 
 ---
 
@@ -1165,7 +1231,11 @@ tools/test-restore.sh alacritty-daemon
 # Claude session (stand-ins for any of its session variables not already set),
 # checking the agent's /proc/<pid>/environ holds none of them — the launcher's
 # job, not the script's. PASS/FAIL per step.
-tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon]
+tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon] [--codex]
+# --codex: the same loop with a real Codex (gpt-5.6-luna, low effort) in a
+# scratch CODEX_HOME that links the real auth.json only — seeded turn,
+# capabilities, send, a 41-line paste, Esc → interrupted then a fresh turn,
+# read, stop. Skipped with a note when codex isn't installed.
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a

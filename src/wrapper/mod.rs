@@ -213,7 +213,7 @@ fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Res
             return Ok(cmd.to_vec());
         }
     };
-    let (mut argv, warning) = crate::hook::inject_settings(cmd, &adapter, exe, cwd);
+    let (mut argv, warning) = crate::hook::inject(cmd, &adapter, exe, cwd);
     if let Some(w) = warning {
         eprintln!("seagents: {w}");
     }

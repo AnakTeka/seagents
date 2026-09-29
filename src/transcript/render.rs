@@ -70,18 +70,29 @@ pub(crate) fn render(records: &[Record], raw: bool) -> Vec<String> {
 
 /// A tool call's argument in a few words: the first of the fields that
 /// name what a call is about (a command, a path, a pattern, …), else its
-/// first string field, else nothing. The field names are the common
-/// vocabulary of coding agents' tools, not one agent's.
+/// first string field, else nothing; an argv (Codex's `command`) joined
+/// with spaces; a free-text input (a Codex custom tool's script) itself.
+/// The field names are the common vocabulary of coding agents' tools, not
+/// one agent's.
 fn short_arg(input: &Value) -> String {
-    const TELLING: &[&str] = &["command", "file_path", "path", "notebook_path", "pattern", "url", "query", "description", "skill"];
-    let Some(obj) = input.as_object() else {
-        return String::new();
+    const TELLING: &[&str] = &["command", "cmd", "file_path", "path", "notebook_path", "pattern", "url", "query", "description", "skill"];
+    let text = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_string) => {
+            Some(a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+        }
+        _ => None,
     };
-    let value = TELLING
-        .iter()
-        .find_map(|k| obj.get(*k).and_then(Value::as_str))
-        .or_else(|| obj.values().find_map(Value::as_str))
-        .unwrap_or("");
+    let value = match input {
+        Value::String(s) => s.clone(),
+        Value::Object(obj) => TELLING
+            .iter()
+            .find_map(|k| obj.get(*k).and_then(text))
+            .or_else(|| obj.values().find_map(text))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let value = value.as_str();
     let first = value.lines().next().unwrap_or("");
     let more = value.lines().nth(1).is_some();
     let short = truncate(first, SHORT);
@@ -164,7 +175,10 @@ mod tests {
     fn a_tool_argument_is_its_telling_field_shortened() {
         assert_eq!(short_arg(&serde_json::json!({"file_path": "/a/b.rs", "old_string": "x"})), "/a/b.rs");
         assert_eq!(short_arg(&serde_json::json!({"n": 3, "foo": "bar"})), "bar");
-        assert_eq!(short_arg(&serde_json::json!("str")), "");
+        assert_eq!(short_arg(&serde_json::json!("str")), "str", "free text is its own argument");
+        assert_eq!(short_arg(&serde_json::json!({"command": ["ls", "-la"], "workdir": "/p"})), "ls -la");
+        assert_eq!(short_arg(&serde_json::json!({"cmd": "env", "yield_time_ms": 10})), "env");
+        assert_eq!(short_arg(&serde_json::json!(3)), "");
         let long = short_arg(&serde_json::json!({"command": "x".repeat(300)}));
         assert_eq!(long.chars().count(), SHORT);
         assert!(long.ends_with('…'));

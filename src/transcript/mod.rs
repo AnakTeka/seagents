@@ -6,9 +6,10 @@
 //!
 //! - [`model`] — the common record model (user / assistant / thinking /
 //!   tool_use / tool_result, with uuid, parent and timestamp).
-//! - one parser per format ([`claude`]) — the only per-agent code: a cheap
-//!   per-line *head* (uuid, parent, timestamp, kind) for the index, and the
-//!   full records of one line when it is actually read.
+//! - one parser per format ([`claude`], [`codex`]) — the only per-agent
+//!   code: a cheap per-line *head* (uuid, parent, timestamp, kind) for the
+//!   index, the full records of one line when it is actually read, and the
+//!   interrupt record the turn ledger looks for.
 //! - [`index`] — the lazy per-transcript offset index, cached and extended
 //!   incrementally, so a 50 MB transcript is scanned once, not per read.
 //! - [`mainline`] — the tree those heads form, and the main line through it.
@@ -26,6 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 mod claude;
+mod codex;
 pub(crate) mod index;
 pub(crate) mod mainline;
 pub(crate) mod model;
@@ -40,6 +42,29 @@ use model::{Kind, Record, Subagent};
 pub(crate) enum Format {
     /// Claude Code's JSONL.
     Claude,
+    /// Codex's rollout JSONL.
+    Codex,
+}
+
+impl Format {
+    /// The format of a transcript named by path alone (`read --transcript`),
+    /// from its first complete lines: a Codex rollout wraps every line in
+    /// `{timestamp, type, payload}`, a Claude transcript never does. Claude
+    /// when nothing tells (an empty file).
+    pub(crate) fn detect(path: &Path) -> std::io::Result<Format> {
+        let mut head = Vec::new();
+        File::open(path)?.take(64 * 1024).read_to_end(&mut head)?;
+        let lines = head.split(|b| *b == b'\n').filter(|l| l.first() == Some(&b'{'));
+        for line in lines {
+            if codex::sniff(line) {
+                return Ok(Format::Codex);
+            }
+            if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
+                return Ok(Format::Claude);
+            }
+        }
+        Ok(Format::Claude)
+    }
 }
 
 /// Did the agent write an interrupt record — its turn cut short by the user —
@@ -47,6 +72,7 @@ pub(crate) enum Format {
 pub(crate) fn interrupted_since(format: Format, transcript: &Path, since_ms: u64) -> bool {
     match format {
         Format::Claude => claude::interrupted_since(transcript, since_ms),
+        Format::Codex => codex::interrupted_since(transcript, since_ms),
     }
 }
 
@@ -73,6 +99,7 @@ impl Transcript {
     pub(crate) fn open_cached(path: &Path, format: Format, cache: Option<&Path>) -> std::io::Result<Transcript> {
         let head = match format {
             Format::Claude => claude::head,
+            Format::Codex => codex::head,
         };
         let index = Index::load(path, cache, head)?;
         Ok(Transcript {
@@ -93,12 +120,16 @@ impl Transcript {
             return Vec::new();
         }
         let mut records = match self.format {
-            Format::Claude => claude::records(&buf),
+            Format::Claude => claude::records(&buf, node),
+            Format::Codex => codex::records(&buf, node),
         };
         for r in &mut records {
             if let Kind::ToolUse { id, subagent: Some(sub), .. } = &mut r.kind {
                 let known = self.subagents.get_or_init(|| match self.format {
                     Format::Claude => claude::subagents(&self.path),
+                    // Codex's subagents are threads of their own, not
+                    // anchored in the parent's rollout by a tool call.
+                    Format::Codex => HashMap::new(),
                 });
                 if let Some(found) = known.get(id.as_str()) {
                     *sub = found.clone();

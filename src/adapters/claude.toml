@@ -6,11 +6,6 @@
 # `--`, so a prompt starting with `-` is never parsed as a flag; interactive
 # mode still submits it (verified 2026-09-29).
 seed_prompt      = ["--", "{prompt}"]
-# How hooks are injected. Repeated --settings flags replace each other
-# (verified 2026-09-28), so `run` merges into one.
-settings_flag    = "--settings"
-# `--bare` skips hooks, so nothing is injected under it.
-hookless_flags   = ["--bare"]
 permission_flag  = "--permission-mode"
 # Least to most privileged.
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
@@ -38,6 +33,15 @@ session_env      = [
   "AI_AGENT",
 ]
 
+[hooks]
+# One --settings JSON carrying the hooks. Repeated --settings flags replace
+# each other (verified 2026-09-28), so `run` merges a user's own into one.
+inject           = "settings"
+flags            = ["--settings"]
+events           = ["SessionStart", "UserPromptSubmit", "Stop"]
+# `--bare` skips hooks, so nothing is injected under it.
+hookless_flags   = ["--bare"]
+
 [send]
 submit_delay_ms  = 300
 pre_send         = ""
@@ -60,3 +64,9 @@ inline_max_lines = 2
 # JSONL under $CLAUDE_CONFIG_DIR/projects, path reported by the hooks. Also
 # where the turn ledger finds an Esc's interrupt record.
 transcript       = "claude"
+
+[restore]
+# `claude --resume <id> …`; a stale --resume/-r/--continue/-c the window was
+# first launched with goes, or it would fight the captured conversation.
+resume           = ["--resume", "{session}"]
+drop             = ["--resume", "-r", "--continue", "-c"]

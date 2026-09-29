@@ -61,12 +61,66 @@ pub(crate) enum Turns {
     Screen,
 }
 
+/// How a tool takes the hooks seagents adds to its command line — the one
+/// thing about hook injection that differs between tools; finding the
+/// user's own hook configuration, merging ours into it and passing ONE flag
+/// back is the same for all ([`crate::hook::inject`]).
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Inject {
+    /// No hook support: nothing is injected.
+    #[default]
+    None,
+    /// A settings JSON object whose `hooks` holds the event arrays, inline
+    /// or as a path (Claude's `--settings`). Repeated flags replace each
+    /// other.
+    Settings,
+    /// A config override `hooks=<TOML>` (Codex's `-c`): every override of
+    /// `hooks` or `hooks.*` contributes, and each hook we add is marked
+    /// trusted in the same table, since Codex runs no hook it has not been
+    /// told to trust.
+    Config,
+}
+
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Adapter {
     pub(crate) launch: Launch,
+    pub(crate) hooks: Hooks,
     pub(crate) send: Send,
     pub(crate) read: Read,
+    pub(crate) restore: Restore,
+}
+
+/// The lifecycle hooks `run` adds, each running `<this binary> __hook`.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Hooks {
+    pub(crate) inject: Inject,
+    /// The flag's spellings, the first being the one passed; the others are
+    /// how a user's own may be written (`-c` / `--config`).
+    pub(crate) flags: Vec<String>,
+    /// The events hooked, by the tool's names. `__hook` understands
+    /// `SessionStart`, `UserPromptSubmit` and `Stop` payloads in the shape
+    /// both Claude Code and Codex send.
+    pub(crate) events: Vec<String>,
+    /// Flags under which the tool skips hooks altogether (Claude's `--bare`):
+    /// nothing is injected, and `.agent` stays empty.
+    pub(crate) hookless_flags: Vec<String>,
+}
+
+/// How `restore` puts a window back on the conversation it was showing.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Restore {
+    /// argv inserted right after the command, `{session}` the conversation
+    /// id the hooks reported. Empty: the window is relaunched on a fresh
+    /// conversation.
+    pub(crate) resume: Vec<String>,
+    /// Words in the recorded argv that picked a conversation at launch
+    /// (each dropped with the id or `--last` after it), so the captured one
+    /// replaces them rather than fighting them.
+    pub(crate) drop: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -85,12 +139,6 @@ pub(crate) struct Launch {
     /// `{prompt}` substituted. Empty: the prompt is pasted instead, once the
     /// agent first reaches idle.
     pub(crate) seed_prompt: Vec<String>,
-    /// The flag that takes a settings JSON carrying our hooks; empty when the
-    /// tool has no hook support.
-    pub(crate) settings_flag: String,
-    /// Flags under which the tool skips hooks altogether (Claude's `--bare`):
-    /// nothing is injected, and `.agent` stays empty.
-    pub(crate) hookless_flags: Vec<String>,
     /// The flag that sets a permission mode; empty when there is none.
     pub(crate) permission_flag: String,
     /// The modes that flag takes, least privileged first — the order a child
@@ -206,6 +254,23 @@ fn parse(text: &str) -> Result<Adapter, String> {
     if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
         return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
     }
+    let hooks = &adapter.hooks;
+    if hooks.inject != Inject::None && (hooks.flags.is_empty() || hooks.events.is_empty()) {
+        return Err("hooks.inject needs flags and events".to_string());
+    }
+    if let Some(bad) = hooks.flags.iter().find(|f| !f.starts_with('-') || f.contains('=')) {
+        return Err(format!("hooks.flags: {bad:?} is not a flag"));
+    }
+    if let Some(bad) = hooks.events.iter().find(|e| !crate::hook::KNOWN_EVENTS.contains(&e.as_str())) {
+        return Err(format!(
+            "hooks.events: seagents records {}, not {bad:?}",
+            crate::hook::KNOWN_EVENTS.join(", ")
+        ));
+    }
+    let resume = &adapter.restore.resume;
+    if !resume.is_empty() && !resume.iter().any(|a| a.contains("{session}")) {
+        return Err("restore.resume has no {session}".to_string());
+    }
     let send = &adapter.send;
     if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
         return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
@@ -285,7 +350,7 @@ pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
         caps.push("state");
     }
     caps.push("wait");
-    if adapter.launch.turns == Turns::Hook && !adapter.launch.settings_flag.is_empty() {
+    if adapter.launch.turns == Turns::Hook && adapter.hooks.inject != Inject::None {
         caps.push("turns");
     }
     if !adapter.launch.seed_prompt.is_empty() {
@@ -335,8 +400,11 @@ mod tests {
         }
         let claude = parse(BUNDLED[0].1).unwrap();
         assert_eq!(claude.launch.seed_prompt, ["--", "{prompt}"]);
-        assert_eq!(claude.launch.settings_flag, "--settings");
-        assert_eq!(claude.launch.hookless_flags, ["--bare"]);
+        assert_eq!(claude.hooks.inject, Inject::Settings);
+        assert_eq!(claude.hooks.flags, ["--settings"]);
+        assert_eq!(claude.hooks.events, crate::hook::KNOWN_EVENTS);
+        assert_eq!(claude.hooks.hookless_flags, ["--bare"]);
+        assert_eq!(claude.restore.resume, ["--resume", "{session}"]);
         assert_eq!(claude.launch.permission_flag, "--permission-mode");
         assert_eq!(
             claude.launch.permission_modes,
@@ -352,11 +420,14 @@ mod tests {
         );
 
         let codex = parse(BUNDLED[1].1).unwrap();
-        assert_eq!(codex.launch.seed_prompt, ["{prompt}"]);
-        assert_eq!(codex.launch.settings_flag, "");
-        assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
+        assert_eq!(codex.launch.seed_prompt, ["--", "{prompt}"]);
+        assert_eq!((codex.hooks.inject, &codex.hooks.flags[..]), (Inject::Config, &["-c".to_string(), "--config".to_string()][..]));
+        assert_eq!(codex.hooks.events, crate::hook::KNOWN_EVENTS);
+        assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::Hook, Turns::Hook));
         assert_eq!(codex.send.long_prompt, LongPrompt::Paste);
-        assert_eq!(codex.read.transcript, None, "Phase 4");
+        assert_eq!(codex.send.exit_sequence, "/exit");
+        assert_eq!(codex.read.transcript, Some(crate::transcript::Format::Codex));
+        assert_eq!(codex.restore.resume, ["resume", "{session}"]);
     }
 
     #[test]
@@ -418,7 +489,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn", "send", "stop", "read"]);
-        assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "spawn", "send", "stop"]);
+        assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "turns", "spawn", "send", "stop", "read"]);
         assert_eq!(capabilities("gemini"), ["state", "wait", "send", "stop"]);
         assert_eq!(capabilities("sleep"), ["wait", "stop"]);
     }
@@ -428,7 +499,7 @@ mod tests {
         let claude = parse(BUNDLED[0].1).unwrap();
         assert_eq!(claude.launch.seed_args("-rf? it's fine").unwrap(), ["--", "-rf? it's fine"]);
         let codex = parse(BUNDLED[1].1).unwrap();
-        assert_eq!(codex.launch.seed_args("go").unwrap(), ["go"]);
+        assert_eq!(codex.launch.seed_args("-go").unwrap(), ["--", "-go"]);
 
         assert!(Adapter::default().launch.seed_args("go").unwrap_err().contains("seed_prompt"));
         assert!(claude.launch.seed_args("a\0b").unwrap_err().contains("NUL"));
@@ -451,6 +522,12 @@ mod tests {
         assert!(parse("[launch]\nidentity = \"telepathy\"\n").is_err());
         assert!(parse("[launch]\nseed_flag = \"-p\"\n").is_err(), "typos are errors");
         assert!(parse("[launch]\nseed_prompt = [\"-p\"]\n").unwrap_err().contains("{prompt}"));
+        assert!(parse("[hooks]\ninject = \"settings\"\n").unwrap_err().contains("flags"));
+        let hooks = "[hooks]\ninject = \"config\"\nflags = [\"-c\"]\n";
+        assert!(parse(&format!("{hooks}events = [\"Stop\"]\n")).is_ok());
+        assert!(parse(&format!("{hooks}events = [\"Interrupt\"]\n")).unwrap_err().contains("Interrupt"));
+        assert!(parse("[hooks]\nflags = [\"c\"]\n").unwrap_err().contains("not a flag"));
+        assert!(parse("[restore]\nresume = [\"--resume\"]\n").unwrap_err().contains("{session}"));
     }
 
     #[test]

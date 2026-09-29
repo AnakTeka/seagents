@@ -64,8 +64,12 @@ pub(crate) struct Node {
 }
 
 /// What a format's parser says about one line: None for a line that is not
-/// a tree node (no uuid, junk).
-pub(crate) type HeadFn = fn(&[u8]) -> Option<Node>;
+/// a tree node (no uuid, junk). Given where the line starts and the nodes
+/// before it, for a format whose lines carry no uuid and no parent (Codex's
+/// rollout, a log with rollback markers): its node is then minted from the
+/// offset, and its parent read off the nodes already indexed — which a
+/// cached index holds, so extending one gives the same tree as a rebuild.
+pub(crate) type HeadFn = fn(line: &[u8], at: u64, prior: &[Node]) -> Option<Node>;
 
 #[derive(Debug, Default)]
 pub(crate) struct Index {
@@ -121,7 +125,7 @@ impl Index {
                 break; // the end, or a line still being written
             }
             let body = &line[..n - 1];
-            if let Some(mut node) = head(body) {
+            if let Some(mut node) = head(body, at, &self.nodes) {
                 node.offset = at;
                 node.len = u32::try_from(body.len()).unwrap_or(u32::MAX);
                 self.nodes.push(node);
@@ -233,7 +237,7 @@ mod tests {
     use super::*;
 
     /// A toy format: `<uuid> <parent|-> <ts> <u|a|o>`; anything else is junk.
-    fn head(line: &[u8]) -> Option<Node> {
+    fn head(line: &[u8], _: u64, _: &[Node]) -> Option<Node> {
         let s = std::str::from_utf8(line).ok()?;
         let mut w = s.split(' ');
         let uuid = parse_uuid(w.next()?)?;

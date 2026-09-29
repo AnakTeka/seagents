@@ -62,7 +62,7 @@ fn scan(tail: &[u8], since_ms: u64) -> bool {
         return false;
     }
     for line in tail.rsplit(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let Some(node) = head(line).filter(|n| n.ts != 0) else {
+        let Some(node) = head(line, 0, &[]).filter(|n| n.ts != 0) else {
             continue; // snapshots, titles: no timestamp, not a turn event
         };
         if node.ts < since_ms {
@@ -71,7 +71,7 @@ fn scan(tail: &[u8], since_ms: u64) -> bool {
         // A tool result quoting the marker is a `tool_result` record, and the
         // assistant saying it an `assistant` one: only the user's own counts.
         let interrupt = node.kind == NodeKind::User
-            && records(line)
+            && records(line, &node)
                 .iter()
                 .any(|r| matches!(&r.kind, Kind::User { text } if text.starts_with(INTERRUPT)));
         if interrupt {
@@ -103,7 +103,7 @@ struct Head<'a> {
 }
 
 /// The tree node a line is, if any (offset and length are the index's).
-pub(super) fn head(line: &[u8]) -> Option<Node> {
+pub(super) fn head(line: &[u8], _at: u64, _prior: &[Node]) -> Option<Node> {
     let h: Head = serde_json::from_slice(line).ok()?;
     let uuid = parse_uuid(h.uuid.as_deref()?)?;
     let parent = h
@@ -123,7 +123,7 @@ pub(super) fn head(line: &[u8]) -> Option<Node> {
 
 /// The records of one line, in block order; none for a line that is not
 /// conversation or does not parse.
-pub(super) fn records(line: &[u8]) -> Vec<Record> {
+pub(super) fn records(line: &[u8], _node: &Node) -> Vec<Record> {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return Vec::new();
     };
@@ -289,6 +289,9 @@ mod tests {
 
     const UUID: &str = "0b7a1c2e-3d4f-4a5b-8c6d-7e8f9a0b1c2d";
 
+    /// Claude's records come from the line alone; the node is not read.
+    const NODE: Node = Node { offset: 0, len: 0, kind: NodeKind::Other, ts: 0, uuid: 0, parent: 0 };
+
     /// A record as Claude 2.1.284 writes it (trimmed).
     fn rec(kind: &str, ts: &str, text: &str) -> String {
         serde_json::json!({
@@ -342,27 +345,27 @@ mod tests {
     }
 
     fn kinds(line: &Value) -> Vec<Kind> {
-        records(line.to_string().as_bytes()).into_iter().map(|r| r.kind).collect()
+        records(line.to_string().as_bytes(), &NODE).into_iter().map(|r| r.kind).collect()
     }
 
     #[test]
     fn heads_take_the_logical_parent_across_a_compaction_and_skip_non_nodes() {
-        let n = head(br#"{"type":"assistant","uuid":"0b7a1c2e-3d4f-4a5b-8c6d-7e8f9a0b1c2d","parentUuid":"00000000-0000-4000-8000-000000000001","timestamp":"1970-01-01T00:00:01.5Z","message":{"content":[{"type":"text","text":"huge \" escaped"}]}}"#).unwrap();
+        let n = head(br#"{"type":"assistant","uuid":"0b7a1c2e-3d4f-4a5b-8c6d-7e8f9a0b1c2d","parentUuid":"00000000-0000-4000-8000-000000000001","timestamp":"1970-01-01T00:00:01.5Z","message":{"content":[{"type":"text","text":"huge \" escaped"}]}}"#, 0, &[]).unwrap();
         let id = |n: u8| parse_uuid(&format!("00000000-0000-4000-8000-00000000000{n}")).unwrap();
         assert_eq!((n.kind, n.ts, n.parent), (NodeKind::Assistant, 1500, id(1)));
-        let boundary = head(br#"{"type":"system","subtype":"compact_boundary","parentUuid":null,"logicalParentUuid":"00000000-0000-4000-8000-000000000002","uuid":"00000000-0000-4000-8000-000000000003","timestamp":"1970-01-01T00:00:02Z"}"#).unwrap();
+        let boundary = head(br#"{"type":"system","subtype":"compact_boundary","parentUuid":null,"logicalParentUuid":"00000000-0000-4000-8000-000000000002","uuid":"00000000-0000-4000-8000-000000000003","timestamp":"1970-01-01T00:00:02Z"}"#, 0, &[]).unwrap();
         assert_eq!((boundary.kind, boundary.parent, boundary.uuid), (NodeKind::Other, id(2), id(3)));
-        assert_eq!(head(br#"{"type":"user","uuid":"00000000-0000-4000-8000-000000000004"}"#).unwrap().parent, 0);
+        assert_eq!(head(br#"{"type":"user","uuid":"00000000-0000-4000-8000-000000000004"}"#, 0, &[]).unwrap().parent, 0);
         for junk in [&br#"{"type":"last-prompt","leafUuid":"00000000-0000-4000-8000-000000000004"}"#[..],
                      b"{\"type\":\"file-history-snapshot\"}", b"not json", b"[1,2]", b"{\"uuid\":\"short\"}"] {
-            assert_eq!(head(junk), None);
+            assert_eq!(head(junk, 0, &[]), None);
         }
     }
 
     #[test]
     fn every_block_kind_becomes_its_record_and_the_rest_is_skipped() {
         let user_str = serde_json::json!({"type":"user","uuid":UUID,"parentUuid":null,"timestamp":"t","message":{"content":"hello"}});
-        let r = records(user_str.to_string().as_bytes());
+        let r = records(user_str.to_string().as_bytes(), &NODE);
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].uuid.as_str(), r[0].parent_uuid.as_deref(), r[0].timestamp.as_deref()), (UUID, None, Some("t")));
         assert_eq!(r[0].kind, Kind::User { text: "hello".into() });
@@ -396,7 +399,7 @@ mod tests {
         let system = serde_json::json!({"type":"system","uuid":UUID,"subtype":"turn_duration","content":"x"});
         let no_uuid = serde_json::json!({"type":"user","message":{"content":"x"}});
         assert!(kinds(&meta).is_empty() && kinds(&system).is_empty() && kinds(&no_uuid).is_empty());
-        assert!(records(b"{\"type\":\"user\",").is_empty());
+        assert!(records(b"{\"type\":\"user\",", &NODE).is_empty());
     }
 
     #[test]

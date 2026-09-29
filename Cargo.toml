@@ -18,6 +18,7 @@ crossterm = "0.28"
 signal-hook = "0.3"
 libc = "0.2"
 serde_json = "1"
+sha2 = "0.10"
 vt100 = "0.15"
 ratatui = "0.28"
 clap = { version = "4", features = ["derive"] }

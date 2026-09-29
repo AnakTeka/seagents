@@ -915,15 +915,21 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
 }
 
 /// The command a restored window runs: the agent's original argv with any
-/// stale `--resume`/`-r` replaced by the conversation we captured. Model flags
-/// and anything else the user launched with are preserved. The flag goes
-/// before a `--`, if there is one: everything after it is the agent's
-/// positional text, and `--resume <id>` there would be read as prompt.
+/// stale conversation selection dropped and the captured conversation
+/// resumed, both per the agent's adapter (`[restore]`: Claude's
+/// `--resume <id>`, Codex's `resume <id>` subcommand). Model flags and
+/// anything else the user launched with are preserved. The resume goes
+/// right after the command: before any `--` (after it everything is the
+/// agent's positional text) and in a subcommand's place. An agent whose
+/// adapter can't resume — or with no captured id — comes back on a fresh
+/// conversation.
 fn resume_argv(agent: &Value) -> Vec<String> {
-    let mut out = argv_without_resume(&argv_of(agent));
-    if let Some(id) = agent["session_id"].as_str() {
-        let at = out.iter().position(|a| a == "--").unwrap_or(out.len());
-        out.splice(at..at, ["--resume".to_string(), id.to_string()]);
+    let argv = argv_of(agent);
+    let restore = crate::adapter::for_command(&argv[0]).unwrap_or_default().restore;
+    let mut out = argv_without_resume(&argv, &restore.drop);
+    if let Some(id) = agent["session_id"].as_str().filter(|_| !restore.resume.is_empty()) {
+        let resume = restore.resume.iter().map(|a| a.replace("{session}", id));
+        out.splice(1..1, resume);
     }
     out
 }
@@ -948,10 +954,11 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// An argv with any session-selection flag removed, so a restored window can
-/// be pointed at the conversation we captured instead of whichever one the
-/// agent was originally launched on.
-fn argv_without_resume(argv: &[String]) -> Vec<String> {
+/// An argv with its session-selection words (`drop`, each with the id or
+/// `--last` after it) removed, so a restored window can be pointed at the
+/// conversation we captured instead of whichever one the agent was
+/// originally launched on.
+fn argv_without_resume(argv: &[String], drop: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut it = argv.iter().peekable();
     while let Some(arg) = it.next() {
@@ -961,9 +968,9 @@ fn argv_without_resume(argv: &[String]) -> Vec<String> {
             out.extend(it.cloned());
             break;
         }
-        if arg == "--resume" || arg == "-r" || arg == "--continue" || arg == "-c" {
-            // Drop the flag, and its value when it carries one.
-            if it.peek().map(|v| is_uuid(v)).unwrap_or(false) {
+        if drop.contains(arg) {
+            // Drop the word, and its value when it carries one.
+            if it.peek().is_some_and(|v| is_uuid(v) || *v == "--last") {
                 it.next();
             }
             continue;
@@ -1049,6 +1056,15 @@ mod tests {
         assert!(!is_uuid("5c603939zbf27-47c8-8b0f-13731d2cc6eb"));
     }
 
+    /// `resume_argv` under the lock the adapter tests hold while they point
+    /// the config dir at a scratch override.
+    fn resume_argv(agent: &Value) -> Vec<String> {
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::resume_argv(agent)
+    }
+
     #[test]
     fn resume_argv_replaces_a_stale_resume_and_keeps_other_flags() {
         let agent = json!({
@@ -1059,10 +1075,10 @@ mod tests {
             resume_argv(&agent),
             vec![
                 "claude",
+                "--resume",
+                "0885fa15-47cf-4903-9d97-db59762dc210",
                 "--model",
                 "claude-opus-4-8",
-                "--resume",
-                "0885fa15-47cf-4903-9d97-db59762dc210"
             ]
         );
     }
@@ -1080,8 +1096,24 @@ mod tests {
                             "session_id": id });
         assert_eq!(
             resume_argv(&agent),
-            ["claude", "--model", "haiku", "--resume", id, "--", "say", "-c", "--resume"]
+            ["claude", "--resume", id, "--model", "haiku", "--", "say", "-c", "--resume"]
         );
+    }
+
+    #[test]
+    fn codex_resumes_by_its_subcommand_and_keeps_its_config_flags() {
+        let id = "01a0ec42-c264-7013-b70f-9acd600b4571";
+        // `-c` is Codex's config override, not Claude's --continue.
+        let agent = json!({ "argv": ["codex", "-c", "model=\"x\"", "resume", "--last", "-m", "m"], "session_id": id });
+        assert_eq!(resume_argv(&agent), ["codex", "resume", id, "-c", "model=\"x\"", "-m", "m"]);
+        let forked = json!({ "argv": ["codex", "fork", "5c603939-bf27-47c8-8b0f-13731d2cc6eb"], "session_id": id });
+        assert_eq!(resume_argv(&forked), ["codex", "resume", id]);
+        // Nothing captured: a fresh conversation, the stale pick still gone.
+        let fresh = json!({ "argv": ["codex", "resume", "--last"], "session_id": null });
+        assert_eq!(resume_argv(&fresh), ["codex"]);
+        // An agent no adapter can resume comes back as it was launched.
+        let other = json!({ "argv": ["gemini", "-c", "x"], "session_id": id });
+        assert_eq!(resume_argv(&other), ["gemini", "-c", "x"]);
     }
 
     #[test]

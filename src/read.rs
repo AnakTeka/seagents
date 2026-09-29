@@ -135,9 +135,9 @@ struct Source {
 
 fn source(args: &Args) -> Result<Source, String> {
     if let Some(p) = &args.transcript {
-        // The one format there is; Phase 4's second parser will have to
-        // tell them apart by content.
-        return Ok(Source { path: p.clone(), format: Format::Claude, cwd: None, ended_at: None });
+        // No agent to ask which tool wrote it: the content says.
+        let format = Format::detect(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        return Ok(Source { path: p.clone(), format, cwd: None, ended_at: None });
     }
     let target = args.target.as_deref().unwrap_or_default();
     let session = registry::resolve_target(target)?;

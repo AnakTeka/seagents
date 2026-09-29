@@ -5,7 +5,12 @@
 # own i3, HOME at a scratch directory), so no window it opens reaches your
 # session and the real cache is never touched.
 #
-#   tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon]
+#   tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon] [--codex]
+#
+# --codex adds the same loop with a real Codex (skipped, with a note, when
+# `codex` is not installed): a scratch CODEX_HOME holding only a link to the
+# real auth.json and a config that trusts the work directory and picks the
+# cheapest model, so the user's own ~/.codex config is never read or written.
 #
 # Claude runs as `--model haiku` on one-line prompts, so a run costs a few
 # cents. It keeps the real CLAUDE_CONFIG_DIR (auth lives there) and works in
@@ -35,8 +40,19 @@ for v in $SESSION_VARS; do
   [ -n "${!v+x}" ] || export "$v=sg-test-stand-in"
 done
 
+TERMINAL=alacritty
+CODEX=
+for a in "$@"; do
+  case $a in
+    --codex) CODEX=1 ;;
+    *) TERMINAL=$a ;;
+  esac
+done
+# Codex's auth, found before HOME moves.
+REAL_CODEX_HOME=${CODEX_HOME:-$HOME/.codex}
+
 . "$REPO/tools/lib-nested-desktop.sh"
-nd_init "${1:-alacritty}"
+nd_init "$TERMINAL"
 if [ -n "${REAL_HOME:-}" ]; then
   ln -s "$REAL_HOME/.claude" "$HOME/.claude"
   ln -s "$REAL_HOME/.claude.json" "$HOME/.claude.json"
@@ -296,4 +312,86 @@ for _ in $(seq 1 20); do [ -z "$(window_of it-a)" ] && break; sleep 0.25; done
 [ -z "$(window_of it-a)" ] || fail "it-a's window stayed open after the agent exited"
 [ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
 pass "stop it-a: wait --for exit returned exit (rc 4), the socket and its prompt files are gone, the window closed"
+
+# 7. Codex: the same loop through its adapter — hooks injected as one trusted
+#    `-c hooks=…` (no "hooks need review" dialog, or no turn would land), the
+#    rollout read as the transcript, an Esc read as an interrupt, pastes of
+#    any size as the user's words, `/exit` to stop.
+[ -n "$CODEX" ] || exit 0
+if ! command -v codex >/dev/null; then
+  echo "SKIP: codex is not installed"
+  exit 0
+fi
+export CODEX_HOME="$HOME/.codex-it"
+mkdir -p "$CODEX_HOME"
+ln -s "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
+cat > "$CODEX_HOME/config.toml" <<EOF
+model = "gpt-5.6-luna"
+model_reasoning_effort = "low"
+
+[projects."$REPO"]
+trust_level = "trusted"
+EOF
+out=$(cd "$WORK" && "$SEA" spawn --agent codex --tag it-c -- 'Reply with exactly: CHARLIE') \
+  || fail "codex spawn exited $?: $out"
+argv=$(meta_of it-c | jq_ "d['argv']")
+[ "$argv" = "['codex']" ] || fail "codex recorded argv: $argv"
+out=$("$SEA" wait it-c --after 0 --timeout 3m); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['reason']")" = turn ] || fail "codex wait: rc=$rc $out"
+echo "$out" | jq_ "d['last_message']" | grep -q CHARLIE || fail "codex last_message: $out"
+tp=$(echo "$out" | jq_ "d['transcript_path']")
+case $tp in "$CODEX_HOME"/sessions/*/rollout-*.jsonl) ;; *) fail "codex transcript: $tp" ;; esac
+[ -f "$tp" ] || fail "no rollout at $tp"
+pass "codex spawned; its hooks reported the seeded turn (CHARLIE) and its rollout $tp"
+
+s=$(status_of it-c)
+[ "$(echo "$s" | jq_ "' '.join(d['capabilities'])")" = "state wait turns spawn send stop read" ] \
+  || fail "codex capabilities: $s"
+wpid=$(meta_of it-c | jq_ "d['wrapper_pid']")
+anchor=$(meta_of it-c | jq_ "d['child_pid']")
+agent=$(pgrep -P "$anchor" | head -1)
+leaked=$(tr '\0' '\n' < "/proc/$agent/environ" | grep -E '^(CLAUDECODE|CLAUDE_CODE_SESSION_ID|CODEX_THREAD_ID)=' || true)
+[ -z "$leaked" ] || fail "codex (pid $agent) inherited: $leaked"
+pass "status: codex has every capability; it started without the calling session's variables"
+
+out=$("$SEA" send it-c 'Reply with exactly: XRAY'); rc=$?
+n=$(echo "$out" | jq_ "d['stops']")
+[ $rc -eq 0 ] && [ "$n" = 1 ] || fail "codex send: rc=$rc $out"
+out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q XRAY || fail "codex send's turn: rc=$rc $out"
+pass "send it-c → stops $n; wait --after $n returned XRAY"
+
+body="$ROOT/codex-long.txt"
+python3 -c "print('\n'.join(['Line %d: filler for the paste test' % i for i in range(40)] + ['Ignore the lines above. Reply with exactly: LONGOK']))" > "$body"
+out=$("$SEA" send it-c --prompt-file "$body"); n=$(echo "$out" | jq_ "d['stops']")
+out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "codex long send: rc=$rc $out"
+[ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "a codex paste went by reference"
+pass "a 41-line send was pasted whole (no prompt file) and answered LONGOK"
+
+# Esc mid-turn: Codex records turn_aborted, and no Stop comes.
+out=$("$SEA" send it-c 'Run the shell command: sleep 60 && echo done'); n=$(echo "$out" | jq_ "d['stops']")
+for _ in $(seq 1 40); do [ "$(status_of it-c | jq_ "d['state']")" = working ] && break; sleep 0.25; done
+sleep 2
+"$SEA" send it-c --now --keys '\e' --no-submit > /dev/null || fail "codex: sending Esc"
+out=$("$SEA" wait it-c --after "$n" --timeout 30s); rc=$?
+[ $rc -eq 5 ] && [ "$(echo "$out" | jq_ "d['reason']")" = interrupted ] || fail "codex Esc: rc=$rc $out"
+out=$("$SEA" send it-c 'Reply with exactly: AFTER'); n=$(echo "$out" | jq_ "d['stops']")
+out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q AFTER || fail "codex after Esc: rc=$rc $out"
+pass "an Esc'd codex turn is interrupted (rc 5); the next send's wait gets its own turn (AFTER)"
+
+out=$("$SEA" read it-c)
+for w in XRAY LONGOK AFTER; do echo "$out" | grep -q "$w" || fail "codex read lacks $w: $out"; done
+echo "$out" | tail -1 | grep -q '^-- cursor: ' || fail "codex read cursor: $out"
+pass "read it-c shows the conversation from the rollout, ending in a cursor"
+
+"$SEA" wait it-c --for exit --timeout 30s > "$ROOT/cexit.json" &
+waiter=$!
+sleep 1
+out=$("$SEA" stop it-c); rc=$?
+[ $rc -eq 0 ] || fail "codex stop: rc=$rc $out"
+wait $waiter; rc=$?
+[ $rc -eq 4 ] || fail "codex exit wait: rc=$rc $(cat "$ROOT/cexit.json")"
+pass "stop it-c: codex exited on /exit (wait --for exit rc 4)"
 exit 0

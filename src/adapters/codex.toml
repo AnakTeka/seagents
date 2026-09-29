@@ -1,23 +1,68 @@
-# Codex — conservative defaults until its hooks are verified (ORCHESTRATION-SPEC
-# Phase 4: does `notify` carry the rollout path, and fire per turn?). Until
-# then: no hook injection, no identity, turns read off the screen. A copy at
-# ~/.config/seagents/agents/codex.toml replaces this file whole.
+# Codex CLI — how seagents launches and drives it. Bundled default; a copy
+# at ~/.config/seagents/agents/codex.toml replaces this file whole. Facts
+# measured on codex-cli 0.152.0 (2026-09-29), live in tmux.
 
 [launch]
-# `codex "<prompt>"` starts an interactive session seeded with the prompt.
-seed_prompt      = ["{prompt}"]
-settings_flag    = ""
-hookless_flags   = []
+# `codex [PROMPT]` starts the interactive TUI and submits the prompt as the
+# first turn; clap takes `--`, so a prompt starting with `-` stays a prompt
+# (verified).
+seed_prompt      = ["--", "{prompt}"]
+# Codex has no permission-mode flag: an approval policy (-a) and a sandbox
+# (-s) instead, and its hooks report Claude's vocabulary for the pair
+# (`default`, `bypassPermissions`). A child runs at the user's configured
+# default.
 permission_flag  = ""
 permission_modes = []
-identity         = "none"
-turns            = "screen"
+identity         = "hook"
+turns            = "hook"
 watch_dir        = ""
-# What a running Codex sets for its children is not known yet (Phase 4).
-session_env      = []
+# What Codex sets for the commands it runs (read off `env` inside a shell
+# tool call, and its source): the thread's identity, its sandbox and
+# approval state. Never CODEX_HOME, the user's own configuration.
+session_env      = [
+  "CODEX_CI",
+  "CODEX_SESSION_ID",
+  "CODEX_THREAD_ID",
+  "CODEX_PERMISSION_PROFILE",
+  "CODEX_SANDBOX",
+  "CODEX_SANDBOX_NETWORK_DISABLED",
+  "CODEX_NETWORK_PROXY_ACTIVE",
+  "CODEX_ESCALATE_SOCKET",
+]
+
+[hooks]
+# Codex's hooks are Claude's (same events, same payload fields, and
+# `transcript_path` is the rollout file), configured under `[hooks]` in
+# config.toml — and in a `-c` override, which Codex keeps as its own
+# "session flags" layer beside the user's config. A hook runs only once
+# trusted: `hooks.state."<source>:<event>:<group>:<handler>".trusted_hash`,
+# a sha256 of the hook's normalized definition, which the same override may
+# carry for the hooks it adds. So `run` passes one `-c hooks={…}` holding
+# its hooks and their trust, and nothing under ~/.codex is written.
+inject           = "config"
+flags            = ["-c", "--config"]
+events           = ["SessionStart", "UserPromptSubmit", "Stop"]
+hookless_flags   = []
 
 [send]
 submit_delay_ms  = 300
 pre_send         = ""
-# Empty: `stop` goes straight to SIGTERM.
-exit_sequence    = ""
+# Exits at once (verified; `/quit` too).
+exit_sequence    = "/exit"
+# Every paste is taken as the user's words: a bracketed paste of 4,392
+# chars on 31 lines shows as `[Pasted Content 4392 chars]` in the composer
+# and is submitted whole — the UserPromptSubmit `prompt` and the rollout's
+# user message hold all of it, and the model acted on its last line.
+long_prompt      = "paste"
+
+[read]
+# The rollout JSONL under $CODEX_HOME/sessions/YYYY/MM/DD/, path reported by
+# the hooks. Also where an Esc's `turn_aborted` record is.
+transcript       = "codex"
+
+[restore]
+# `codex resume <id> …` — the subcommand takes every option the TUI does,
+# and a `-c` before it still applies (verified: our hooks fire in a
+# resumed session, SessionStart source `resume`).
+resume           = ["resume", "{session}"]
+drop             = ["resume", "fork", "--last"]
