@@ -49,6 +49,8 @@ pub(crate) fn cache_dir() -> PathBuf {
 pub(crate) struct Files {
     /// The teed output stream.
     pub(crate) raw: PathBuf,
+    /// Where a rotation writes the tee's tail before renaming it over `raw`.
+    pub(crate) raw_tmp: PathBuf,
     /// Identity: [`Meta`].
     pub(crate) meta: PathBuf,
     /// Last observed state: [`StateRecord`].
@@ -66,6 +68,7 @@ impl Files {
     pub(crate) fn in_dir(dir: &Path, wrapper_pid: u64) -> Files {
         Files {
             raw: dir.join(format!("{wrapper_pid}.raw")),
+            raw_tmp: dir.join(format!("{wrapper_pid}.raw.tmp")),
             meta: dir.join(format!("{wrapper_pid}.meta")),
             state: dir.join(format!("{wrapper_pid}.state")),
             lock: dir.join(format!("{wrapper_pid}.lock")),
@@ -227,7 +230,7 @@ pub(crate) fn reap() {
 fn reap_in(dir: &Path) {
     for s in all_in(dir).into_iter().filter(|s| !is_alive(&s.meta)) {
         let f = &s.files;
-        for path in [&f.meta, &f.raw, &f.state, &f.lock] {
+        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.lock] {
             let _ = fs::remove_file(path);
         }
     }

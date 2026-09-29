@@ -154,8 +154,18 @@ says `▼ n more` — otherwise `q / esc` would silently fall off the end.
 
 Source layout under `src/`:
 
-- **`src/main.rs`** — CLI dispatch; the `run()` pty-tee wrapper;
-  `write_meta()`, `terminal_size()`; manifest-update helpers.
+- **`src/main.rs`** — CLI dispatch; manifest-update helpers.
+- **`src/wrapper/`** — `seagents run`, the pty-tee wrapper (§1):
+  - `mod.rs` — setup and wiring: `run()` (window identity, pty + child,
+    `.meta`, raw mode, thread start, the job-control wait loop),
+    `identify_window()`, `terminal_size()`, `write_meta()`.
+  - `pumps.rs` — the output pump (stdout + tee, with `.raw` rotation), the
+    input pump (with window-identity healing, `input_capture_eligible()`), and
+    the SIGWINCH resize pump.
+  - `monitor.rs` — the self-monitor thread: detection tick, `.state`
+    transitions, `notify_transition()`, the done-ack on focus, the snapshot
+    offer.
+  - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord`, `list()` (live,
   never deletes) / `reap()` (deletes the dead) / `by_child_pid()`, and the
@@ -233,7 +243,8 @@ continues the agent's group and nudges a repaint with SIGWINCH.
 Per session, keyed by the wrapper's pid:
 
 - **`<wrapper_pid>.raw`** — the teed output byte stream (for detection);
-  rotated down to its last ~1 MB once it passes 16 MB.
+  rotated down to its last ~1 MB once it passes 16 MB (via a
+  `<wrapper_pid>.raw.tmp` renamed over it).
 - **`<wrapper_pid>.state`** — last observed state transition
   (`{"state": "idle", "since": <unix>, "seen": bool}`); powers the
   "idle for / waiting for" column and the **done** state: the wrapper marks a
@@ -607,7 +618,7 @@ seagents debug-screen ~/.cache/seagents/<pid>.raw <cols> <rows> [--json]
 # SEAGENTS_DEBUG=1 surfaces manifest-update warnings on stderr
 
 # Regression-test the Ctrl+Z suspend/resume chain headlessly (scripted pty
-# driving an interactive bash — run after touching run()/lead()/the pumps):
+# driving an interactive bash — run after touching anything in src/wrapper/):
 python3 tools/test-jobctl.py
 
 # Debug the HUD post-mortem (its terminal vanishes with it):
