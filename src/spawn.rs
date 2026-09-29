@@ -80,8 +80,14 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
     let caller = registry::enclosing_session(u64::from(std::process::id()));
     let who = match &caller {
         None => Caller::Human,
+        // The mode as the parent's own adapter reads it: its hooks' word,
+        // bounded by its command line where they report less than the
+        // mode (Codex).
         Some(s) => Caller::Agent {
-            mode: registry::read_agent(&s.files).permission_mode,
+            mode: crate::adapter::for_command(s.meta.argv.first().map_or("", String::as_str))
+                .unwrap_or_default()
+                .launch
+                .bound_mode(registry::read_agent(&s.files).permission_mode, &s.meta.argv),
         },
     };
     let permission = permission_args(&adapter.launch, &who, args.permission_mode.as_deref())?;
@@ -158,8 +164,10 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
 enum Caller {
     /// No seagents wrapper among the caller's ancestors.
     Human,
-    /// An agent, with its mode as its hooks last reported it (None: no hook
-    /// has reported one — not started yet, or `--bare`).
+    /// An agent, with its mode as its hooks last reported it, bounded by its
+    /// own command line for an adapter whose hooks report less than the mode
+    /// (`Launch::bound_mode`). None: no hook has reported one — not started
+    /// yet, or `--bare`.
     Agent { mode: Option<String> },
 }
 

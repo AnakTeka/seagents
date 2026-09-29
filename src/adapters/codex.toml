@@ -54,6 +54,19 @@ default           = ["-a", "on-request", "-s", "read-only"]
 acceptEdits       = ["-a", "on-request", "-s", "workspace-write"]
 bypassPermissions = ["-a", "never", "-s", "danger-full-access"]
 
+# What a running Codex may pass on is also read off its own command line
+# (`.meta` argv), since its hooks report the approval policy alone: a Codex
+# a human started as `-a never -s read-only` reports bypassPermissions, but
+# may write nothing. The lesser of the two bounds its children. The flags
+# above count in reverse — a value ranks as the most privileged mode using
+# it (`-s read-only` → default, `-a never` → bypassPermissions) — plus these.
+# A mode changed mid-session (/permissions) is not on the command line; the
+# lesser of the two still holds. A `-p` profile's contents are not read.
+[launch.argv_mode]
+aliases     = { "--ask-for-approval" = "-a", "--sandbox" = "-s" }
+config_keys = { approval_policy = "-a", sandbox_mode = "-s" }
+flags       = { "--dangerously-bypass-approvals-and-sandbox" = "bypassPermissions", "--yolo" = "bypassPermissions", "--full-auto" = "acceptEdits" }
+
 # What an agent calling `spawn` may not pass with `--arg`: its child's mode
 # comes from `spawn --permission-mode` (the -a/-s pair above), capped at its
 # own, and each of these reaches past that cap. A human may pass anything.

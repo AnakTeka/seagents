@@ -37,6 +37,8 @@ plan              = ["--permission-mode", "plan"]
 default           = ["--permission-mode", "default"]
 acceptEdits       = ["--permission-mode", "acceptEdits"]
 bypassPermissions = ["--permission-mode", "bypassPermissions"]
+# No [launch.argv_mode]: the hooks report the mode whole, and it is the
+# current one — Shift+Tab changes it after launch, so argv would be stale.
 
 # What an agent calling `spawn` may not pass with `--arg`: its child's mode
 # comes from `spawn --permission-mode`, capped at its own, and each of these

@@ -920,7 +920,8 @@ something the caller can't casually change:
    requested `--tag` must be free of live agents, reservations **and the
    saved layout(s)** — unlike `run --tag`, which restore needs to reuse them.
 3. **Permission mode**: from an agent, always explicit — the parent's own
-   hook-reported `permission_mode` by default, refused above it (the adapter's
+   hook-reported `permission_mode` by default (bounded by its own argv for
+   Codex, whose hooks report only its approval policy, §11), refused above it (the adapter's
    `permission_modes` order, least privileged first), the least privileged
    when the parent's is unknown. From a human, passed only if given (the
    tool's configured default otherwise, as when typing `claude`). The reason
@@ -1254,11 +1255,23 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   danger-full-access`. Measured for every pair: the hooks' `permission_mode`
   follows `-a` alone — `on-request` → `default`, `never` →
   `bypassPermissions`, whatever `-s` — so no mode short of bypass may use
-  `never`. Consequences: a Codex parent reads as `default` in any
-  on-request setup, so its children are capped at `default` even if it runs
-  `workspace-write`; and a Codex a human started with `-a never -s
-  read-only` reads as `bypassPermissions`, so its children may be spawned in
-  bypass (only its argv could tell, and nothing reads that).
+  `never`. So a Codex parent reads as `default` in any on-request setup,
+  and its children are capped at `default` even if it runs
+  `workspace-write`. The other direction — a Codex a human started with `-a
+  never -s read-only` reports `bypassPermissions` but can write nothing — is
+  closed by reading the parent's own `.meta` argv as well
+  (`Launch::bound_mode`, enabled by the adapter's `[launch.argv_mode]`):
+  `permission_argv` in reverse, a flag's value ranking as the most
+  privileged mode that uses it (`-s read-only` → `default`, `-s
+  workspace-write` → `acceptEdits`, `-a never` → bypass; a value no mode
+  uses → the least), plus the long spellings, `-c approval_policy=` /
+  `sandbox_mode=`, and the whole-mode flags (`--dangerously-bypass-…`,
+  `--yolo`, `--full-auto`); the parent's mode is the lesser of that and
+  its hooks' word. So that parent's children get at most `default`. A mode
+  changed mid-session (`/permissions`) or set by a `-p` profile is not on
+  the command line; the lesser still holds. Claude has no `argv_mode`: its
+  hooks report the mode whole and current (Shift+Tab changes it after
+  launch).
 - **The rollout** is a log, not a tree: no uuids, no parents. Nodes are its
   lines (uuid = byte offset + 1), chained; `thread_rolled_back {num_turns}`
   hangs off the node before the user turns it drops, so they become a side

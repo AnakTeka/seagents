@@ -165,6 +165,25 @@ pub(crate) struct Launch {
     pub(crate) config_flags: Vec<String>,
     /// What an agent calling `spawn` may not pass through `--arg`.
     pub(crate) privileged: Privileged,
+    /// When present, a running agent's mode is also read off its own argv
+    /// ([`Launch::bound_mode`]), for a tool whose hooks report less than its
+    /// mode (Codex's follow its approval policy alone).
+    pub(crate) argv_mode: Option<ArgvMode>,
+}
+
+/// How a running agent's own command line names its mode, beyond
+/// `permission_argv` read in reverse.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ArgvMode {
+    /// Other spellings of the flags `permission_argv` uses (`--sandbox` →
+    /// `-s`).
+    pub(crate) aliases: BTreeMap<String, String>,
+    /// Configuration keys (behind `config_flags`) that set what one of those
+    /// flags sets (`sandbox_mode` → `-s`).
+    pub(crate) config_keys: BTreeMap<String, String>,
+    /// Flags that are a whole mode on their own.
+    pub(crate) flags: BTreeMap<String, String>,
 }
 
 /// Arguments that would give a child more than the permission mode `spawn`
@@ -256,7 +275,94 @@ fn config_key(kv: &str) -> &str {
     kv.split('=').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'')
 }
 
+/// A value as a command line or a TOML override writes it: blanks and
+/// quotes dropped.
+fn unquoted(v: &str) -> &str {
+    v.trim().trim_matches(|c| c == '"' || c == '\'')
+}
+
 impl Launch {
+    /// The mode a running agent of this kind may pass on: the one its hooks
+    /// `reported`, unless its own command line (`argv`, as `.meta` records
+    /// it) says it has less — the lesser of the two. Only for an adapter with
+    /// `argv_mode`; the others' hooks report their mode whole. None: no mode
+    /// is known (the child then gets the least privileged).
+    pub(crate) fn bound_mode(&self, reported: Option<String>, argv: &[String]) -> Option<String> {
+        let reported = reported?;
+        let Some(ceiling) = self.argv_mode.as_ref().and_then(|am| self.argv_rank(am, argv)) else {
+            return Some(reported);
+        };
+        match self.permission_modes.iter().position(|m| *m == reported) {
+            Some(r) if r > ceiling => Some(self.permission_modes[ceiling].clone()),
+            _ => Some(reported),
+        }
+    }
+
+    /// The highest mode `argv` (a whole command line, the tool's name first)
+    /// allows, by its permission flags; None when it has none. A flag's value
+    /// ranks as the most privileged mode whose `permission_argv` uses it —
+    /// the value grants no more than that mode does (Codex's `-s read-only`
+    /// is `default`, since `plan` and `default` share it) — and a value no
+    /// mode uses as the least privileged. The last of a repeated flag
+    /// counts; every flag present bounds.
+    fn argv_rank(&self, am: &ArgvMode, argv: &[String]) -> Option<usize> {
+        // (flag, value) → the highest rank using it; flags that take a value.
+        let mut value_rank: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let mut valued: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (rank, mode) in self.permission_modes.iter().enumerate() {
+            let words = &self.permission_argv[mode];
+            for (i, w) in words.iter().enumerate() {
+                if let Some(v) = words.get(i + 1).filter(|_| w.starts_with('-')).filter(|v| !v.starts_with('-')) {
+                    valued.insert(w);
+                    let r = value_rank.entry((w, v)).or_insert(rank);
+                    *r = (*r).max(rank);
+                }
+            }
+        }
+        let canonical = |f: &str| -> Option<String> {
+            let f = am.aliases.get(f).map_or(f, String::as_str);
+            valued.contains(f).then(|| f.to_string())
+        };
+        let spellings: Vec<&str> = valued.iter().copied().chain(am.aliases.keys().map(String::as_str)).collect();
+        let mut last: BTreeMap<String, String> = BTreeMap::new();
+        let mut whole: Vec<usize> = Vec::new();
+        let mut it = argv.iter().skip(1);
+        while let Some(arg) = it.next() {
+            if arg == "--" {
+                break;
+            }
+            if let Some(mode) = am.flags.get(arg.as_str()) {
+                whole.push(self.permission_modes.iter().position(|m| m == mode).unwrap_or(0));
+                continue;
+            }
+            if let Some(glued) = self.config_flags.iter().find_map(|cf| spelled(arg, cf)) {
+                let kv = match glued {
+                    Some(kv) => kv.to_string(),
+                    None => it.next().cloned().unwrap_or_default(),
+                };
+                let key = config_key(&kv);
+                if let Some(flag) = am.config_keys.get(key).and_then(|f| canonical(f)) {
+                    let value = kv.split_once('=').map_or("", |(_, v)| unquoted(v));
+                    last.insert(flag, value.to_string());
+                }
+                continue;
+            }
+            if let Some((flag, glued)) = spellings.iter().find_map(|f| spelled(arg, f).map(|g| (*f, g))) {
+                let value = match glued {
+                    Some(v) => v.to_string(),
+                    None => it.next().cloned().unwrap_or_default(),
+                };
+                if let Some(flag) = canonical(flag) {
+                    last.insert(flag, unquoted(&value).to_string());
+                }
+            }
+        }
+        last.iter()
+            .map(|(f, v)| value_rank.get(&(f.as_str(), v.as_str())).copied().unwrap_or(0))
+            .chain(whole)
+            .min()
+    }
+
     /// The first of `args` an agent caller may not pass (`privileged`), as
     /// written — with its value, for a configuration override. Matching errs
     /// toward refusing: a one-letter flag is found inside any cluster of
@@ -363,6 +469,17 @@ fn parse(text: &str) -> Result<Adapter, String> {
     }
     if let Some(bad) = privileged.commands.iter().find(|c| c.is_empty() || c.starts_with('-')) {
         return Err(format!("launch.privileged.commands: {bad:?} is not a word"));
+    }
+    if let Some(am) = &launch.argv_mode {
+        if let Some(bad) = am.flags.values().find(|m| !listed.contains(m)) {
+            return Err(format!("launch.argv_mode.flags: {bad:?} is not one of permission_modes"));
+        }
+        if !am.config_keys.is_empty() && launch.config_flags.is_empty() {
+            return Err("launch.argv_mode.config_keys needs launch.config_flags".to_string());
+        }
+        if let Some(bad) = am.aliases.iter().chain(&am.flags).map(|(f, _)| f).chain(am.aliases.values()).find(|f| !f.starts_with('-')) {
+            return Err(format!("launch.argv_mode: {bad:?} is not a flag"));
+        }
     }
     if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
         return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
@@ -552,6 +669,57 @@ mod tests {
         assert_eq!(argv("default"), "-a on-request -s read-only");
         assert_eq!(argv("acceptEdits"), "-a on-request -s workspace-write");
         assert_eq!(argv("bypassPermissions"), "-a never -s danger-full-access");
+    }
+
+    #[test]
+    fn a_codex_parents_mode_is_the_lesser_of_its_hooks_and_its_command_line() {
+        let codex = parse(BUNDLED[1].1).unwrap().launch;
+        let bound = |reported: Option<&str>, argv: &str| {
+            let argv: Vec<String> = argv.split_whitespace().map(str::to_string).collect();
+            codex.bound_mode(reported.map(str::to_string), &argv)
+        };
+        let bypass = Some("bypassPermissions");
+        // A human's `-a never -s read-only` reads as bypass to the hooks, but
+        // writes nothing.
+        assert_eq!(bound(bypass, "codex -a never -s read-only").as_deref(), Some("default"));
+        assert_eq!(bound(bypass, "codex -s read-only -a never").as_deref(), Some("default"));
+        assert_eq!(bound(bypass, "codex --sandbox=workspace-write --ask-for-approval never").as_deref(), Some("acceptEdits"));
+        assert_eq!(bound(bypass, "codex -anever -sread-only").as_deref(), Some("default"));
+        assert_eq!(bound(bypass, "codex -c sandbox_mode=\"read-only\"").as_deref(), Some("default"));
+        assert_eq!(bound(bypass, "codex --config=sandbox_mode='workspace-write'").as_deref(), Some("acceptEdits"));
+        assert_eq!(bound(bypass, "codex -c approval_policy=on-request").as_deref(), Some("acceptEdits"));
+        assert_eq!(bound(bypass, "codex --full-auto").as_deref(), Some("acceptEdits"));
+        // Every flag present bounds; the last of a repeated one counts.
+        assert_eq!(bound(bypass, "codex -s read-only -s danger-full-access").as_deref(), Some("bypassPermissions"));
+        assert_eq!(bound(bypass, "codex --dangerously-bypass-approvals-and-sandbox -s read-only").as_deref(), Some("default"));
+        // What seagents itself launches a child with reads back as that mode.
+        for mode in ["default", "acceptEdits", "bypassPermissions"] {
+            let argv = format!("codex {}", codex.permission_argv[mode].join(" "));
+            assert_eq!(bound(bypass, &argv).as_deref(), Some(mode), "{argv}");
+        }
+        // The command line never raises the hooks' word, nor invents one.
+        assert_eq!(bound(Some("default"), "codex -a never -s danger-full-access").as_deref(), Some("default"));
+        assert_eq!(bound(None, "codex -a never -s danger-full-access"), None);
+        // No permission flags: the hooks' word stands. A value no mode uses
+        // (an older `-a untrusted`) is the least privileged.
+        assert_eq!(bound(bypass, "codex -m o3 -c model=x").as_deref(), bypass);
+        assert_eq!(bound(bypass, "codex -a untrusted").as_deref(), Some("plan"));
+        // After `--` is the prompt.
+        assert_eq!(bound(bypass, "codex -- -s read-only").as_deref(), bypass);
+        // Claude's hooks report its mode whole (and current), so its argv is
+        // not read.
+        let claude = parse(BUNDLED[0].1).unwrap().launch;
+        let argv: Vec<String> = ["claude", "--permission-mode", "plan"].map(String::from).to_vec();
+        assert_eq!(claude.bound_mode(Some("acceptEdits".into()), &argv).as_deref(), Some("acceptEdits"));
+    }
+
+    #[test]
+    fn argv_mode_names_listed_modes_and_flags() {
+        let base = "[launch]\npermission_modes = [\"a\"]\n[launch.permission_argv]\na = [\"-m\", \"a\"]\n[launch.argv_mode]\n";
+        assert!(parse(&format!("{base}flags = {{ \"--all\" = \"a\" }}\n")).is_ok());
+        assert!(parse(&format!("{base}flags = {{ \"--all\" = \"z\" }}\n")).unwrap_err().contains("permission_modes"));
+        assert!(parse(&format!("{base}aliases = {{ \"--mode\" = \"m\" }}\n")).unwrap_err().contains("not a flag"));
+        assert!(parse(&format!("{base}config_keys = {{ mode = \"-m\" }}\n")).unwrap_err().contains("config_flags"));
     }
 
     #[test]
