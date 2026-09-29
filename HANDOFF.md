@@ -214,6 +214,15 @@ Source layout under `src/`:
   `shell_quote()`. `spawn_terminal()` runs `<abs path of this binary> run
   --tag <tag> [--parent <p>]`, so the new window's PATH doesn't matter. Used
   by `restore`; `spawn` will share it.
+- **`src/adapter.rs`** + **`src/adapters/*.toml`** — per-agent orchestration
+  facts as data (ORCHESTRATION-SPEC "agent adapters"): how a seed prompt is
+  passed, the settings/permission flags and mode order, where identity and
+  turns come from, submit delay / pre-send / exit sequence. Keyed by the
+  detection engine's agent id for `argv[0]`; `~/.config/seagents/agents/<agent>.toml`
+  replaces the bundled file whole (an unparseable override is an error, not a
+  silent default); unknown agents get the generic state-only adapter. Bundled:
+  `claude`, and a conservative `codex` (no hooks, screen turns) until its
+  `notify` hook is verified. Nothing consumes it yet — spawn/send will.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+mod adapter;
 mod clock;
 mod detect;
 mod hud;

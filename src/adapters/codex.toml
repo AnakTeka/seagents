@@ -1,0 +1,20 @@
+# Codex — conservative defaults until its hooks are verified (ORCHESTRATION-SPEC
+# Phase 4: does `notify` carry the rollout path, and fire per turn?). Until
+# then: no hook injection, no identity, turns read off the screen. A copy at
+# ~/.config/seagents/agents/codex.toml replaces this file whole.
+
+[launch]
+# `codex "<prompt>"` starts an interactive session seeded with the prompt.
+seed_prompt      = ["{prompt}"]
+settings_flag    = ""
+permission_flag  = ""
+permission_modes = []
+identity         = "none"
+turns            = "screen"
+watch_dir        = ""
+
+[send]
+submit_delay_ms  = 300
+pre_send         = ""
+# Empty: `stop` goes straight to SIGTERM.
+exit_sequence    = ""
