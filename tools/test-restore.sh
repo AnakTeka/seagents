@@ -57,6 +57,9 @@ cleanup() {
 trap cleanup EXIT
 
 export HOME="$ROOT/home"
+# seagents derives its config and state dirs from these when set; they would
+# point the run (and its layout.json) back at the real ones.
+unset XDG_STATE_HOME XDG_CONFIG_HOME
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 export SEAGENTS_NO_NOTIFY=1
 mkdir -p "$HOME" "$ROOT/bin"

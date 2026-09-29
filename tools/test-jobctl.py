@@ -13,13 +13,17 @@ Usage: python3 tools/test-jobctl.py [path-to-seagents]
        (default: target/release/seagents, falling back to `seagents` on PATH)
 
 Exits 0 on success, 1 with a transcript dump on failure. Needs a Linux box with
-bash; safe to run anywhere — it only touches its own pty.
+bash; safe to run anywhere — it only touches its own pty and a scratch HOME
+(the wrapper registers the session under ~/.cache/seagents and captures a
+layout under ~/.local/state/seagents; neither may land in your live ones),
+removed on exit.
 """
 import os
 import pty
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 def resolve_binary() -> str:
@@ -35,9 +39,22 @@ def resolve_binary() -> str:
 
 def main() -> int:
     binary = resolve_binary()
+    home = tempfile.mkdtemp(prefix="seagents-jobctl-")
+    try:
+        return drive(binary, home)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+def drive(binary: str, home: str) -> int:
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["PS1"] = "SHELL$ "
+        # The cache is HOME's; config and state follow these when set, which
+        # would escape the scratch HOME.
+        os.environ["HOME"] = home
+        for var in ("XDG_STATE_HOME", "XDG_CONFIG_HOME"):
+            os.environ.pop(var, None)
+        os.environ["SEAGENTS_NO_NOTIFY"] = "1"
         os.execvp("bash", ["bash", "--norc", "-i"])
     os.set_blocking(fd, False)
 
