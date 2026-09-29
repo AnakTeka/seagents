@@ -9,10 +9,16 @@ use std::thread::{self, JoinHandle};
 
 use portable_pty::MasterPty;
 
+use super::inject::{ModeScanner, PtyModes, SharedWriter};
 use crate::registry::Files;
 use crate::window;
 
 /// Output pump: master -> stdout (+ tee). This owns the "T-junction".
+///
+/// It also watches the stream (without touching it) for the input modes the
+/// agent switches on — bracketed paste, the kitty keyboard protocol — which
+/// is how injection knows how to frame a paste and encode Enter
+/// ([`super::inject`]).
 ///
 /// It waits in `poll` rather than a blocking `read` so that it can also be
 /// woken by [`OutputDrain::wait`]: the wrapper stops its *whole process* when
@@ -24,6 +30,7 @@ pub(super) fn spawn_output(
     master_fd: RawFd,
     tee: Option<File>,
     files: Files,
+    modes: Arc<PtyModes>,
 ) -> (JoinHandle<()>, Option<OutputDrain>) {
     // Without a pipe (fd exhaustion) the pump just relays; suspends then work
     // as they did before draining existed.
@@ -43,6 +50,7 @@ pub(super) fn spawn_output(
         const ROTATE_AT: u64 = 16 * 1024 * 1024;
         const CHECK_EVERY: u64 = 4 * 1024 * 1024;
         let mut since_check: u64 = 0;
+        let mut scanner = ModeScanner::default();
         // One read + relay. False once the pty is gone (child exited: EIO) or
         // stdout is.
         let mut relay = |reader: &mut Box<dyn Read + Send>| -> bool {
@@ -55,6 +63,7 @@ pub(super) fn spawn_output(
                             return false;
                         }
                         let _ = out.flush();
+                        scanner.feed(data, &modes);
                         if let Some(f) = tee.as_mut() {
                             let _ = f.write_all(data);
                             let _ = f.flush();
@@ -169,7 +178,10 @@ impl OutputDrain {
 /// exactly which window hosts this agent. Re-capture (throttled) keeps the
 /// meta's con_id/window_id correct through i3 restarts and launch-time
 /// capture misses — this is what lets focus use exact handles only.
-pub(super) fn spawn_input(mut writer: Box<dyn Write + Send>, files: Files) {
+///
+/// The writer is shared with the control thread and locked per chunk, so a
+/// `send` body (written under one lock) is never split by a keystroke.
+pub(super) fn spawn_input(writer: SharedWriter, files: Files) {
     thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 8192];
@@ -178,10 +190,13 @@ pub(super) fn spawn_input(mut writer: Box<dyn Write + Send>, files: Files) {
             match stdin.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
+                    {
+                        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        if w.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = w.flush();
                     }
-                    let _ = writer.flush();
                     let due = last_capture
                         .map_or(true, |t| t.elapsed().as_secs() >= 60);
                     if due && input_capture_eligible(&buf[..n]) {

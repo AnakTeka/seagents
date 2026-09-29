@@ -126,6 +126,14 @@ seagents wait <target> [--after N] [--for turn|exit] [--timeout DUR]
                            block until the turn after N ends, the agent is
                            blocked, interrupted or gone; prints the outcome
                            JSON incl. the turn's last_message (§8)
+seagents send <target> [--now] [--keys] [--no-submit] [--answer-permission]
+              [--timeout DUR] (--prompt-file F | TEXT)
+                           submit TEXT as a new turn once the agent is idle;
+                           prints {"ok","tag","stops","paired"} — `stops` is
+                           the baseline for `wait --after` (§9)
+seagents stop <target> [--force]
+                           make the agent exit: its exit command, then
+                           SIGTERM, then SIGKILL (§9)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
@@ -191,12 +199,25 @@ Source layout under `src/`:
     transitions, `notify_transition()`, the done-ack on focus, the snapshot
     offer.
   - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
+  - `control.rs` — the control socket (§9): bind, `SO_PEERCRED`
+    authorization (`authorize()`, the lineage rule), submit-when-idle
+    (`gate()`), `stop`'s escalation; `Control::finish()` at exit.
+  - `inject.rs` — the one implementation of writing into the agent
+    (§9): `SharedWriter` (the PTY master's input side, shared by the input
+    pump and the control thread), `ModeScanner`/`PtyModes` (bracketed paste
+    and kitty keyboard flags, watched in the output stream), `deliver()`
+    (pre-send nudge, bracketed paste, delayed Enter encoded for the
+    keyboard protocol), `decode_keys()`.
+- **`src/send.rs`** — `seagents send` / `stop`, the socket's client, and its
+  wire format (`Request`, `Reply`, `Refusal` → exit codes).
 - **`src/hook.rs`** — the agent's lifecycle hooks (§6): `inject_settings()`
   (the one merged `--settings` `run` hands a hook-capable agent) and `run()`,
   the hidden `__hook` command that records each event in `.agent`.
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
-  `list()` (live, never deletes) / `reap()` (deletes the dead) /
+  `Dirs` (the cache and the runtime dir — sockets live in the latter),
+  `list()` (live, never deletes) / `reap()` (deletes the dead, and sweeps
+  control sockets no live session owns) /
   `by_child_pid()` / `enclosing_session(pid)` (the session a process runs
   inside, by `/proc` ancestry — "who is calling"), the locked `update_meta()` / `update_state()` / `update_agent()`;
   tags (`valid_tag()`,
@@ -258,8 +279,8 @@ Source layout under `src/`:
   (`settings_flag`, `hookless_flags`, `identity`/`turns`) and to turn a
   seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
   and mode order; `capabilities()` is what `status --json` reports per agent
-  (`state`, `wait`, `turns`, `spawn` as applicable); send/stop (Phase 2) will
-  read the rest.
+  (`state`, `wait`, `turns`, `spawn`, `send`, `stop` as applicable); `send`
+  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence).
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -279,8 +300,11 @@ real terminal and the child, while **tee**-ing a copy of the output stream to a
 file. "pty-teeing" = a T-junction in the terminal stream (like `tee`, named after
 the plumbing fitting): the output flows through to your terminal unchanged *and* a
 copy branches off for status detection. Transparency comes from **relaying, not
-interpreting** — we never parse the stream in the hot path, so colors, mouse,
-alt-screen, resize (SIGWINCH) all pass through. Uses `portable-pty` + `crossterm`.
+interpreting** — nothing in the hot path changes the stream, so colors, mouse,
+alt-screen, resize (SIGWINCH) all pass through. (The output pump does *look*
+at it, byte by byte, for the handful of mode switches `send` needs —
+`wrapper/inject.rs`, §9 — and forwards every byte untouched.) Uses
+`portable-pty` + `crossterm`.
 
 We chose pty-tee over reading the terminal's screen because **you cannot read the
 PTY of a process you didn't spawn** (a kernel isolation, not a missing feature).
@@ -378,6 +402,12 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`,
   `.state` or `.agent`.
 - **`tags.lock`** — one for the whole cache; see Tags.
+- **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
+  socket (§9; 0600 in a 0700 dir, the cache dir when there is no runtime
+  dir). Bound once the `.meta` exists; removed by the wrapper on exit and on
+  SIGHUP/SIGTERM, and by `reap()` when no live session owns it (a SIGKILLed
+  wrapper). A `sun_path` holds 108 bytes, so a very long `XDG_RUNTIME_DIR`
+  means no socket (and no `send`); the agent still runs.
 
 **Tags.** Every agent has one: its name for every command (`focus reviewer`),
 the window handle `restore` swallows on (`seagents-<tag>`), and the lineage
@@ -662,7 +692,7 @@ reusing the running turn's `prompt_id` and is answered by a second `Stop` with a
 fresh one; an Esc-interrupted turn fires `UserPromptSubmit` and no `Stop` at
 all). Its stamps are **milliseconds** — a prompt in the same second as the last
 `Stop` is the common case. `turn::Ledger::in_turn()` is the one definition of
-"mid-turn", shared by `status` and `wait` (and `send` in Phase 2):
+"mid-turn", shared by `status`, `wait` and `send`:
 
 - **Hook adapters** (Claude): prompted after the last `Stop`, **and** no
   interrupt record in the transcript since that prompt. On Esc Claude writes a
@@ -753,7 +783,8 @@ something the caller can't casually change:
    only — never `.meta`'s, which `restore` replays. Adapters with no template,
    and prompts of 128 KiB or more (one argv string's limit), are refused before
    a window opens; the spec's paste-once-idle path for them isn't built, since
-   no bundled adapter needs it. The prompt is visible in the agent's
+   no bundled adapter needs it (when it is, it pastes through
+   `wrapper/inject.rs::deliver`, as `send` does). The prompt is visible in the agent's
    `/proc/<pid>/cmdline` to anyone who can read it (single-user machine).
 6. **Launch** via `launch::spawn_terminal` with `keep_shell: false`, in the
    terminal class of the caller's own window (the focused one for a human;
@@ -770,7 +801,7 @@ Errors exit 1 with the reason on stderr; stdout carries only the JSON.
 returns at once right after `spawn` (the agent paints an idle input box before
 it takes the seed) or right after a prompt (the detector ticks every 2 s), and
 never sees a sub-tick turn as working at all. The caller holds a baseline N —
-0 from `spawn` (Phase 2's `send` will return one) — and polls every 250 ms:
+0 from `spawn`, `stops` from `send` — and polls every 250 ms:
 
 | reason | exit | when |
 |---|---|---|
@@ -787,6 +818,75 @@ only. Without `--after`, a running turn is waited on (N = current `stops`).
 The reported `state` follows the ledger for hook agents (`.state` lags a turn's
 end by up to one monitor tick). `wait` only reads: it never acknowledges
 `done` and never writes `.state`.
+
+Right after a gate is answered (`send --answer-permission`, or a human at the
+window), `.state` still says `blocked` until the wrapper's monitor next looks
+(≤ 2 s), so a `wait` called in that instant returns `blocked` again; call it
+once more.
+
+### 9. `seagents send` / `stop` — driving an agent
+
+Only the wrapper holds the agent's PTY master, so it is the wrapper that
+writes: each listens on `<runtime dir>/<wrapper_pid>.sock` (§2), one JSON
+request line in, one reply line out (`send.rs` has the format; any client
+that speaks it is treated like the CLI).
+
+**Authorization is the wrapper's**, per request, from `SO_PEERCRED`: the
+connecting pid's `/proc` ancestry names the calling agent
+(`registry::enclosing_session`, as for `spawn`). A human (no wrapper among its
+ancestors) may send to and stop anyone and answer gates. An agent may act only
+on its own descendants — walking the target's `parent` chain by tag, over live
+`.meta`s, must reach the caller — so never on itself, its parent, a sibling or
+a stranger (and A→B→A ping-pong can't happen), and may never
+`--answer-permission`. Refusal: `forbidden`, exit 5. Also checked: the peer's
+uid is ours.
+
+**Submit when idle.** A `send` is held (up to `--timeout`, 5 min) until the
+agent is out of its turn (`turn::Ledger::in_turn`, the one definition) and its
+`.state` reads idle; then the body is written and the reply carries the
+ledger's `stops` at that instant, `paired: true` — nothing else is in flight,
+so `wait --after <stops>` returns the turn it started. Measured live
+2026-09-29: a second `send` issued while the first's turn ran was held ~4 s
+and each was answered by its own turn. Submissions are serialized in the
+wrapper, and one counts as in flight until the agent's `UserPromptSubmit` hook
+fires for it (or 5 s pass), so two back-to-back sends can't both see "idle"
+and fold into one turn. `--now` writes at once (`paired: false`: a prompt sent
+mid-turn is answered by its own later `Stop`, verified, but `wait --after N`
+returns the running turn's). A **blocked** agent is refused at once — reason
+`blocked`, exit 3, with the gate's `rule` from `.state` — even with `--now`,
+since whatever is typed into a permission menu answers it;
+`--answer-permission` (humans only) is the way through, usually with
+`--keys` (e.g. `--keys 1` picks "Yes" on Claude's menu, verified). An agent no
+detector knows (a plain shell) can't be seen to be idle: only `--now` sends
+to it (reason `unsupported` otherwise). Exit codes: 0 ok, 2 `busy_timeout`
+(nothing was sent), 3 `blocked`, 4 `exit`, 5 `forbidden`, 1 anything else.
+
+**Framing** (`wrapper/inject.rs`, copied from herdr): text is a bracketed
+paste (`ESC[200~…ESC[201~`, the end marker stripped from the body) when the
+agent has enabled DECSET 2004, raw otherwise; the adapter's `pre_send` nudge
+(`focus_gained` → `ESC[I`) first; the body is one write under the writer lock,
+so the human's keystrokes (the input pump locks per chunk) can't land inside
+it; then the lock is released, `submit_delay_ms` (300) passes, and Enter is
+written — `\r`, or `CSI 13 u` when the agent has pushed kitty keyboard flags
+that report every key (flag 8; the output pump tracks the flag stacks per
+screen). modifyOtherKeys isn't tracked: it never changes an unmodified Enter.
+`--keys` writes bytes verbatim after decoding `\e \r \n \t \0 \\ \xNN`
+(in the wrapper, so a raw client gets the same syntax); `--no-submit` skips
+the Enter. Verified live on Claude 2.1.284: a multi-line body with both quote
+kinds, backticks, `$` and backslashes arrives exactly (Claude's transcript
+wraps a large paste in `<pasted_content>`; the text inside is byte-identical).
+Prompt text is never logged.
+
+**`stop`** types the adapter's `exit_sequence` (Claude: `/exit`, ~1 s) as a
+`--now` paste and gives it 5 s; then SIGTERMs the PTY's foreground process
+group (the agent's, via `tcgetpgrp` on the master) and continues it, then
+SIGKILLs it and the anchor, 5 s apart; it replies once the agent is gone.
+`--force` skips the exit sequence. So does a **blocked** agent — `/exit` +
+Enter typed into a permission menu would pick an answer — which goes straight
+to SIGTERM (verified: the gated command never ran). The lineage rule applies;
+the blocked refusal does not. The wrapper exits with its agent, so
+`Control::finish()` lets in-flight requests reply (≤ 2 s) before the socket is
+removed.
 
 ---
 

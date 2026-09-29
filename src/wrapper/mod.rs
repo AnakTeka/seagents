@@ -6,8 +6,10 @@
 //! rewrites the stream: transparency comes from relaying, not interpreting.
 //!
 //! This file is the setup and wiring; the threads live in [`pumps`] (output
-//! tee, input, resize) and [`monitor`] (state detection, notifications, the
-//! snapshot offer), and the in-PTY job-control anchor in [`lead`].
+//! tee, input, resize), [`monitor`] (state detection, notifications, the
+//! snapshot offer) and [`control`] (the socket `send`/`stop` drive the agent
+//! through, writing with [`inject`]'s framing), and the in-PTY job-control
+//! anchor in [`lead`].
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,8 @@ use crate::launch::handle_for;
 use crate::registry::{self, Files};
 use crate::window;
 
+mod control;
+mod inject;
 mod lead;
 mod monitor;
 mod pumps;
@@ -118,8 +122,8 @@ pub(crate) fn run(
             return 1;
         }
     };
-    let writer = match pair.master.take_writer() {
-        Ok(w) => w,
+    let writer: inject::SharedWriter = match pair.master.take_writer() {
+        Ok(w) => Arc::new(Mutex::new(w)),
         Err(e) => {
             eprintln!("seagents: take writer failed: {e}");
             return 1;
@@ -144,18 +148,33 @@ pub(crate) fn run(
     // through untouched (the inner PTY's line discipline does the cooking).
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
 
-    let (reader_handle, drain) = pumps::spawn_output(reader, master_fd, tee, files.clone());
-    pumps::spawn_input(writer, files.clone());
+    let modes = Arc::new(inject::PtyModes::default());
+    let (reader_handle, drain) =
+        pumps::spawn_output(reader, master_fd, tee, files.clone(), Arc::clone(&modes));
+    pumps::spawn_input(Arc::clone(&writer), files.clone());
     pumps::spawn_resize(&master);
 
     // (Monitor guarded on a known pid: without one, geometry lookups would
     // fail forever and the monitor would misclassify at 80x24 while other
-    // observers disagree — better no monitor than a flapping one.)
-    if let Some(anchor_pid) = child.process_id().map(u64::from) {
+    // observers disagree — better no monitor than a flapping one. The
+    // control socket needs it too, to signal the agent on `stop`.)
+    let control = child.process_id().map(u64::from).and_then(|anchor_pid| {
         monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd);
-    }
+        // After the `.meta`: `reap` sweeps a socket no live session owns.
+        control::spawn(control::Wiring {
+            files: files.clone(),
+            anchor_pid,
+            master_fd,
+            writer,
+            modes,
+            argv0: cmd[0].clone(),
+        })
+    });
 
     let code = wait_forwarding_job_control(&mut child, &master, drain.as_ref(), raw);
+    if let Some(control) = control {
+        control.finish();
+    }
 
     // Let the output pump drain anything buffered before we tear down.
     let _ = reader_handle.join();

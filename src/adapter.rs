@@ -20,9 +20,6 @@
 //! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
 //! `spawn`, `send` and `stop` are its other consumers.
 
-// The send facts have no reader until send/stop land (Phase 2).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -183,10 +180,12 @@ pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
 /// adapter, never stored: `state` (the detector knows the agent), `wait`
 /// (always: exit and gates need nothing from the agent), `turns` (an exact
 /// turn ledger, from hooks), `spawn` (a seed prompt can go on its command
-/// line). `send`/`stop` join in Phase 2, `read` in Phase 3.
+/// line), `send` (the default submit-when-idle needs a detector to say idle;
+/// any agent takes `send --now`), `stop` (always: signals need nothing from
+/// the agent). `read` joins in Phase 3.
 pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
     let Ok(adapter) = for_command(argv0) else {
-        return vec!["wait"];
+        return vec!["wait", "stop"];
     };
     let mut caps = Vec::new();
     if agent_id(argv0).is_some() {
@@ -199,6 +198,10 @@ pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
     if !adapter.launch.seed_prompt.is_empty() {
         caps.push("spawn");
     }
+    if agent_id(argv0).is_some() {
+        caps.push("send");
+    }
+    caps.push("stop");
     caps
 }
 
@@ -258,10 +261,10 @@ mod tests {
         let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn"]);
-        assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "spawn"]);
-        assert_eq!(capabilities("gemini"), ["state", "wait"]);
-        assert_eq!(capabilities("sleep"), ["wait"]);
+        assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn", "send", "stop"]);
+        assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "spawn", "send", "stop"]);
+        assert_eq!(capabilities("gemini"), ["state", "wait", "send", "stop"]);
+        assert_eq!(capabilities("sleep"), ["wait", "stop"]);
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod i3;
 mod launch;
 mod procfs;
 mod registry;
+mod send;
 mod snapshot;
 mod spawn;
 mod status;
@@ -152,6 +153,73 @@ enum Command {
         timeout: std::time::Duration,
     },
 
+    /// Submit text to an agent as a new turn; prints the baseline for `wait`
+    ///
+    /// Prints `{"ok","tag","stops","paired"}`: `wait <tag> --after <stops>`
+    /// then waits for the turn this started. By default the text is held
+    /// until the agent is idle (out of its turn, the screen idle), so the
+    /// next turn to end is the one it opened (`paired: true`). A blocked agent
+    /// (a permission prompt, a trust dialog) is refused at once, with the
+    /// gate's `rule`. From inside an agent, only that agent's own descendants
+    /// can be sent to. The text goes in as a bracketed paste when the agent
+    /// takes one, then Enter 300 ms later. Refusals print
+    /// `{"ok":false,"reason","error"[,"rule"]}` and exit: 3 blocked, 2
+    /// busy_timeout (still busy at --timeout; nothing was sent), 4 exit, 5
+    /// forbidden, 1 anything else (incl. `unsupported`: no detector knows
+    /// the agent, so only --now can send to it).
+    Send {
+        /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
+        target: String,
+
+        /// Submit at once, even mid-turn (the agent may fold it into the
+        /// running turn: `paired: false`). Never past a gate
+        #[arg(long)]
+        now: bool,
+
+        /// Write TEXT as raw keys, not a paste. Escapes: \e (Esc), \r, \n,
+        /// \t, \0, \\, \xNN; e.g. '\e[B' is Down
+        #[arg(long)]
+        keys: bool,
+
+        /// Don't press Enter after the text
+        #[arg(long)]
+        no_submit: bool,
+
+        /// Write even though the agent is blocked at a gate — to answer it
+        /// (usually with --keys). Humans only: refused from inside an agent
+        #[arg(long)]
+        answer_permission: bool,
+
+        /// How long to wait for the agent to be idle: 30s, 5m, 1h, or seconds
+        #[arg(long, value_name = "DUR", default_value = "5m", value_parser = wait::parse_duration)]
+        timeout: std::time::Duration,
+
+        /// Read the text from this file
+        #[arg(long, value_name = "FILE", conflicts_with = "text")]
+        prompt_file: Option<PathBuf>,
+
+        /// The text (one argument; `--` before it if it starts with `-`)
+        #[arg(value_name = "TEXT", required_unless_present = "prompt_file")]
+        text: Option<String>,
+    },
+
+    /// Make an agent exit: its exit command, then SIGTERM, then SIGKILL
+    ///
+    /// Types the agent's exit command (Claude: `/exit`) and gives it 5 s;
+    /// then SIGTERMs its process group, then SIGKILLs it, 5 s apart. A
+    /// blocked agent skips the exit command (typed into a permission menu,
+    /// its Enter would pick an answer). Prints `{"ok":true,"tag"}` once the
+    /// agent is gone. From inside an agent, only its own descendants. Exit 5
+    /// forbidden, 1 any other failure.
+    Stop {
+        /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
+        target: String,
+
+        /// Skip the exit command: SIGTERM at once
+        #[arg(long)]
+        force: bool,
+    },
+
     /// The in-PTY job-control anchor `run` wraps around the agent (internal)
     ///
     /// The PTY session leader must not BE the agent: a lone process group in
@@ -285,6 +353,26 @@ fn dispatch(command: Command) -> i32 {
             what,
             timeout,
         } => wait::run(&target, after, what, timeout),
+        Command::Send {
+            target,
+            now,
+            keys,
+            no_submit,
+            answer_permission,
+            timeout,
+            prompt_file,
+            text,
+        } => send::send(send::SendArgs {
+            target,
+            now,
+            keys,
+            no_submit,
+            answer_permission,
+            timeout,
+            prompt_file,
+            text,
+        }),
+        Command::Stop { target, force } => send::stop(&target, force),
         Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
@@ -420,6 +508,37 @@ mod tests {
                     &["seagents", "wait", "x", "--for", "done"][..]] {
             assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn send_takes_text_or_a_file_and_waits_five_minutes_by_default() {
+        let Command::Send { target, now, keys, no_submit, answer_permission, timeout, prompt_file, text } =
+            parse(&["seagents", "send", "it-b", "Reply with exactly: BRAVO"])
+        else {
+            panic!("not send");
+        };
+        assert_eq!((target.as_str(), text.as_deref(), prompt_file), ("it-b", Some("Reply with exactly: BRAVO"), None));
+        assert_eq!((now, keys, no_submit, answer_permission), (false, false, false, false));
+        assert_eq!(timeout, std::time::Duration::from_secs(300));
+        let Command::Send { now, keys, no_submit, answer_permission, timeout, text, .. } = parse(&[
+            "seagents", "send", "@it-b", "--now", "--keys", "--no-submit", "--answer-permission", "--timeout=30s",
+            "--", "-1",
+        ]) else {
+            panic!("not send");
+        };
+        assert_eq!((now, keys, no_submit, answer_permission, timeout.as_secs()), (true, true, true, true, 30));
+        assert_eq!(text.as_deref(), Some("-1"));
+        for bad in [
+            &["seagents", "send", "x"][..],
+            &["seagents", "send", "x", "--prompt-file", "f", "text"][..],
+            &["seagents", "send"][..],
+        ] {
+            assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
+        }
+        let Command::Stop { target, force } = parse(&["seagents", "stop", "it-b", "--force"]) else {
+            panic!("not stop");
+        };
+        assert_eq!((target.as_str(), force), ("it-b", true));
     }
 
     #[test]

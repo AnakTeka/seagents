@@ -1,5 +1,5 @@
-//! "Is this agent in a turn?" — the one definition `status`, `wait` and (in
-//! Phase 2) `send` share, over the `.agent` turn ledger.
+//! "Is this agent in a turn?" — the one definition `status`, `wait` and
+//! `send` share, over the `.agent` turn ledger.
 //!
 //! **Hook adapters** (Claude): in a turn = prompted after the last `Stop`
 //! **and** the transcript holds no interrupt record since that prompt. An

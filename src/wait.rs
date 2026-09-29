@@ -5,8 +5,8 @@
 //! paints an idle input box before it takes the seed) and right after a
 //! prompt (the detector ticks every 2 s) — and a turn shorter than a tick is
 //! never seen working at all. The ledger's `stops` counter is exact: the
-//! caller holds a baseline N (0 from `spawn`, the count `send` returns in
-//! Phase 2) and the turn it cares about has ended when `stops > N`. Nothing
+//! caller holds a baseline N (0 from `spawn`, the `stops` `send` returns)
+//! and the turn it cares about has ended when `stops > N`. Nothing
 //! is consumed, so re-calling with the same N after a timeout is always right
 //! — which matters, because the caller is usually an agent whose shell tool
 //! kills long commands.

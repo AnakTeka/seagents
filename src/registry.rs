@@ -57,6 +57,47 @@ pub(crate) fn cache_dir() -> PathBuf {
     base
 }
 
+/// Where sessions live: the cache (every sidecar) and the runtime dir (their
+/// control sockets, [`runtime_dir`]). Two roots because a socket belongs on
+/// tmpfs, private and gone at logout, while `.meta` & co. must be readable by
+/// whoever looks. A test puts both in one scratch directory.
+#[derive(Clone, Debug)]
+pub(crate) struct Dirs {
+    cache: PathBuf,
+    runtime: PathBuf,
+}
+
+impl Dirs {
+    /// This machine's: `~/.cache/seagents` and `$XDG_RUNTIME_DIR/seagents`.
+    pub(crate) fn live() -> Dirs {
+        Dirs {
+            cache: cache_dir(),
+            runtime: runtime_dir(),
+        }
+    }
+
+    /// Everything in one directory.
+    #[cfg(test)]
+    pub(crate) fn single(dir: &Path) -> Dirs {
+        Dirs {
+            cache: dir.to_path_buf(),
+            runtime: dir.to_path_buf(),
+        }
+    }
+
+    /// A path in the cache.
+    fn join(&self, name: &str) -> PathBuf {
+        self.cache.join(name)
+    }
+}
+
+impl AsRef<Path> for Dirs {
+    /// The cache directory.
+    fn as_ref(&self) -> &Path {
+        &self.cache
+    }
+}
+
 /// A session is keyed by the wrapper's pid; these are its sidecar files.
 #[derive(Clone, Debug)]
 pub(crate) struct Files {
@@ -72,15 +113,18 @@ pub(crate) struct Files {
     pub(crate) agent: PathBuf,
     /// Guards every read-modify-write of `meta`, `state` and `agent`.
     lock: PathBuf,
+    /// The wrapper's control socket (`send`/`stop`), in the runtime dir.
+    pub(crate) sock: PathBuf,
 }
 
 impl Files {
-    /// The files of session `wrapper_pid` in the cache directory.
+    /// The files of session `wrapper_pid` on this machine.
     pub(crate) fn of(wrapper_pid: u64) -> Files {
-        Files::in_dir(&cache_dir(), wrapper_pid)
+        Files::in_dirs(&Dirs::live(), wrapper_pid)
     }
 
-    pub(crate) fn in_dir(dir: &Path, wrapper_pid: u64) -> Files {
+    pub(crate) fn in_dirs(dirs: &Dirs, wrapper_pid: u64) -> Files {
+        let dir = &dirs.cache;
         Files {
             raw: dir.join(format!("{wrapper_pid}.raw")),
             raw_tmp: dir.join(format!("{wrapper_pid}.raw.tmp")),
@@ -88,7 +132,14 @@ impl Files {
             state: dir.join(format!("{wrapper_pid}.state")),
             agent: dir.join(format!("{wrapper_pid}.agent")),
             lock: dir.join(format!("{wrapper_pid}.lock")),
+            sock: dirs.runtime.join(format!("{wrapper_pid}.sock")),
         }
+    }
+
+    /// Every file of the session in one directory (tests).
+    #[cfg(test)]
+    pub(crate) fn in_dir(dir: impl AsRef<Path>, wrapper_pid: u64) -> Files {
+        Files::in_dirs(&Dirs::single(dir.as_ref()), wrapper_pid)
     }
 }
 
@@ -257,7 +308,7 @@ pub(crate) fn read_agent(files: &Files) -> AgentRecord {
 }
 
 /// Every parseable `.meta` in `dir`, alive or not.
-fn all_in(dir: &Path) -> Vec<Session> {
+fn all_in(dir: &Dirs) -> Vec<Session> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -267,7 +318,7 @@ fn all_in(dir: &Path) -> Vec<Session> {
         .filter_map(|e| {
             let text = fs::read_to_string(e.path()).ok()?;
             let meta: Meta = serde_json::from_str(&text).ok()?;
-            let files = Files::in_dir(dir, meta.wrapper_pid);
+            let files = Files::in_dirs(dir, meta.wrapper_pid);
             Some(Session { files, meta })
         })
         .collect();
@@ -283,10 +334,10 @@ fn is_alive(meta: &Meta) -> bool {
 /// anything, so it is safe from any process — a snapshot capture runs inside a
 /// wrapper's monitor thread and has no business deleting other sessions.
 pub(crate) fn list() -> Vec<Session> {
-    list_in(&cache_dir())
+    list_in(&Dirs::live())
 }
 
-fn list_in(dir: &Path) -> Vec<Session> {
+fn list_in(dir: &Dirs) -> Vec<Session> {
     all_in(dir)
         .into_iter()
         .filter(|s| is_alive(&s.meta))
@@ -297,15 +348,41 @@ fn list_in(dir: &Path) -> Vec<Session> {
 /// agent isn't interesting — "idle" already means finished-and-waiting — so
 /// the HUD and `status` only ever show live agents. A `.meta` that does not
 /// parse is left alone: it is not known to be dead.
+///
+/// Also sweeps control sockets no live session owns. A wrapper removes its
+/// own on the way out, but one killed outright (SIGKILL, a crash) cannot, and
+/// its `.meta` may already have been reaped by the time anyone notices. A
+/// wrapper binds its socket only after its `.meta` exists, so a live one is
+/// never swept.
 pub(crate) fn reap() {
-    reap_in(&cache_dir())
+    reap_in(&Dirs::live())
 }
 
-fn reap_in(dir: &Path) {
-    for s in all_in(dir).into_iter().filter(|s| !is_alive(&s.meta)) {
+fn reap_in(dir: &Dirs) {
+    let all = all_in(dir);
+    for s in all.iter().filter(|s| !is_alive(&s.meta)) {
         let f = &s.files;
-        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock] {
+        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock, &f.sock] {
             let _ = fs::remove_file(path);
+        }
+    }
+    let owned: HashSet<u64> = all
+        .iter()
+        .filter(|s| is_alive(&s.meta))
+        .map(|s| s.meta.wrapper_pid)
+        .collect();
+    let Ok(entries) = fs::read_dir(&dir.runtime) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let pid = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".sock"))
+            .and_then(|p| p.parse::<u64>().ok());
+        if pid.is_some_and(|p| !owned.contains(&p)) {
+            let _ = fs::remove_file(&path);
         }
     }
 }
@@ -314,7 +391,7 @@ fn reap_in(dir: &Path) {
 /// address agents by. Not filtered on liveness: a lookup is not the place to
 /// decide a session has ended.
 pub(crate) fn by_child_pid(child_pid: u64) -> Option<Session> {
-    all_in(&cache_dir())
+    all_in(&Dirs::live())
         .into_iter()
         .find(|s| s.meta.child_pid == Some(child_pid))
 }
@@ -325,10 +402,10 @@ pub(crate) fn by_child_pid(child_pid: u64) -> Option<Session> {
 /// digits, so the bare forms cannot be confused. The error is the message to
 /// show the user.
 pub(crate) fn resolve_target(target: &str) -> Result<Session, String> {
-    resolve_target_in(&cache_dir(), target)
+    resolve_target_in(&Dirs::live(), target)
 }
 
-fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
+fn resolve_target_in(dir: &Dirs, target: &str) -> Result<Session, String> {
     if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
         let pid: u64 = target
             .parse()
@@ -347,14 +424,14 @@ fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
     live_by_tag(dir, tag).ok_or_else(|| format!("no live agent tagged {tag}"))
 }
 
-fn live_by_tag(dir: &Path, tag: &str) -> Option<Session> {
+fn live_by_tag(dir: &Dirs, tag: &str) -> Option<Session> {
     list_in(dir).into_iter().find(|s| s.meta.tag == tag)
 }
 
 /// The live session process `pid` runs inside: the first of its `/proc`
 /// ancestors that is a wrapper with a live `.meta` (for a hook: sh → the agent
 /// → `__lead` → the wrapper). This is "who is calling" for every command that
-/// cares — a hook finding its ledger, `spawn` deriving lineage, and (Phase 2)
+/// cares — a hook finding its ledger, `spawn` deriving lineage, and
 /// the control socket judging an `SO_PEERCRED` pid. None is a human caller.
 ///
 /// Derived from ancestry rather than an environment variable, which
@@ -362,12 +439,12 @@ fn live_by_tag(dir: &Path, tag: &str) -> Option<Session> {
 /// accident, though an agent that deliberately escapes its tree (`setsid`,
 /// `systemd-run`) will look human — the line the threat model draws.
 pub(crate) fn enclosing_session(pid: u64) -> Option<Session> {
-    enclosing_session_in(&cache_dir(), &procfs::ancestors(pid))
+    enclosing_session_in(&Dirs::live(), &procfs::ancestors(pid))
 }
 
-fn enclosing_session_in(dir: &Path, ancestors: &[u64]) -> Option<Session> {
+fn enclosing_session_in(dir: &Dirs, ancestors: &[u64]) -> Option<Session> {
     ancestors.iter().find_map(|&pid| {
-        let files = Files::in_dir(dir, pid);
+        let files = Files::in_dirs(dir, pid);
         let meta = read_meta(&files).filter(|m| m.wrapper_pid == pid && is_alive(m))?;
         Some(Session { files, meta })
     })
@@ -487,11 +564,11 @@ pub(crate) fn claim_tag(
     cwd: &Path,
     reserved: &HashSet<String>,
 ) -> Result<TagClaim, String> {
-    claim_tag_in(&cache_dir(), requested, parent, cwd, reserved)
+    claim_tag_in(&Dirs::live(), requested, parent, cwd, reserved)
 }
 
 fn claim_tag_in(
-    dir: &Path,
+    dir: &Dirs,
     requested: Option<&str>,
     parent: Option<&str>,
     cwd: &Path,
@@ -582,13 +659,13 @@ struct Pending {
     spawner: u64,
 }
 
-fn pending_path(dir: &Path, tag: &str) -> PathBuf {
-    dir.join(format!("{tag}.pending"))
+fn pending_path(dir: &Dirs, tag: &str) -> PathBuf {
+    dir.join(&format!("{tag}.pending"))
 }
 
 /// Every reservation whose spawner is still running. Only called under the
 /// tags lock, which is also what makes deleting the dead ones here safe.
-fn live_pending(dir: &Path) -> Vec<Pending> {
+fn live_pending(dir: &Dirs) -> Vec<Pending> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -638,11 +715,11 @@ pub(crate) fn claim_spawn(
     reserved: &HashSet<String>,
     caps: &Caps,
 ) -> Result<SpawnClaim, String> {
-    claim_spawn_in(&cache_dir(), requested, caller, cwd, reserved, caps, std::process::id())
+    claim_spawn_in(&Dirs::live(), requested, caller, cwd, reserved, caps, std::process::id())
 }
 
 fn claim_spawn_in(
-    dir: &Path,
+    dir: &Dirs,
     requested: Option<&str>,
     caller: Option<u64>,
     cwd: &Path,
@@ -745,9 +822,10 @@ fn check_caps(
     Ok(())
 }
 
-/// Where per-session runtime files go — spawn's seed prompts today, control
-/// sockets in Phase 2: `$XDG_RUNTIME_DIR/seagents` (tmpfs, private, gone at
-/// logout), created `0700`; the cache dir when there is no runtime dir.
+/// Where per-session runtime files go — spawn's seed prompts and the
+/// wrappers' control sockets: `$XDG_RUNTIME_DIR/seagents` (tmpfs, private,
+/// gone at logout), created `0700`; the cache dir when there is no runtime
+/// dir.
 pub(crate) fn runtime_dir() -> PathBuf {
     use std::os::unix::fs::DirBuilderExt;
     if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
@@ -767,10 +845,10 @@ pub(crate) fn backfill_tags(sessions: &mut [Session], reserved: &HashSet<String>
     if sessions.iter().all(|s| !s.meta.tag.is_empty()) {
         return;
     }
-    backfill_tags_in(&cache_dir(), sessions, reserved)
+    backfill_tags_in(&Dirs::live(), sessions, reserved)
 }
 
-fn backfill_tags_in(dir: &Path, sessions: &mut [Session], reserved: &HashSet<String>) {
+fn backfill_tags_in(dir: &Dirs, sessions: &mut [Session], reserved: &HashSet<String>) {
     let Some(_lock) = Lock::acquire(&dir.join("tags.lock")) else {
         return;
     };
@@ -907,11 +985,11 @@ impl Lock {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> Dirs {
         let dir = std::env::temp_dir().join(format!("seagents-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        Dirs::single(&dir)
     }
 
     fn sample(wrapper_pid: u64, child_pid: Option<u64>) -> Meta {
@@ -1060,28 +1138,34 @@ mod tests {
         }
         // Unparseable: not known to be dead, so never reaped.
         fs::write(dir.join("3.meta"), "{torn").unwrap();
+        // Sockets: the live session's stays; the dead one's goes, and so does
+        // one whose session left no `.meta` at all (a SIGKILLed wrapper).
+        for f in [&live.sock, &gone.sock] {
+            fs::write(f, b"").unwrap();
+        }
+        fs::write(dir.join("99.sock"), b"").unwrap();
 
         let listed: Vec<u64> = list_in(&dir).iter().map(|s| s.meta.wrapper_pid).collect();
         assert_eq!(listed, [1]);
         assert!(gone.meta.exists(), "list must not reap");
 
         reap_in(&dir);
-        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock] {
+        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock, &gone.sock, &dir.join("99.sock")] {
             assert!(!path.exists(), "{} should be reaped", path.display());
         }
-        for path in [&live.meta, &live.raw, &live.state] {
+        for path in [&live.meta, &live.raw, &live.state, &live.sock] {
             assert!(path.exists(), "{} should survive", path.display());
         }
         assert!(dir.join("3.meta").exists());
         fs::remove_dir_all(&dir).ok();
     }
 
-    fn claim(dir: &Path, requested: Option<&str>, parent: Option<&str>) -> Result<TagClaim, String> {
+    fn claim(dir: &Dirs, requested: Option<&str>, parent: Option<&str>) -> Result<TagClaim, String> {
         claim_tag_in(dir, requested, parent, Path::new("/home/u/My Project!"), &HashSet::new())
     }
 
     /// Claim and create a live session (child = this test process).
-    fn create(dir: &Path, wrapper_pid: u64, requested: Option<&str>, parent: Option<&str>) -> Result<Meta, String> {
+    fn create(dir: &Dirs, wrapper_pid: u64, requested: Option<&str>, parent: Option<&str>) -> Result<Meta, String> {
         let c = claim(dir, requested, parent)?;
         let files = Files::in_dir(dir, wrapper_pid);
         c.create_meta(&files, sample(wrapper_pid, Some(std::process::id() as u64)));
@@ -1273,7 +1357,7 @@ mod tests {
     }
 
     fn spawn_claim(
-        dir: &Path,
+        dir: &Dirs,
         requested: Option<&str>,
         caller: Option<u64>,
         reserved: &HashSet<String>,
