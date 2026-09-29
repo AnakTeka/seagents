@@ -896,7 +896,11 @@ so `wait --after <stops>` returns the turn it started. Measured live
 and each was answered by its own turn. Submissions are serialized in the
 wrapper, and one counts as in flight until the agent's `UserPromptSubmit` hook
 fires for it (or 5 s pass), so two back-to-back sends can't both see "idle"
-and fold into one turn. `--now` writes at once (`paired: false`: a prompt sent
+and fold into one turn — and the reply itself waits for that hook (≤ 5 s),
+so a `wait --after <stops>` issued the instant `send` returns sees the new
+turn open. Without that, after an Esc'd turn the ledger still read
+"prompted, no longer running" until the hook landed, and such a `wait`
+returned `interrupted` for the *old* turn (found live on Codex). `--now` writes at once (`paired: false`: a prompt sent
 mid-turn is answered by its own later `Stop`, verified, but `wait --after N`
 returns the running turn's). A **blocked** agent is refused at once — reason
 `blocked`, exit 3, with the gate's `rule` from `.state` — even with `--now`,

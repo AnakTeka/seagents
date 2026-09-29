@@ -480,8 +480,23 @@ fn send(
                 // `wait` called the moment this returns doesn't read the
                 // gate that was just answered.
                 w.wake.input();
-                if state.as_ref().is_some_and(|s| s.state == "blocked") {
+                let gated = state.as_ref().is_some_and(|s| s.state == "blocked");
+                if gated {
                     w.wake.wait_unblocked(ANSWER_SETTLE);
+                } else if submit && shared.ledger.turns == Turns::Hook {
+                    // And a prompt: reply once the agent has announced it
+                    // (≤ LANDING_GRACE), so a `wait --after <stops>` called
+                    // the moment this returns sees this turn open — not the
+                    // ledger as the last turn left it, which after an Esc
+                    // reads "prompted, no longer running": `interrupted`
+                    // (found live on Codex, 2026-09-29).
+                    let landed = Instant::now() + LANDING_GRACE;
+                    while registry::read_agent(&w.files).prompted_at.is_none_or(|p| p < ms)
+                        && Instant::now() < landed
+                        && !shared.exited()
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 if submit {
                     *last = Some(Submitted { at: Instant::now(), ms });
