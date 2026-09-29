@@ -386,11 +386,13 @@ fn list_in(dir: &Dirs) -> Vec<Session> {
 /// the HUD and `status` only ever show live agents. A `.meta` that does not
 /// parse is left alone: it is not known to be dead.
 ///
-/// Also sweeps control sockets no live session owns. A wrapper removes its
+/// Also sweeps control sockets left by dead wrappers. A wrapper removes its
 /// own on the way out, but one killed outright (SIGKILL, a crash) cannot, and
-/// its `.meta` may already have been reaped by the time anyone notices. A
-/// wrapper binds its socket only after its `.meta` exists, so a live one is
-/// never swept.
+/// its `.meta` may already have been reaped by the time anyone notices.
+/// The runtime dir is not this cache's alone — a seagents run with another
+/// `HOME` (a test's scratch one, `sudo -E`, a second profile) shares it — so
+/// "no session here owns it" is not enough: a socket goes only when its pid
+/// is dead or provably not seagents ([`sweepable`]).
 pub(crate) fn reap() {
     reap_in(&Dirs::live())
 }
@@ -414,7 +416,7 @@ fn reap_in(dir: &Dirs) {
         for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock] {
             let _ = fs::remove_file(path);
         }
-        if let Ok(sock) = &f.sock {
+        if let (Ok(sock), true) = (&f.sock, sweepable(s.meta.wrapper_pid)) {
             let _ = fs::remove_file(sock);
         }
         remove_prompts(&s.meta);
@@ -431,10 +433,19 @@ fn reap_in(dir: &Dirs) {
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_suffix(".sock"))
             .and_then(|p| p.parse::<u64>().ok());
-        if pid.is_some_and(|p| !owned.contains(&p)) {
+        if pid.is_some_and(|p| !owned.contains(&p) && sweepable(p)) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Whether `<wrapper_pid>.sock` may be swept: its wrapper is dead, or the pid
+/// now runs something that is not seagents (reused). A live seagents process
+/// may be a wrapper registered in another cache, and one that can't be read
+/// isn't provably anything; both keep their socket — at worst a stale file
+/// stays until the pid is gone.
+fn sweepable(wrapper_pid: u64) -> bool {
+    !crate::procfs::alive(wrapper_pid) || crate::procfs::runs_seagents(wrapper_pid) == Some(false)
 }
 
 /// The session whose anchor is `child_pid` — the handle `focus` and the HUD
@@ -1511,9 +1522,11 @@ mod tests {
         let me = std::process::id() as u64;
         let dead = u32::MAX as u64; // no such pid
         let live = Files::in_dir(&dir, 1);
-        let gone = Files::in_dir(&dir, 2);
+        // Its wrapper is dead too, as a dead session's usually is.
+        let gone_wrapper = u32::MAX as u64 - 2;
+        let gone = Files::in_dir(&dir, gone_wrapper);
         write_new_meta(&live, &sample(1, Some(me)));
-        write_new_meta(&gone, &sample(2, Some(dead)));
+        write_new_meta(&gone, &sample(gone_wrapper, Some(dead)));
         for f in [&live, &gone] {
             fs::write(&f.raw, b"x").unwrap();
             update_state(f, |r| {
@@ -1528,23 +1541,34 @@ mod tests {
         }
         // Unparseable: not known to be dead, so never reaped.
         fs::write(dir.join("3.meta"), "{torn").unwrap();
-        // Sockets: the live session's stays; the dead one's goes, and so does
-        // one whose session left no `.meta` at all (a SIGKILLed wrapper).
+        // Sockets: the live session's stays; the dead one's goes, and so does one whose session left no
+        // `.meta` at all (a SIGKILLed wrapper: a dead pid). A socket of a
+        // live seagents process registered in no session here — a wrapper
+        // run with another HOME — stays, as does one whose pid can't be read.
+        // A live process that is not seagents holds a reused pid: swept.
         let (live_sock, gone_sock) = (live.sock.clone().unwrap(), gone.sock.clone().unwrap());
         for f in [&live_sock, &gone_sock] {
             fs::write(f, b"").unwrap();
         }
-        fs::write(dir.join("99.sock"), b"").unwrap();
+        let orphan = dir.join(&format!("{}.sock", u32::MAX - 1));
+        let foreign = dir.join(&format!("{me}.sock"));
+        let mut sleep = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let reused = dir.join(&format!("{}.sock", sleep.id()));
+        for f in [&orphan, &foreign, &reused] {
+            fs::write(f, b"").unwrap();
+        }
 
         let listed: Vec<u64> = list_in(&dir).iter().map(|s| s.meta.wrapper_pid).collect();
         assert_eq!(listed, [1]);
         assert!(gone.meta.exists(), "list must not reap");
 
         reap_in(&dir);
-        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock, &gone_sock, &dir.join("99.sock")] {
+        sleep.kill().ok();
+        sleep.wait().ok();
+        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock, &gone_sock, &orphan, &reused] {
             assert!(!path.exists(), "{} should be reaped", path.display());
         }
-        for path in [&live.meta, &live.raw, &live.state, &live_sock] {
+        for path in [&live.meta, &live.raw, &live.state, &live_sock, &foreign] {
             assert!(path.exists(), "{} should survive", path.display());
         }
         assert!(dir.join("3.meta").exists());

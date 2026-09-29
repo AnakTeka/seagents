@@ -241,7 +241,8 @@ Source layout under `src/`:
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
   `Dirs` (the cache and the runtime dir — sockets live in the latter),
   `list()` (live, never deletes) / `reap()` (deletes the dead, leaving each a
-  `<tag>.exited` tombstone, and sweeps control sockets no live session owns) /
+  `<tag>.exited` tombstone, and sweeps control sockets whose wrapper is dead
+  or not seagents) /
   `resolve_exited()` + `final_agent()` (an agent that may have exited, for
   `wait`/`read`) /
   `by_child_pid()` / `enclosing_session(pid)` (the session a process runs
@@ -493,7 +494,15 @@ Per session, keyed by the wrapper's pid:
 - **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
   socket (§9; 0600 in a 0700 dir). Bound once the `.meta` exists; removed
   by the wrapper on exit and on SIGHUP/SIGTERM, and by `reap()` when no live
-  session owns it (a SIGKILLed wrapper). `registry::runtime_dir()` is the one
+  session owns it (a SIGKILLed wrapper) **and** its pid is dead or provably
+  not seagents (`procfs::runs_seagents`: neither `/proc/<pid>/exe` nor
+  argv[0] is named `seagents…`; unreadable counts as "can't say" and keeps
+  it). The runtime dir is shared by every seagents whatever its `HOME` — a
+  test's scratch one, `sudo -E`, a second profile — so "not in this cache"
+  alone once let such a run delete the user's live agents' sockets.
+  Verified: a wrapper under one scratch `HOME` kept its socket through a
+  `status` under another sharing its runtime dir, and `send` still reached
+  it; a dead pid's socket went. `registry::runtime_dir()` is the one
   place the directory is decided (the wrapper binding, every client
   connecting, `spawn`'s seed file): `$XDG_RUNTIME_DIR/seagents` unless that is
   unset, can't be created, or is too long for a socket path (`sun_path` holds
@@ -503,8 +512,7 @@ Per session, keyed by the wrapper's pid:
   else's directory is refused, and then there is no socket and no `send` —
   the agent still runs, and `send` says why). Verified with a 119-byte
   `XDG_RUNTIME_DIR`: the socket went to `/tmp/seagents-1000`, `send` and `stop`
-  worked. Note `reap()` sweeps every unowned `<pid>.sock` in that dir, so a
-  scratch-`HOME` test must also use a scratch runtime dir.
+  worked.
 
 **Tags.** Every agent has one: its name for every command (`focus reviewer`),
 the window handle `restore` swallows on (`seagents-<tag>`), and the lineage
