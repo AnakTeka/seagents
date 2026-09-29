@@ -406,11 +406,16 @@ Per session, keyed by the wrapper's pid:
   working→idle completion `seen: false` (shown as 🔵 done, ranked just under
   blocked) until acknowledged — by a HUD preview/jump of that agent, or by the
   agent's window gaining focus — which flips it to plain idle without touching
-  the clock. Reader-written transitions are always `seen: true`, so sessions
-  from pre-monitor wrappers never show a stuck done.
+  the clock. Whoever observes the working→idle edge marks it — the monitor
+  or a reader (the HUD, `status`): for a hook agent the edge is the ledger's
+  `Stop`, which lands between screen changes, and the HUD's 750 ms poll
+  usually sees it before the monitor's 2 s tick; while only the monitor's
+  sighting counted, the HUD won that race and wrote plain idle (a HUD `p`
+  send's finished turn showed idle, not done).
   **Maintained by the wrapper itself** (a monitor thread re-detects
   its own agent every 2s — every 100 ms for a second after input reaches it
-  at a gate, §8 — skipping the pass while the tee is unchanged), so
+  at a gate, §8 — skipping the pass while neither the tee nor `.agent` has
+  changed: a `Stop` need not be followed by output), so
   durations stay truthful with no HUD open. HUD/status polls also write it
   whenever their own detection disagrees — the writers race benignly on
   transitions (both stamp since≈now; each read-decide-write is one locked

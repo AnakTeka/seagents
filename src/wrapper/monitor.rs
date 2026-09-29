@@ -105,11 +105,12 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: 
         .unwrap_or("?")
         .to_string();
     thread::spawn(move || {
-        // No new output ⇒ no state change (even resizes repaint), so skip
-        // the vt100 render entirely while the tee is unchanged. This is
-        // what makes an idle agent's monitor cost ~zero instead of a
-        // permanent ~1% of a core re-detecting the same bytes.
-        let mut last_seen: Option<(u64, std::time::SystemTime)> = None;
+        // Nothing new to look at ⇒ no state change (even resizes repaint),
+        // so skip the vt100 render entirely while neither input to the
+        // state has changed. This is what makes an idle agent's monitor cost
+        // ~zero instead of a permanent ~1% of a core re-detecting the same
+        // bytes.
+        let mut last_seen: Option<Inputs> = None;
         // In-memory previous state for transition notifications — kept
         // separate from the sidecar on purpose: another observer (an open
         // HUD) may stamp the sidecar first, but the notification decision
@@ -117,11 +118,9 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: 
         let mut prev: Option<status::State> = None;
         let mut quick_until: Option<Instant> = None;
         loop {
-            let seen = fs::metadata(&files.raw)
-                .ok()
-                .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
-            if seen.is_none() || seen != last_seen {
-                last_seen = seen;
+            let seen = Inputs::of(&files);
+            if seen.raw.is_none() || Some(&seen) != last_seen.as_ref() {
+                last_seen = Some(seen);
                 if let Some((state, acked)) = status::track_session(&files, &cmd0, anchor_pid) {
                     // Read the con_id fresh: the input pump and focus
                     // fallback heal it in the meta over time, and a stale
@@ -162,6 +161,27 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: 
             }
         }
     });
+}
+
+/// What the state is made of, as of one look: the tee (the screen) and the
+/// `.agent` turn ledger, each as (length, mtime). A hook agent's turn ends at
+/// its `Stop` hook, which need not be followed by a byte of output — watching
+/// the tee alone left `.state` at `working` after the turn had ended, with no
+/// "finished" notification and no done marker until something repainted.
+#[derive(PartialEq, Eq)]
+struct Inputs {
+    raw: Option<(u64, std::time::SystemTime)>,
+    agent: Option<(u64, std::time::SystemTime)>,
+}
+
+impl Inputs {
+    fn of(files: &Files) -> Inputs {
+        let stamp = |p: &Path| fs::metadata(p).ok().and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
+        Inputs {
+            raw: stamp(&files.raw),
+            agent: stamp(&files.agent),
+        }
+    }
 }
 
 /// Desktop notification for a state transition worth interrupting the user
@@ -216,6 +236,20 @@ fn notify_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ledger_change_alone_is_something_new_to_look_at() {
+        let dir = std::env::temp_dir().join(format!("seagents-inputs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = Files::in_dir(&dir, 1);
+        fs::write(&files.raw, b"screen").unwrap();
+        let before = Inputs::of(&files);
+        assert!(before == Inputs::of(&files), "nothing changed");
+        // The Stop hook rewrites `.agent`; the tee is untouched.
+        fs::write(&files.agent, br#"{"stops":1}"#).unwrap();
+        assert!(before != Inputs::of(&files));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn input_hurries_the_monitor_only_at_a_gate() {

@@ -248,7 +248,7 @@ fn read_session(live: &crate::registry::Session) -> Session {
         .unwrap_or((Screen { state: State::Unknown, rule: None }, String::new()));
 
     let now = crate::clock::unix_now();
-    let (state, record, agent, in_turn) = settle(&live.files, &cmd, screen, now, false);
+    let (state, record, agent, in_turn) = settle(&live.files, &cmd, screen, now);
     // Present unacknowledged completions as their own state.
     let state = if state == State::Idle && !record.seen {
         State::Done
@@ -323,7 +323,6 @@ fn settle(
     cmd: &str,
     screen: Screen,
     now: u64,
-    mark_unseen: bool,
 ) -> (State, StateRecord, crate::registry::AgentRecord, bool) {
     let agent = crate::registry::read_agent(files);
     let ledger = crate::turn::Ledger::for_command(cmd);
@@ -335,10 +334,10 @@ fn settle(
             screen
         };
         let state = shown.state;
-        (state, observe_state(files, shown, now, mark_unseen), agent, in_turn)
+        (state, observe_state(files, shown, now), agent, in_turn)
     } else {
         let state = screen.state;
-        let record = observe_state(files, screen, now, mark_unseen);
+        let record = observe_state(files, screen, now);
         let in_turn = ledger.in_turn(&agent, Some(&record));
         (state, record, agent, in_turn)
     }
@@ -356,12 +355,13 @@ fn or_unknown(s: &str) -> String {
 /// read-decide-write is one locked registry update, so a race can only ever
 /// order two whole decisions, never interleave them.)
 ///
-/// `mark_unseen`: true only for the wrapper's own monitor — a working→idle
-/// transition it observes is stamped `seen: false` (the agent finished and
-/// nobody has looked yet). Readers (HUD/status fallback writes for
-/// pre-monitor sessions) always write `seen: true`, so unmonitored sessions
-/// simply never show "done" rather than showing it forever.
-fn observe_state(files: &Files, screen: Screen, now: u64, mark_unseen: bool) -> StateRecord {
+/// A working→idle transition is stamped `seen: false` — the agent finished
+/// and nobody has looked yet (the "done" state) — whoever observes it. For a
+/// hook agent that edge is the ledger's (its `Stop`), which lands between
+/// two screen changes: the wrapper's monitor and an open HUD (every 750 ms)
+/// race to see it, and when only the monitor's sighting counted, a HUD that
+/// saw it first wrote plain idle and the done marker was lost.
+fn observe_state(files: &Files, screen: Screen, now: u64) -> StateRecord {
     let Screen { state, rule } = screen;
     crate::registry::update_state(files, |current| {
         if let Some(p) = current {
@@ -378,8 +378,7 @@ fn observe_state(files: &Files, screen: Screen, now: u64, mark_unseen: bool) -> 
                 return p.clone();
             }
         }
-        let finished_unwatched = mark_unseen
-            && state == State::Idle
+        let finished_unwatched = state == State::Idle
             && current.as_ref().is_some_and(|p| p.state == "working");
         let record = StateRecord {
             state: state.word().to_string(),
@@ -418,7 +417,7 @@ pub(crate) fn ack_session(id: u64) {
 /// seen, so the caller can notify and acknowledge.
 pub(crate) fn track_session(files: &Files, cmd: &str, child_pid: u64) -> Option<(State, bool)> {
     let (screen, _) = detect_screen(&files.raw, crate::procfs::live_pty_size(child_pid), cmd)?;
-    let (state, record, _, _) = settle(files, cmd, screen, crate::clock::unix_now(), true);
+    let (state, record, _, _) = settle(files, cmd, screen, crate::clock::unix_now());
     Some((state, record.seen))
 }
 
@@ -592,12 +591,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
         let gate = |rule: &str| Screen { state: State::Blocked, rule: Some(rule.into()) };
-        let r = observe_state(&files, gate("live_blocked_form"), 100, true);
+        let r = observe_state(&files, gate("live_blocked_form"), 100);
         assert_eq!((r.since, r.rule.as_deref()), (100, Some("live_blocked_form")));
-        let r = observe_state(&files, gate("permission_prompt"), 150, true);
+        let r = observe_state(&files, gate("permission_prompt"), 150);
         assert_eq!((r.since, r.rule.as_deref()), (100, Some("permission_prompt")));
         assert_eq!(crate::registry::read_state(&files).unwrap().rule.as_deref(), Some("permission_prompt"));
-        let r = observe_state(&files, sc(State::Working), 200, true);
+        let r = observe_state(&files, sc(State::Working), 200);
         assert_eq!((r.since, r.rule), (200, None));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -608,14 +607,42 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
 
-        assert_eq!(observe_state(&files, sc(State::Idle), 100, false).since, 100);
+        assert_eq!(observe_state(&files, sc(State::Idle), 100).since, 100);
         // A mid-repaint Unknown sample must not reset the idle clock…
-        assert_eq!(observe_state(&files, sc(State::Unknown), 150, false).since, 100);
-        assert_eq!(observe_state(&files, sc(State::Idle), 200, false).since, 100);
+        assert_eq!(observe_state(&files, sc(State::Unknown), 150).since, 100);
+        assert_eq!(observe_state(&files, sc(State::Idle), 200).since, 100);
         // …but a real transition does.
-        assert_eq!(observe_state(&files, sc(State::Blocked), 250, false).since, 250);
-        assert_eq!(observe_state(&files, sc(State::Blocked), 300, false).since, 250);
+        assert_eq!(observe_state(&files, sc(State::Blocked), 250).since, 250);
+        assert_eq!(observe_state(&files, sc(State::Blocked), 300).since, 250);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_turn_the_ledger_ends_is_done_whoever_sees_it_first() {
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("seagents-ledgerdone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = Files::in_dir(&dir, 1);
+        let meta = crate::registry::Meta { wrapper_pid: 1, child_pid: Some(2), ..Default::default() };
+        std::fs::write(&files.meta, serde_json::to_string(&meta).unwrap()).unwrap();
+        // A HUD-sent prompt: the ledger opens a turn while Claude streams a
+        // plain-text answer the screen reads as idle.
+        crate::registry::update_agent(&files, |a| a.prompted_at = Some(100_000));
+        let (state, rec, _, in_turn) = settle(&files, "claude", sc(State::Idle), 100);
+        assert!(in_turn);
+        assert!(state == State::Working && rec.state == "working");
+        // The Stop lands with no new output; an open HUD's poll (not the
+        // wrapper's monitor) is the first to look.
+        crate::registry::update_agent(&files, |a| {
+            a.stops = 1;
+            a.stopped_at = Some(104_000);
+        });
+        let (state, rec, _, in_turn) = settle(&files, "claude", sc(State::Idle), 104);
+        assert!(!in_turn && state == State::Idle);
+        assert!(!rec.seen, "the completion must still read as done");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -625,26 +652,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
 
-        // Wrapper monitor observes: working, then idle → unseen completion.
-        assert!(observe_state(&files, sc(State::Working), 100, true).seen);
-        let rec = observe_state(&files, sc(State::Idle), 200, true);
-        assert!(!rec.seen, "working→idle by the wrapper should be unseen");
+        // Working, then idle → an unseen completion.
+        assert!(observe_state(&files, sc(State::Working), 100).seen);
+        let rec = observe_state(&files, sc(State::Idle), 200);
+        assert!(!rec.seen, "working→idle should be unseen");
         assert_eq!(rec.since, 200);
 
-        // A reader polling the same state keeps the unseen bit and the clock.
-        let rec = observe_state(&files, sc(State::Idle), 260, false);
+        // Another look at the same state keeps the unseen bit and the clock.
+        let rec = observe_state(&files, sc(State::Idle), 260);
         assert!(!rec.seen);
         assert_eq!(rec.since, 200);
 
         // Acknowledgment flips seen without touching the clock.
         ack_session_files(&files);
-        let rec = observe_state(&files, sc(State::Idle), 300, true);
+        let rec = observe_state(&files, sc(State::Idle), 300);
         assert!(rec.seen);
         assert_eq!(rec.since, 200);
 
-        // A reader-written transition (pre-monitor session) is never unseen.
-        assert!(observe_state(&files, sc(State::Working), 400, false).seen);
-        assert!(observe_state(&files, sc(State::Idle), 500, false).seen);
+        // Idle from anything but working (a gate answered, a first paint) is
+        // not a completion.
+        assert!(observe_state(&files, sc(State::Blocked), 400).seen);
+        assert!(observe_state(&files, sc(State::Idle), 500).seen);
 
         std::fs::remove_dir_all(&dir).ok();
     }
