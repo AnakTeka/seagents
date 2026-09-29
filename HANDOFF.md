@@ -486,7 +486,8 @@ Per session, keyed by the wrapper's pid:
   `send` body too long to paste as the user's words (§9), 0600. Outside the
   cache, but the session's: named and deleted by `registry`.
 - **`sessions/<session id>.idx`** — a transcript's offset index (§10),
-  about a conversation rather than a live agent, so never reaped; a
+  about a conversation rather than a live agent, so never reaped with a
+  session (swept daily instead, §10); a
   subagent's transcript (not named by a uuid) is keyed by a hash of its
   path. `registry::sessions_dir()`.
 - **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
@@ -1169,7 +1170,14 @@ indexed byte on every open (transcripts are append-only; only complete lines
 are indexed), rebuilt when the file is shorter than that or its first 4 KiB
 no longer hash the same. Measured on the largest transcript here (53 MB):
 `read --tail 20` in 65 ms cold, 6 ms warm; the whole main line as NDJSON in
-90 ms.
+90 ms. The header records the transcript's canonical path (format v2; a v1
+index is swept and rebuilt), and a read that changes nothing touches the
+index's mtime. `index::cache_path()` — every cached open — sweeps the
+directory at most once a day (the mtime of `sessions/.swept`; one `stat`
+otherwise): an index whose transcript is gone, or unread for 30 days, goes,
+as do `*.tmp` leftovers a day old. Verified with a scratch HOME: a gone
+transcript's, a 40-day-old and a v1 index went on the first read after the
+stamp aged past a day, the live one stayed.
 
 ### 11. Codex — the second adapter
 
