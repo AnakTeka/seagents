@@ -24,6 +24,17 @@ else
 fi
 command -v claude >/dev/null || { echo "claude is not on PATH"; exit 1; }
 
+# Launch as if from inside a Claude Code session — an agent calling `spawn`,
+# which is also how the orchestrator runs this — so the launcher, not this
+# script, must keep that session's variables from the agents under test.
+# Only the ones not already set get stand-ins.
+SESSION_VARS="CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
+  CLAUDE_CODE_EXECPATH CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ATTENDED
+  CLAUDE_PID CLAUDE_EFFORT AI_AGENT"
+for v in $SESSION_VARS; do
+  [ -n "${!v+x}" ] || export "$v=sg-test-stand-in"
+done
+
 . "$REPO/tools/lib-nested-desktop.sh"
 nd_init "${1:-alacritty}"
 if [ -n "${REAL_HOME:-}" ]; then
@@ -91,6 +102,19 @@ out=$("$SEA" wait it-a --after 0 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['reason']")" = turn ] || fail "wait: rc=$rc $out"
 echo "$out" | jq_ "d['last_message']" | grep -q ALPHA || fail "wait: last_message: $out"
 pass "wait --after 0 returned the turn (rc 0): $out"
+
+# 2a. The agent started clean of the calling session's variables (the
+#     launcher's doing), kept the user's config dir, and so wrote a transcript.
+anchor=$(meta_of it-a | jq_ "d['child_pid']")
+agent=$(cat /proc/$anchor/task/$anchor/children | awk '{print $1}')
+[ -n "$agent" ] || fail "no agent process under the anchor $anchor"
+leaked=$(tr '\0' '\n' < /proc/$agent/environ | cut -d= -f1 | grep -xF "$(echo $SESSION_VARS | tr ' ' '\n')")
+[ -z "$leaked" ] || fail "the agent (pid $agent) inherited: $leaked"
+[ -z "${CLAUDE_CONFIG_DIR:-}" ] || tr '\0' '\n' < /proc/$agent/environ | grep -qxF "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
+  || fail "the agent lost CLAUDE_CONFIG_DIR"
+tp=$(echo "$out" | jq_ "d['transcript_path']")
+[ -f "$tp" ] || fail "no transcript at '$tp'"
+pass "the agent (pid $agent) has none of the calling session's variables, keeps CLAUDE_CONFIG_DIR, and writes $tp"
 
 # 2b. Nothing to wait for without a baseline; a baseline not yet passed times out.
 out=$("$SEA" wait it-a --timeout 5s); rc=$?

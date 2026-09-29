@@ -262,7 +262,16 @@ Source layout under `src/`:
   --tag <tag> [--parent <p>] [--seed-file <f>] -- <argv>`, so the new
   window's PATH doesn't matter; `Run::keep_shell` is the one difference
   between its two callers — `restore` leaves the window at a shell when the
-  agent exits (`; exec "$SHELL"`), `spawn` closes it with the agent.
+  agent exits (`; exec "$SHELL"`), `spawn` closes it with the agent. The
+  window starts as a user's shell would: the calling agent's own session
+  variables (every bundled adapter's `[launch] session_env` — Claude's
+  `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, messaging socket and token, … but
+  never `CLAUDE_CONFIG_DIR` or other user config) are removed from the
+  terminal's environment *and* `unset` at the head of its `sh -c` line, since
+  a daemon-hosted window (`alacritty msg`) gets the daemon's environment, not
+  ours. Inherited, they made a Claude started outside tmux never write its
+  transcript (bisected in Phase 2), and the socket/token are that session's
+  alone. seagents sets no per-agent variables of its own.
 - **`src/wait.rs`** — `seagents wait` (§8): `decide()`, the whole reason
   logic as a pure function over one look at the ledger, `.state` and
   liveness; `parse_duration()`.
@@ -1054,10 +1063,10 @@ tools/test-restore.sh alacritty-daemon
 # lineage/caps and the socket's lineage rule → focus → stop, with a real
 # Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.
-# Keeps the real CLAUDE_CONFIG_DIR for auth, but drops any CLAUDECODE /
-# CLAUDE_CODE_* it was started with (run from inside a Claude session, the
-# agents under test would otherwise start as that session's children, which
-# outside tmux never write a transcript). PASS/FAIL per step.
+# Keeps the real CLAUDE_CONFIG_DIR for auth, and runs as if from inside a
+# Claude session (stand-ins for any of its session variables not already set),
+# checking the agent's /proc/<pid>/environ holds none of them — the launcher's
+# job, not the script's. PASS/FAIL per step.
 tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon]
 ```
 

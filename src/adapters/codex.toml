@@ -13,6 +13,8 @@ permission_modes = []
 identity         = "none"
 turns            = "screen"
 watch_dir        = ""
+# What a running Codex sets for its children is not known yet (Phase 4).
+session_env      = []
 
 [send]
 submit_delay_ms  = 300

@@ -89,6 +89,12 @@ pub(crate) struct Launch {
     pub(crate) turns: Turns,
     /// For `identity = "watch"`.
     pub(crate) watch_dir: String,
+    /// Variables a running agent of this kind sets for what it runs — its
+    /// own session's identity and messaging channel — which a window
+    /// seagents launches must not inherit when the launch comes from inside
+    /// such an agent. Names, or a prefix ending in `*`. Never the user's own
+    /// configuration (Claude's `CLAUDE_CONFIG_DIR`).
+    pub(crate) session_env: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -186,11 +192,50 @@ fn parse(text: &str) -> Result<Adapter, String> {
     if !seed.is_empty() && !seed.iter().any(|a| a.contains("{prompt}")) {
         return Err("launch.seed_prompt has no {prompt}".to_string());
     }
+    if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
+        return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
+    }
     let send = &adapter.send;
     if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
         return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
     }
     Ok(adapter)
+}
+
+/// `NAME` or `PREFIX*`, `[A-Za-z_][A-Za-z0-9_]*` — safe to write unquoted
+/// into a shell's `unset`.
+fn valid_env_pattern(p: &str) -> bool {
+    let name = p.strip_suffix('*').unwrap_or(p);
+    let b = name.as_bytes();
+    !b.is_empty()
+        && !b[0].is_ascii_digit()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+/// Of the variables `env` holds, those every bundled adapter's
+/// `session_env` names — what a window seagents launches must not inherit.
+/// Every bundled adapter, not the one being launched: an agent of one kind
+/// may spawn an agent of another, and it is the caller's session that
+/// leaks. The bundled files, not overrides: an override written before a
+/// variable was listed would otherwise quietly let it through.
+pub(crate) fn session_env<'a>(env: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let patterns: Vec<String> = BUNDLED
+        .iter()
+        .flat_map(|(_, text)| parse(text).expect("bundled adapters parse (pinned by a test)").launch.session_env)
+        .collect();
+    let mut names: Vec<String> = env
+        .into_iter()
+        .filter(|name| {
+            patterns.iter().any(|p| match p.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == p,
+            })
+        })
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// `~/.config/seagents/agents/<agent>.toml`.
@@ -295,6 +340,42 @@ mod tests {
         assert_eq!(codex.launch.settings_flag, "");
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
         assert_eq!(codex.send.long_prompt, LongPrompt::Paste);
+    }
+
+    #[test]
+    fn a_launch_strips_the_calling_sessions_variables_and_nothing_else() {
+        let env = [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ATTENDED",
+            "CLAUDE_PID",
+            "CLAUDE_EFFORT",
+            "AI_AGENT",
+            // The user's configuration stays.
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            "HOME",
+            "PATH",
+        ];
+        let mut want = env[..11].to_vec();
+        want.sort();
+        assert_eq!(session_env(env), want);
+        assert!(session_env(["HOME", "TERM"]).is_empty());
+    }
+
+    #[test]
+    fn session_env_takes_names_or_a_prefix_glob() {
+        assert!(parse("[launch]\nsession_env = [\"FOO_BAR\", \"X_*\", \"_Y1\"]\n").is_ok());
+        for bad in ["", "*", "1X", "A-B", "A B", "A*B", "$(rm)"] {
+            let text = format!("[launch]\nsession_env = [{bad:?}]\n");
+            assert!(parse(&text).unwrap_err().contains("session_env"), "{bad}");
+        }
     }
 
     #[test]

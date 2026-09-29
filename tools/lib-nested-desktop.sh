@@ -42,11 +42,6 @@ nd_init() {
   # seagents derives its config and state dirs from these when set; they would
   # point the run (and its layout.json) back at the real ones.
   unset XDG_STATE_HOME XDG_CONFIG_HOME
-  # Run from inside a Claude Code session (an agent running the tests), the
-  # agents under test would inherit that session's variables and start as its
-  # children — and such a Claude, outside tmux, never writes its transcript
-  # (measured 2026-09-29). Start them as a user's shell would.
-  unset CLAUDECODE AI_AGENT CLAUDE_PID CLAUDE_EFFORT $(compgen -v CLAUDE_CODE_)
   # Seed prompts (and weston's socket) live here; keep them out of the real one.
   export XDG_RUNTIME_DIR="$ROOT/run"
   export SEAGENTS_NO_NOTIFY=1

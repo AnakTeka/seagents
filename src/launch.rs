@@ -208,19 +208,34 @@ pub(crate) struct Run<'a> {
 /// `SEAGENTS_TERMINAL_CMD` overrides the whole invocation for terminals without
 /// a built-in recipe; `{handle}` (alias `{role}`), `{cwd}` and `{cmd}` are
 /// substituted.
+///
+/// The window starts as a user's shell would, not as a child of whoever
+/// calls this: an agent running `spawn` carries its own session's variables
+/// (the adapters' `session_env` — Claude's session id, messaging socket and
+/// token, …), and a Claude that inherits them never writes its transcript
+/// outside tmux. They are dropped twice over — from the terminal's own
+/// environment, and by an `unset` at the head of the line it runs, which
+/// covers a window hosted by a terminal daemon started with them.
 pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), String> {
     let handle = handle_for(run.tag);
     // This very binary, by absolute path: the new window's shell has whatever
     // PATH its rc files give it, and the one it finds need not be us.
     let exe = std::env::current_exe().map_err(|e| format!("locating seagents: {e}"))?;
-    let inner = inner_command(&exe, run);
+    let vars: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    let strip = crate::adapter::session_env(vars.iter().map(String::as_str));
+    let inner = inner_command(&exe, run, &strip);
     let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
         return Err("terminal command is empty".to_string());
     };
 
-    Command::new(program)
-        .args(rest)
+    let mut cmd = Command::new(program);
+    for name in &strip {
+        cmd.env_remove(name);
+    }
+    cmd.args(rest)
         .current_dir(if Path::new(cwd).is_dir() { cwd } else { "/" })
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -230,10 +245,16 @@ pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), St
         .map_err(|e| format!("launching {program}: {e}"))
 }
 
-/// The `sh -c` line the terminal runs. `--tag` so the wrapper identifies its
-/// own window by `handle_for(tag)` rather than by winning a focus race it
+/// The `sh -c` line the terminal runs: `unset` of `strip` (names the adapter
+/// validated, safe unquoted), then `run`. `--tag` so the wrapper identifies
+/// its own window by `handle_for(tag)` rather than by winning a focus race it
 /// cannot win.
-fn inner_command(exe: &Path, run: &Run) -> String {
+fn inner_command(exe: &Path, run: &Run, strip: &[String]) -> String {
+    let unset = if strip.is_empty() {
+        String::new()
+    } else {
+        format!("unset {}; ", strip.join(" "))
+    };
     let mut inner = format!(
         "{} run --tag {}",
         shell_quote(&exe.to_string_lossy()),
@@ -247,9 +268,9 @@ fn inner_command(exe: &Path, run: &Run) -> String {
     }
     let argv = run.argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
     if run.keep_shell {
-        format!("{inner} -- {argv}; exec \"$SHELL\"")
+        format!("{unset}{inner} -- {argv}; exec \"$SHELL\"")
     } else {
-        format!("exec {inner} -- {argv}")
+        format!("{unset}exec {inner} -- {argv}")
     }
 }
 
@@ -290,17 +311,23 @@ mod tests {
         };
         let exe = Path::new("/opt/my bin/seagents");
         assert_eq!(
-            inner_command(exe, &run),
+            inner_command(exe, &run, &[]),
             r#"'/opt/my bin/seagents' run --tag 't1' -- 'claude' '--resume' 'it'\''s'; exec "$SHELL""#
         );
         run.parent = Some("boss");
         run.seed_file = Some(Path::new("/run/user/1/seagents/seed-t1"));
         run.keep_shell = false;
         assert_eq!(
-            inner_command(exe, &run),
+            inner_command(exe, &run, &[]),
             "exec '/opt/my bin/seagents' run --tag 't1' --parent 'boss' \
              --seed-file '/run/user/1/seagents/seed-t1' -- 'claude' '--resume' 'it'\\''s'"
         );
+        // The calling session's variables are gone before `run` starts, and
+        // stay gone for the shell a restored window drops back to.
+        let strip = ["CLAUDECODE".to_string(), "CLAUDE_PID".to_string()];
+        assert!(inner_command(exe, &run, &strip).starts_with("unset CLAUDECODE CLAUDE_PID; exec '/opt/my bin/seagents' run"));
+        run.keep_shell = true;
+        assert!(inner_command(exe, &run, &strip).starts_with("unset CLAUDECODE CLAUDE_PID; '/opt/my bin/seagents' run"));
     }
 
     #[test]

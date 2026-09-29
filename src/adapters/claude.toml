@@ -17,6 +17,26 @@ permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
 watch_dir        = ""
+# What a running Claude Code sets for its children: its session's identity
+# and messaging socket/token. A window launched from inside one (an agent
+# calling `spawn`) must not inherit them — with them, a Claude started
+# outside tmux never writes its transcript (bisected 2026-09-29), and the
+# socket and token are that session's alone. Listed one by one: the user's
+# own configuration (CLAUDE_CONFIG_DIR, CLAUDE_CODE_USE_BEDROCK,
+# CLAUDE_CODE_MAX_OUTPUT_TOKENS, …) must pass through.
+session_env      = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "CLAUDE_CODE_EXECPATH",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ATTENDED",
+  "CLAUDE_PID",
+  "CLAUDE_EFFORT",
+  "AI_AGENT",
+]
 
 [send]
 submit_delay_ms  = 300
