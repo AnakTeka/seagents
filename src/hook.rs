@@ -39,7 +39,7 @@ pub(crate) fn run() -> i32 {
             .map_err(|e| format!("stdin: {e}"))?;
         let payload: Value = serde_json::from_str(&input).map_err(|e| format!("payload: {e}"))?;
         let session = find_session().ok_or("no enclosing seagents session")?;
-        record(&session.files, &payload, crate::clock::unix_now())
+        record(&session.files, &payload, crate::clock::unix_now_ms())
     });
     let err = match outcome {
         Ok(Ok(())) => return 0,
@@ -80,7 +80,8 @@ fn find_session() -> Option<registry::Session> {
 /// Every event carries the current `session_id` and `transcript_path`, so all
 /// of them refresh identity, not only `SessionStart`: a `SessionStart` lost to
 /// a startup race (or to a wrapper that was not yet recording) heals on the
-/// next prompt. `source` only comes with `SessionStart`.
+/// next prompt. `source` only comes with `SessionStart`. `now` is Unix
+/// milliseconds, the ledger's unit (see [`AgentRecord::prompted_at`]).
 fn record(files: &Files, payload: &Value, now: u64) -> Result<(), String> {
     let event = payload["hook_event_name"]
         .as_str()

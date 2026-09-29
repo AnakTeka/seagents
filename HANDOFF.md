@@ -188,15 +188,21 @@ Source layout under `src/`:
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
   `list()` (live, never deletes) / `reap()` (deletes the dead) /
   `by_child_pid()` / `enclosing_session()` (the caller's session, by `/proc`
-  ancestry), the locked `update_meta()` / `update_state()` / `update_agent()`,
-  and `in_turn()`, the one definition of "this agent is mid-turn"; tags (`valid_tag()`,
+  ancestry), the locked `update_meta()` / `update_state()` / `update_agent()`;
+  tags (`valid_tag()`,
   `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
   `backfill_tags()`) and `resolve_target()`, the one resolver every command
   that addresses an agent uses. No other module builds a `<pid>.*` path or
   parses one.
+- **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
+  is mid-turn" (§6), per adapter: the hook ledger plus the transcript's
+  interrupt record, or the screen for hookless agents.
+- **`src/transcript/`** — the agent's own conversation file, one parser per
+  format (`claude.rs`); today only `interrupted_since()`. Phase 3's `read`
+  grows the common record model here.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then
-  detects), `print()`, `read_session()` (detection), `observe_state()` (the
-  `.state` transition rules), OSC-title parsing (`all_titles`,
+  detects), `print()`, `read_session()` (detection), `settle()` (screen fused
+  with the turn ledger), `observe_state()` (the `.state` transition rules), OSC-title parsing (`all_titles`,
   `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
   vendored engine's verdicts on live-capture scenarios; `debug_screen()`; the
@@ -235,7 +241,8 @@ Source layout under `src/`:
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
   `parent_pid()`, `ancestors()`, `live_pty_size()`.
-- **`src/clock.rs`** — `unix_now()`, the unit of every stored timestamp.
+- **`src/clock.rs`** — `unix_now()` (seconds: `.meta`, `.state`, the
+  snapshot) and `unix_now_ms()` (the `.agent` turn ledger).
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 - **`src/snapshot.rs`** — the reboot snapshot, layout capture/restore only:
   `capture()` (conversation ids read from each session's `.agent`), layout
@@ -335,10 +342,10 @@ Per session, keyed by the wrapper's pid:
     "source": "startup",            // startup | resume | clear | compact
     "permission_mode": "bypassPermissions",
     "stops": 7,                     // +1 at every Stop; never resets
-    "prompted_at": 1783468390,      // last UserPromptSubmit
-    "stopped_at": 1783468399,       // last Stop
+    "prompted_at": 1783468390120,   // last UserPromptSubmit (Unix ms)
+    "stopped_at": 1783468399870,    // last Stop (Unix ms)
     "last_message": "…",            // the last turn's final assistant text
-    "updated": 1783468399
+    "updated": 1783468399870
   }
   ```
   Its own file because it churns on every prompt and turn end while `.meta`
@@ -618,14 +625,36 @@ Details that matter:
 turns (verified 2026-09-29: a message typed mid-turn fires `UserPromptSubmit`
 reusing the running turn's `prompt_id` and is answered by a second `Stop` with a
 fresh one; an Esc-interrupted turn fires `UserPromptSubmit` and no `Stop` at
-all). `registry::in_turn()` is the one definition of "mid-turn": prompted after
-the last `Stop`, and `.state` not `idle` since that prompt — the second clause
-is what ends an interrupted turn. `status --json` reports it with `stops`;
-`wait`/`send` will share it. Caveat, measured live on 2.1.284: while Claude
-streams a plain-text answer it shows no spinner, and the detector calls that
-screen `idle` — so `in_turn` can read false mid-answer, and a turn interrupted
-before the detector ever saw it `working` stays `in_turn` until the next prompt
-or `Stop`. `stops` itself is exact.
+all). Its stamps are **milliseconds** — a prompt in the same second as the last
+`Stop` is the common case. `turn::Ledger::in_turn()` is the one definition of
+"mid-turn", shared by `status` and `wait` (and `send` in Phase 2):
+
+- **Hook adapters** (Claude): prompted after the last `Stop`, **and** no
+  interrupt record in the transcript since that prompt. On Esc Claude writes a
+  `user` record whose text is `[Request interrupted by user]` (or `… for tool
+  use]`); `transcript/claude.rs` looks for it in the transcript's last 256 KiB,
+  newest first, stopping at the first record older than the prompt (and not
+  parsing at all when the marker isn't in the tail). The screen is **not**
+  consulted: Claude 2.1.284 streams a plain-text answer with no spinner and an
+  idle title, so the detector says `idle` mid-answer, and a turn Esc'd before
+  the detector ever saw it `working` would never have ended.
+- **Screen adapters**: prompted after the last `Stop`, and `.state` not `idle`
+  since the prompt.
+
+The **state column** for hook adapters follows from it (`status::settle`):
+`blocked` from the screen wins; else in a turn → `working`; else the screen's
+verdict. The fused state is what `.state` records, so the done marker and the
+"finished" notification fire when the turn really ends, not when the stream
+merely looks idle. `status --json` reports `stops` and `in_turn`.
+
+Residual, measured live on 2.1.284: an Esc that lands **before the model's
+first response** (well under a second after submitting) doesn't interrupt a
+turn — Claude puts the prompt back in the input box and writes neither an
+interrupt record nor a `Stop` (and no hook event exists for it: the binary's
+event list has no cancel). The transcript can't tell that from a stream in
+progress either, because Claude writes an assistant text record only when the
+block is complete. So such an agent reads as `in_turn`/`working` until its next
+prompt or `Stop`, and a `wait` on it times out rather than returning.
 
 **One-time cost of the hook cutover.** Wrappers started by a pre-hook binary
 have no `.agent` (and the conversation id an old capture cached in their

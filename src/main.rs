@@ -18,6 +18,8 @@ mod procfs;
 mod registry;
 mod snapshot;
 mod status;
+mod transcript;
+mod turn;
 mod vendor;
 mod window;
 mod wrapper;

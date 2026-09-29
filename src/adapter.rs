@@ -135,10 +135,17 @@ fn override_path(agent: &str) -> PathBuf {
 /// a silent fallback: the user wrote it to change how the agent is driven,
 /// and driving it the default way instead is the surprise to avoid.
 pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
-    match crate::vendor::herdr_detect::identify_agent(argv0) {
-        Some(agent) => for_agent(crate::vendor::herdr_detect::agent_label(agent)),
+    match agent_id(argv0) {
+        Some(agent) => for_agent(agent),
         None => Ok(Adapter::default()),
     }
+}
+
+/// The agent id for the command whose first word is `argv0` — the key of its
+/// adapter, detection manifest and transcript parser. None for a command no
+/// detection manifest knows.
+pub(crate) fn agent_id(argv0: &str) -> Option<&'static str> {
+    crate::vendor::herdr_detect::identify_agent(argv0).map(crate::vendor::herdr_detect::agent_label)
 }
 
 /// The adapter for agent id `agent` (as `agent_label` spells it).

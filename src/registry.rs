@@ -201,35 +201,18 @@ pub(crate) struct AgentRecord {
     pub(crate) permission_mode: Option<String>,
     /// Turn ends seen, +1 at every `Stop`.
     pub(crate) stops: u64,
-    /// When the last prompt was submitted, and the last turn ended (unix s).
+    /// When the last prompt was submitted, and the last turn ended — Unix
+    /// **milliseconds**: a prompt in the same second as the last `Stop` is
+    /// common, and seconds would read it as not after it.
     pub(crate) prompted_at: Option<u64>,
     pub(crate) stopped_at: Option<u64>,
     /// The final assistant text of the last turn.
     pub(crate) last_message: Option<String>,
-    /// When any of the above last changed.
+    /// When any of the above last changed (Unix ms).
     pub(crate) updated: u64,
     /// Fields written by another version of seagents, preserved verbatim.
     #[serde(flatten)]
     pub(crate) extra: Map<String, Value>,
-}
-
-/// Is the agent in a turn — has it been given a prompt it has not finished?
-/// The one definition `status`, `wait` and `send` share.
-///
-/// A prompt after the last `Stop`, and the screen not seen `idle` since that
-/// prompt. The second clause is what ends an Esc-interrupted turn, which fires
-/// no `Stop`: the detector seeing the agent back at an idle prompt is the only
-/// edge it leaves. (Seconds resolution: an idle observation stamped in the
-/// same second as the prompt counts as after it.) Blocked is still in a turn —
-/// a permission prompt interrupts a turn, it does not end one.
-pub(crate) fn in_turn(agent: &AgentRecord, state: Option<&StateRecord>) -> bool {
-    let Some(prompted) = agent.prompted_at else {
-        return false;
-    };
-    if prompted <= agent.stopped_at.unwrap_or(0) {
-        return false;
-    }
-    !state.is_some_and(|s| s.state == "idle" && s.since >= prompted)
 }
 
 /// One tracked session: its files and its identity.
@@ -1046,38 +1029,5 @@ mod tests {
         assert_eq!(found(&[500, 30, 20]), Some(20));
         assert_eq!(found(&[500, 501]), None);
         fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn in_turn_truth_table() {
-        let agent = |prompted: Option<u64>, stopped: Option<u64>| AgentRecord {
-            prompted_at: prompted,
-            stopped_at: stopped,
-            ..AgentRecord::default()
-        };
-        let state = |word: &str, since: u64| StateRecord {
-            state: word.into(),
-            since,
-            seen: true,
-        };
-        let idle_before = state("idle", 50);
-        let working = state("working", 101);
-        let blocked = state("blocked", 102);
-        let idle_after = state("idle", 110);
-        let idle_same_second = state("idle", 100);
-
-        // Never prompted: not in a turn, whatever the screen says.
-        assert!(!in_turn(&agent(None, None), Some(&working)));
-        // Prompted, no Stop yet: in a turn until the screen says idle after it.
-        assert!(in_turn(&agent(Some(100), None), None));
-        assert!(in_turn(&agent(Some(100), None), Some(&idle_before)));
-        assert!(in_turn(&agent(Some(100), Some(90)), Some(&working)));
-        assert!(in_turn(&agent(Some(100), Some(90)), Some(&blocked)), "a gate is mid-turn");
-        // Stopped since the prompt (or in the same second): the turn is over.
-        assert!(!in_turn(&agent(Some(100), Some(105)), Some(&working)));
-        assert!(!in_turn(&agent(Some(100), Some(100)), Some(&working)));
-        // Interrupted: prompted, no Stop, idle observed after the prompt.
-        assert!(!in_turn(&agent(Some(100), Some(90)), Some(&idle_after)));
-        assert!(!in_turn(&agent(Some(100), None), Some(&idle_same_second)));
     }
 }

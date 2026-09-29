@@ -100,7 +100,7 @@ pub(crate) struct Session {
     /// What the agent reports about itself (conversation, turn ledger); the
     /// empty record for an agent without hooks.
     pub(crate) agent: crate::registry::AgentRecord,
-    /// [`crate::registry::in_turn`], as of this read.
+    /// [`crate::turn::Ledger::in_turn`], as of this read.
     pub(crate) in_turn: bool,
 }
 
@@ -240,31 +240,13 @@ fn read_session(live: &crate::registry::Session) -> Session {
     let cwd = or_unknown(&meta.cwd);
     let cmd = or_unknown(meta.agent());
 
-    // 1 MB tail: big enough to contain a full screen repaint for rendering.
-    let (state, title) = match read_tail(&live.files.raw, 1024 * 1024) {
-        Some(buf) => {
-            // Prefer the child's *live* pty size (accurate, survives resize and
-            // missing meta); fall back to meta, then a sane default.
-            let (rows, cols) = crate::procfs::live_pty_size(child_pid)
-                .or_else(|| Some((meta.rows?, meta.cols?)))
-                .unwrap_or((24, 80));
-            let screen = crate::detect::render(&buf, rows, cols);
-            let title = current_title(&buf).unwrap_or_default();
-            let agent = crate::vendor::herdr_detect::identify_agent(&cmd);
-            let detection = crate::vendor::herdr_detect::detect_agent_with_osc(
-                agent, &screen, &title, "",
-            );
-            // The same title the engine classifies on is also the one the HUD
-            // can label the row with — parsed once, used twice.
-            (State::from(detection.state), conversation_title(&title))
-        }
-        None => (State::Unknown, String::new()),
-    };
+    // Prefer the child's *live* pty size (accurate, survives resize and
+    // missing meta); fall back to meta, then a sane default.
+    let size = crate::procfs::live_pty_size(child_pid).or_else(|| Some((meta.rows?, meta.cols?)));
+    let (screen, title) = detect_screen(&live.files.raw, size, &cmd).unwrap_or((State::Unknown, String::new()));
 
     let now = crate::clock::unix_now();
-    let record = observe_state(&live.files, state, now, false);
-    let agent = crate::registry::read_agent(&live.files);
-    let in_turn = crate::registry::in_turn(&agent, Some(&record));
+    let (state, record, agent, in_turn) = settle(&live.files, &cmd, screen, now, false);
     // Present unacknowledged completions as their own state.
     let state = if state == State::Idle && !record.seen {
         State::Done
@@ -286,6 +268,56 @@ fn read_session(live: &crate::registry::Session) -> Session {
         depth: meta.depth,
         agent,
         in_turn,
+    }
+}
+
+/// Classify the screen the tee's tail renders to, at `size` (rows, cols;
+/// 80×24 when unknown): the engine's verdict, and the conversation title the
+/// agent stamped into the window title — parsed once, used twice. None when
+/// there is no tee to read.
+fn detect_screen(raw: &Path, size: Option<(u16, u16)>, cmd: &str) -> Option<(State, String)> {
+    // 1 MB tail: big enough to contain a full screen repaint for rendering.
+    let buf = read_tail(raw, 1024 * 1024)?;
+    let (rows, cols) = size.unwrap_or((24, 80));
+    let screen = crate::detect::render(&buf, rows, cols);
+    let title = current_title(&buf).unwrap_or_default();
+    let agent = crate::vendor::herdr_detect::identify_agent(cmd);
+    let detection = crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "");
+    Some((State::from(detection.state), conversation_title(&title)))
+}
+
+/// Fold what the screen shows together with the turn ledger, record it in
+/// `.state`, and report (the fused state, the record, the ledger, whether
+/// the agent is in a turn).
+///
+/// For an agent whose turns come from hooks the ledger is exact where the
+/// screen is not — Claude streams a plain-text answer with no spinner, which
+/// the detector reads as idle — so: blocked (screen) wins; else in a turn →
+/// working; else the screen's verdict. Recording the fused state (rather
+/// than the raw one) is what keeps the done marker and the "finished"
+/// notification from firing mid-answer. Screen adapters record the screen,
+/// and their turn rule then reads it back.
+fn settle(
+    files: &Files,
+    cmd: &str,
+    screen: State,
+    now: u64,
+    mark_unseen: bool,
+) -> (State, StateRecord, crate::registry::AgentRecord, bool) {
+    let agent = crate::registry::read_agent(files);
+    let ledger = crate::turn::Ledger::for_command(cmd);
+    if ledger.turns == crate::adapter::Turns::Hook {
+        let in_turn = ledger.in_turn(&agent, None);
+        let shown = if in_turn && screen != State::Blocked {
+            State::Working
+        } else {
+            screen
+        };
+        (shown, observe_state(files, shown, now, mark_unseen), agent, in_turn)
+    } else {
+        let record = observe_state(files, screen, now, mark_unseen);
+        let in_turn = ledger.in_turn(&agent, Some(&record));
+        (screen, record, agent, in_turn)
     }
 }
 
@@ -352,18 +384,12 @@ pub(crate) fn ack_session(id: u64) {
 /// thread: re-classify from the teed tail and stamp the sidecar on
 /// transitions (marking a working→idle completion as unseen — the "done"
 /// state). This is what keeps "idle for" truthful while no HUD or status
-/// invocation is watching. Returns the detected engine state plus whether
-/// the completion has been seen, so the caller can notify and acknowledge.
+/// invocation is watching. Returns the state (the screen fused with the turn
+/// ledger, see `settle`) plus whether the completion has been
+/// seen, so the caller can notify and acknowledge.
 pub(crate) fn track_session(files: &Files, cmd: &str, child_pid: u64) -> Option<(State, bool)> {
-    let buf = read_tail(&files.raw, 1024 * 1024)?;
-    let (rows, cols) = crate::procfs::live_pty_size(child_pid).unwrap_or((24, 80));
-    let screen = crate::detect::render(&buf, rows, cols);
-    let title = current_title(&buf).unwrap_or_default();
-    let agent = crate::vendor::herdr_detect::identify_agent(cmd);
-    let state = State::from(
-        crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
-    );
-    let record = observe_state(files, state, crate::clock::unix_now(), true);
+    let (screen, _) = detect_screen(&files.raw, crate::procfs::live_pty_size(child_pid), cmd)?;
+    let (state, record, _, _) = settle(files, cmd, screen, crate::clock::unix_now(), true);
     Some((state, record.seen))
 }
 
