@@ -204,14 +204,7 @@ pub(crate) fn stop(target: &str, force: bool) -> i32 {
 
 /// Send `request` to `target`'s wrapper, print the reply, return its code.
 fn exchange(cmd: &str, target: &str, request: &Request, bound: Duration) -> i32 {
-    let session = match registry::resolve_target(target) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("seagents {cmd}: {e}");
-            return 1;
-        }
-    };
-    match call(&session, request, bound + REPLY_SLACK) {
+    match ask(target, request, bound) {
         Ok(reply) => {
             println!("{}", serde_json::to_string(&reply).unwrap_or_default());
             if let Some(e) = &reply.error {
@@ -224,6 +217,15 @@ fn exchange(cmd: &str, target: &str, request: &Request, bound: Duration) -> i32 
             1
         }
     }
+}
+
+/// Resolve `target` and carry `request` to its wrapper: the reply, or why
+/// there is none. `bound` is how long the request itself may take (a `send`'s
+/// idle wait; zero for `stop`, whose grace periods the slack covers). The one
+/// client: the CLI and the HUD's keys both come through here.
+pub(crate) fn ask(target: &str, request: &Request, bound: Duration) -> Result<Reply, String> {
+    let session = registry::resolve_target(target)?;
+    call(&session, request, bound + REPLY_SLACK)
 }
 
 /// One request/reply round trip with `session`'s wrapper.

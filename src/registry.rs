@@ -534,6 +534,17 @@ fn mint_tag(cwd: &Path, taken: &HashSet<String>, reserved: &HashSet<String>) -> 
     }
 }
 
+/// Whether `tag` is one [`mint_tag`] would have made for `cwd` — the
+/// directory's name plus four hex digits of noise. Such a tag says nothing the
+/// directory doesn't, so a display that has room for one name shows the
+/// directory; a tag somebody chose (`spawn --tag reviewer`) names the agent
+/// better than where it runs.
+pub(crate) fn minted_from(tag: &str, cwd: &Path) -> bool {
+    tag.strip_prefix(tag_base(cwd).as_str())
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|hex| hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The name a new session will be created under, with the cache-wide tags lock
 /// still held. Only [`TagClaim::create_meta`] turns it into a session, and it
 /// releases the lock when it has — so from the uniqueness check to the `.meta`
@@ -1334,6 +1345,17 @@ mod tests {
             assert!(valid_tag(&tag), "{cwd} -> {tag}");
             let (_, hex) = tag.rsplit_once('-').unwrap();
             assert!(hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()), "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_minted_tag_is_recognised_as_minted_and_a_chosen_one_is_not() {
+        let cwd = Path::new("/home/u/My Project!");
+        let tag = mint_tag(cwd, &HashSet::new(), &HashSet::new());
+        assert!(minted_from(&tag, cwd), "{tag}");
+        assert!(minted_from("my-project-00af", cwd));
+        for chosen in ["reviewer", "my-project", "my-project-x", "my-project-00afx", "my-project-zzzz", "other-00af"] {
+            assert!(!minted_from(chosen, cwd), "{chosen}");
         }
     }
 

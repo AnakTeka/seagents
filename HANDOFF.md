@@ -33,7 +33,7 @@ All four milestones are **code-complete and on `main`**:
 | transparent launcher (pty-tee) | `seagents run <cmd>` | done, verified feels native |
 | status detection | `seagents status` | done; blocked/working/idle verified live |
 | focus the agent's i3 window | `seagents focus <child_pid>` | done; con_id fix **committed but not yet live-verified** |
-| floating HUD | `seagents hud` | done; works, j/k preview + click-to-focus |
+| floating HUD | `seagents hud` | done; works, j/k preview + click-to-focus; lineage tree, tags, send/stop keys |
 | reboot survival | `seagents snapshot` / `restore` | done; round-trip verified in a nested X (`tools/test-restore.sh`) |
 
 Focus identity is exact-handle only (no title matching since 2026-07-14), so
@@ -176,14 +176,18 @@ keep focus on HUD); `g`/`G` = first/last row (vim-style, also previews);
 `s` = cycle sort (urgency → dir → recent; remembered across launches);
 `t` = cycle the name columns — **both** (directory + title, the default) →
 **title** only → **dir** only (remembered across launches);
+`p` = send the selected agent a prompt (a one-line input in the footer; Enter
+sends, Esc cancels); `x` = stop the selected agent (asks y/n);
 `?` = the full key list, as an overlay (the footer hint is one line and a
 floating window clips it); `r` = refresh now; `q`/`Esc` = quit.
 
 While the `?` overlay is up it owns the keyboard: any key but `q` dismisses it
 rather than acting, so a keystroke aimed at the overlay can't navigate the list
 underneath. It draws over the agent list (no room for both in a floating
-window), and if the window is too short for all nine bindings the bottom border
-says `▼ n more` — otherwise `q / esc` would silently fall off the end.
+window), and if the window is too short for all eleven bindings the bottom border
+says `▼ n more` — otherwise `q / esc` would silently fall off the end. The send
+line and the stop confirmation own the keyboard the same way (`q` there is a
+letter).
 
 ---
 
@@ -604,6 +608,44 @@ knowing:
 - Column widths are measured once per frame (`Cols::measure`) and shared by
   every row, so the columns line up; a frame in which no agent has named its
   conversation draws no title column at all rather than a block of blanks.
+
+**Lineage.** `lineage()` turns the sorted list into a forest: every spawned
+agent directly under its parent, its name behind `└ ` (two more columns per
+generation). The marker sits *in the name column*, so the dot, state and time
+columns stay aligned. The sort still decides, one level at a time, but a family
+is placed where its **highest-sorted member** would be: under urgency a child
+blocked on a prompt lifts its whole family to the top rather than hiding under
+an idle parent. A child whose parent is not live is a top-level row, and a
+parent cycle (only a hand-edited `.meta` could make one) costs no row.
+
+**Tags.** The name column shows `@tag` when somebody chose the tag
+(`spawn --tag reviewer`) and the directory when `run` minted it
+(`registry::minted_from`: the directory's tag base plus four hex digits, which
+says nothing the directory doesn't). Spawned children usually run in their
+parent's directory, so without the tag a fleet reads as N rows all named
+`seagents`. Title mode is unchanged: the title names the row.
+
+**Send / stop from the HUD** (`p`, `x`) go through `send::ask`, the one socket
+client `seagents send`/`stop` also use, on a background thread (a send is held
+until the agent is idle; a stop takes its grace periods), and the outcome lands
+in the footer: `sent to @w · stops 3` (the `wait --after` baseline), `stopped
+@w`, or the wrapper's own refusal text. The HUD is a human caller, so the
+lineage rule never refuses it; the blocked refusal still applies, and `p` on a
+blocked row says so at once rather than after the prompt is typed — Enter
+jumps to the window, where the gate is answered. There is deliberately no
+answer-the-gate key: what `1` picks differs per gate, and approving one
+unseen from a list row is the thing the blocked refusal exists to prevent.
+The target is fixed when the input opens, since rows move under the urgency
+sort. Bracketed paste is on, so a pasted multi-line prompt arrives whole
+(newlines show as `↵` in the one-line input); typed prompt text is never
+written to `SEAGENTS_HUD_LOG`.
+
+Verified live (tmux, 120×40, scratch HOME): `run --tag p bash`, `run --tag c
+--parent p bash` and a haiku `run --tag w --parent p claude` render as `@p`
+with `└ @w`/`└ @c` under it; `p` on `@w` sent a prompt (footer `sent to @w ·
+stops 0`), the row read `working` for the ~5 s the plain-text answer streamed
+(the ledger, not the screen — Claude shows no spinner there) and `status
+--json` went to `stops: 1`; `x`, `y` on `@c` → `stopped @c`, row gone.
 
 Both view modes persist in `state_dir()` — one word per file (`hud-sort`,
 `hud-label`: `urgency|dir|recent`, `both|title|dir`) — so the setting survives

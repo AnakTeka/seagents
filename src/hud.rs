@@ -2,15 +2,20 @@
 //!
 //! A ratatui panel meant to run in an i3 floating window. It polls the same
 //! session data as `seagents status`, colour-codes each agent by state, and on
-//! Enter or left-click focuses that agent's i3 window (milestone 3). Everything
-//! underneath is already proven — this is assembly.
+//! Enter or left-click focuses that agent's i3 window (milestone 3). Spawned
+//! agents sit under the agent that spawned them, and the selected row can be
+//! sent a prompt or stopped through the same control socket `seagents send` /
+//! `stop` use.
 
+use std::collections::HashMap;
 use std::io;
+use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -19,6 +24,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
+use crate::send::{Mode, Reply, Request};
 use crate::status::{self, Session, State};
 
 const REFRESH: Duration = Duration::from_millis(750);
@@ -32,7 +38,10 @@ pub fn run() -> i32 {
         return 1;
     }
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+    // Bracketed paste so a prompt pasted into the send line arrives as one
+    // event: unbracketed, its first newline would be an Enter and submit the
+    // first line alone.
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
@@ -47,6 +56,7 @@ pub fn run() -> i32 {
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     );
@@ -94,29 +104,226 @@ impl Label {
     }
 }
 
-/// How to refer to a row in the footer — the directory, which is short and
-/// always there, except in title mode where the title *is* the row's name.
-fn label_of(s: &Session, labels: Label) -> &str {
-    match labels {
-        Label::Title if !s.title.is_empty() => &s.title,
-        _ => &s.dir,
+/// The row's name in its directory column: the agent's tag where somebody
+/// chose it (`@reviewer`), else the directory. A tag `run` minted is the
+/// directory plus four hex digits of noise — it says nothing the directory
+/// doesn't, and every hand-started agent has one — while a chosen tag is the
+/// name the agent is addressed by, and a spawned child usually runs in its
+/// parent's directory, where the directory would name every row of the fleet
+/// alike. `@` because that is how a target is spelled on the command line.
+fn name_of(s: &Session) -> String {
+    if s.tag.is_empty() || crate::registry::minted_from(&s.tag, Path::new(&s.cwd)) {
+        s.dir.clone()
+    } else {
+        format!("@{}", s.tag)
     }
 }
 
+/// How to refer to a row in the footer — its name column, which is short and
+/// always there, except in title mode where the title *is* the row's name.
+fn label_of(s: &Session, labels: Label) -> String {
+    match labels {
+        Label::Title if !s.title.is_empty() => s.title.clone(),
+        _ => name_of(s),
+    }
+}
+
+/// How the socket client addresses a row: its tag, or its child pid for a
+/// session whose wrapper predates tags (the one resolver takes either).
+fn target_of(s: &Session) -> String {
+    if s.tag.is_empty() {
+        s.pid.to_string()
+    } else {
+        s.tag.clone()
+    }
+}
+
+/// One line of the list: a session and how deep it sits in the lineage tree
+/// on screen (0 for a top-level row).
+struct Row {
+    s: Session,
+    level: usize,
+}
+
+/// A keystroke-owning footer: while one is up, keys edit it instead of
+/// driving the list. The target is fixed when it opens — rows move under
+/// the urgency and recent sorts, and a prompt typed for one agent must not
+/// land in whichever row slid under the cursor meanwhile.
+enum Input {
+    /// Typing a prompt for `target` (`name` is how the footer shows it).
+    Prompt { target: String, name: String, text: String },
+    /// Asking before stopping `target`.
+    ConfirmStop { target: String, name: String },
+}
+
 struct App {
-    sessions: Vec<Session>,
+    rows: Vec<Row>,
     list: ListState,
     sort: status::Sort,
     labels: Label,
     /// The `?` key list is up. It owns the keyboard while open, so a keystroke
     /// aimed at it can't quietly drive the list underneath.
     help: bool,
+    input: Option<Input>,
     message: String,
+    /// Outcomes of sends/stops, which run off the event loop (a send is held
+    /// until its agent is idle — up to minutes) and report here when done.
+    done_tx: mpsc::Sender<String>,
+    done_rx: mpsc::Receiver<String>,
     /// Screen y of the first agent row, cached each frame for mouse hit-testing.
     rows_top: u16,
     /// con_id of the HUD's own window, so previews can return focus to it.
     /// Captured lazily on the first preview, when the HUD is definitely focused.
     hud_con_id: Option<u64>,
+}
+
+impl App {
+    fn new(sessions: Vec<Session>, sort: status::Sort, labels: Label, message: String) -> App {
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut app = App {
+            rows: lineage(sessions),
+            list: ListState::default(),
+            sort,
+            labels,
+            help: false,
+            input: None,
+            message,
+            done_tx,
+            done_rx,
+            rows_top: 1,
+            hud_con_id: None,
+        };
+        if !app.rows.is_empty() {
+            app.list.select(Some(0));
+        }
+        app
+    }
+
+    fn selected(&self) -> Option<&Session> {
+        self.list.selected().and_then(|i| self.rows.get(i)).map(|r| &r.s)
+    }
+}
+
+/// Order a sorted list as a lineage forest: every spawned agent directly
+/// under its parent, indented one level per generation. An agent whose parent
+/// is not live (or who has none) is a top-level row.
+///
+/// The sort still decides, one level at a time: a family is placed where its
+/// **highest-sorted member** would be, and siblings likewise. So under
+/// urgency a child blocked on a permission prompt lifts its whole family to
+/// the top, rather than hiding under an idle parent at the bottom — the HUD's
+/// one job is to show who needs you — and the families stay contiguous in
+/// every sort.
+fn lineage(sorted: Vec<Session>) -> Vec<Row> {
+    let n = sorted.len();
+    let parent: Vec<Option<usize>> = {
+        let at: HashMap<&str, usize> = sorted
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.tag.is_empty())
+            .map(|(i, s)| (s.tag.as_str(), i))
+            .collect();
+        sorted
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                s.parent
+                    .as_deref()
+                    .and_then(|p| at.get(p).copied())
+                    .filter(|&p| p != i)
+            })
+            .collect()
+    };
+    let mut children = vec![Vec::new(); n];
+    for (i, p) in parent.iter().enumerate() {
+        if let Some(p) = *p {
+            children[p].push(i);
+        }
+    }
+
+    // Each row is claimed by exactly one tree. Rows no root reaches — only a
+    // parent cycle, which tags make near-impossible but a hand-edited `.meta`
+    // could make — become roots themselves rather than vanishing.
+    struct Forest {
+        children: Vec<Vec<usize>>,
+        claimed: Vec<bool>,
+        /// Tree children, once claimed.
+        kids: Vec<Vec<usize>>,
+        /// The best sort position anywhere in the subtree.
+        key: Vec<usize>,
+    }
+    impl Forest {
+        fn claim(&mut self, i: usize) -> usize {
+            self.claimed[i] = true;
+            let mut key = i;
+            for c in self.children[i].clone() {
+                if !self.claimed[c] {
+                    self.kids[i].push(c);
+                    key = key.min(self.claim(c));
+                }
+            }
+            self.key[i] = key;
+            key
+        }
+
+        fn emit(&self, i: usize, level: usize, out: &mut Vec<(usize, usize)>) {
+            out.push((i, level));
+            let mut kids = self.kids[i].clone();
+            kids.sort_by_key(|&c| self.key[c]);
+            for c in kids {
+                self.emit(c, level + 1, out);
+            }
+        }
+    }
+    let mut forest = Forest {
+        children,
+        claimed: vec![false; n],
+        kids: vec![Vec::new(); n],
+        key: (0..n).collect(),
+    };
+    let mut roots = Vec::new();
+    for i in (0..n).filter(|&i| parent[i].is_none()) {
+        roots.push(i);
+        forest.claim(i);
+    }
+    for i in 0..n {
+        if !forest.claimed[i] {
+            roots.push(i);
+            forest.claim(i);
+        }
+    }
+    roots.sort_by_key(|&r| forest.key[r]);
+    let mut order = Vec::with_capacity(n);
+    for r in roots {
+        forest.emit(r, 0, &mut order);
+    }
+
+    let mut slots: Vec<Option<Session>> = sorted.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|(i, level)| slots[i].take().map(|s| Row { s, level }))
+        .collect()
+}
+
+/// A mouse report torn across a read boundary surfaces as a bare Esc key
+/// (seen live during an i3 $mod+drag of the HUD window). A torn sequence's
+/// tail arrives as garbage *key* events right behind the Esc; pending
+/// mouse-motion events are unrelated and must not veto the Esc (motion
+/// streams continuously under mode 1003, so "any pending input" would
+/// suppress Esc whenever the pointer is moving). True when the Esc was torn.
+fn torn_escape() -> bool {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    while event::poll(Duration::from_millis(25)).unwrap_or(false) {
+        match event::read() {
+            Ok(Event::Key(_)) => return true,
+            Ok(_) => {} // motion/resize: irrelevant, drop
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+    false
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
@@ -139,26 +346,22 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
         };
     }
     let sort = load_sort();
-    let mut app = App {
-        sessions: status::collect(sort),
-        list: ListState::default(),
+    let mut app = App::new(
+        status::collect(sort),
         sort,
-        labels: load_labels(),
-        help: false,
+        load_labels(),
         // Surface detection-rule update problems where they'll be seen; the
         // help line is one keypress away from rediscovery.
-        message: crate::detect::manifest_health_warning()
+        crate::detect::manifest_health_warning()
             .map(|w| format!("⚠ {w}"))
             .unwrap_or_else(help_line),
-        rows_top: 1,
-        hud_con_id: None,
-    };
-    if !app.sessions.is_empty() {
-        app.list.select(Some(0));
-    }
+    );
     let mut last_refresh = Instant::now();
 
     loop {
+        while let Ok(outcome) = app.done_rx.try_recv() {
+            app.message = outcome;
+        }
         if terminal.draw(|f| draw(f, &mut app)).is_err() {
             return 1;
         }
@@ -166,8 +369,23 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
         let timeout = REFRESH.saturating_sub(last_refresh.elapsed());
         if event::poll(timeout).unwrap_or(false) {
             let ev = event::read();
-            hud_log!("{ev:?}");
+            // Never log what is typed into the send line: prompt text stays
+            // out of every log (HANDOFF §9).
+            match (&ev, app.input.is_some()) {
+                (Ok(Event::Key(_) | Event::Paste(_)), true) => hud_log!("input-line event"),
+                _ => hud_log!("{ev:?}"),
+            }
             match ev {
+                // The send line / stop confirmation owns the keyboard, like
+                // the overlay: `q` there is a letter, not quit.
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press && app.input.is_some() => {
+                    input_key(&mut app, k)
+                }
+                Ok(Event::Paste(text)) => {
+                    if let Some(Input::Prompt { text: line, .. }) = app.input.as_mut() {
+                        line.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    }
+                }
                 // While the key list is up it owns the keyboard: anything but
                 // `q` dismisses it instead of acting, so a keystroke aimed at
                 // the overlay can't secretly navigate the list underneath.
@@ -184,30 +402,8 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                         hud_log!("exit: quit key {:?}", k);
                         return 0;
                     }
-                    // A mouse report torn across a read boundary surfaces as a
-                    // bare Esc key (seen live during an i3 $mod+drag of the HUD
-                    // window). A torn sequence's tail arrives as garbage *key*
-                    // events right behind the Esc; pending mouse-motion events
-                    // are unrelated and must not veto the quit (motion streams
-                    // continuously under mode 1003, so "any pending input"
-                    // would suppress Esc whenever the pointer is moving).
                     KeyCode::Esc => {
-                        let deadline = Instant::now() + Duration::from_millis(50);
-                        let mut torn = false;
-                        while event::poll(Duration::from_millis(25)).unwrap_or(false) {
-                            match event::read() {
-                                Ok(Event::Key(_)) => {
-                                    torn = true;
-                                    break;
-                                }
-                                Ok(_) => {} // motion/resize: irrelevant, drop
-                                Err(_) => break,
-                            }
-                            if Instant::now() >= deadline {
-                                break;
-                            }
-                        }
-                        if torn {
+                        if torn_escape() {
                             hud_log!("ignored Esc: torn escape sequence");
                         } else {
                             hud_log!("exit: quit key {:?}", k);
@@ -220,10 +416,19 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     // same preview-on-move behavior as j/k).
                     KeyCode::Char('g') => jump_selection(&mut app, 0),
                     KeyCode::Char('G') => {
-                        let last = app.sessions.len().saturating_sub(1);
+                        let last = app.rows.len().saturating_sub(1);
                         jump_selection(&mut app, last);
                     }
                     KeyCode::Enter => focus_selected(&mut app),
+                    KeyCode::Char('p') => open_prompt(&mut app),
+                    KeyCode::Char('x') => {
+                        if let Some(s) = app.selected() {
+                            app.input = Some(Input::ConfirmStop {
+                                target: target_of(s),
+                                name: name_of(s),
+                            });
+                        }
+                    }
                     KeyCode::Char('s') => {
                         app.sort = app.sort.next();
                         save_sort(app.sort);
@@ -246,7 +451,9 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     }
                     _ => {}
                 },
-                Ok(Event::Mouse(m)) => match m.kind {
+                // The mouse drives the list only; with a footer open, a click
+                // would move the selection away from the row being addressed.
+                Ok(Event::Mouse(m)) if app.input.is_none() => match m.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(idx) = row_at(&app, m.row) {
                             app.list.select(Some(idx));
@@ -271,26 +478,114 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
     }
 }
 
+/// Open the send line for the selected row. A blocked row is turned away
+/// here rather than after the prompt is typed: the wrapper would refuse it
+/// anyway (only the window answers a gate — Enter jumps there), and losing a
+/// typed prompt to a refusal is worse than not starting one. The wrapper
+/// still decides; this only spares the typing.
+fn open_prompt(app: &mut App) {
+    let Some(s) = app.selected() else {
+        return;
+    };
+    let name = name_of(s);
+    if s.state == State::Blocked {
+        app.message = format!("{name} is blocked at a prompt · enter to answer it there");
+        return;
+    }
+    app.input = Some(Input::Prompt {
+        target: target_of(s),
+        name,
+        text: String::new(),
+    });
+}
+
+/// A key while the footer is an input: edit the prompt, or answer y/n.
+fn input_key(app: &mut App, k: KeyEvent) {
+    let Some(input) = app.input.take() else {
+        return;
+    };
+    match input {
+        Input::Prompt { target, name, mut text } => match k.code {
+            KeyCode::Enter if text.trim().is_empty() => app.message = "nothing to send".into(),
+            KeyCode::Enter => {
+                app.message = format!("sending to {name} · waits until it is idle");
+                dispatch(app, name, target, Request::Send {
+                    text,
+                    mode: Mode::Paste,
+                    submit: true,
+                    now: false,
+                    answer_permission: false,
+                    timeout_ms: Some(crate::send::DEFAULT_TIMEOUT.as_millis() as u64),
+                });
+            }
+            KeyCode::Esc if !torn_escape() => app.message = help_line(),
+            KeyCode::Backspace => {
+                text.pop();
+                app.input = Some(Input::Prompt { target, name, text });
+            }
+            // Ctrl+U clears the line, as in a shell.
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input = Some(Input::Prompt { target, name, text: String::new() });
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                text.push(c);
+                app.input = Some(Input::Prompt { target, name, text });
+            }
+            _ => app.input = Some(Input::Prompt { target, name, text }),
+        },
+        Input::ConfirmStop { target, name } => {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                app.message = format!("stopping {name}…");
+                dispatch(app, name, target, Request::Stop { force: false });
+            } else {
+                app.message = format!("left {name} running");
+            }
+        }
+    }
+}
+
+/// Carry a request to a wrapper off the event loop — a send is held until
+/// its agent is idle, a stop takes its grace periods — through the same
+/// client `seagents send`/`stop` use, and post the outcome to the footer.
+fn dispatch(app: &App, name: String, target: String, request: Request) {
+    let done = app.done_tx.clone();
+    std::thread::spawn(move || {
+        let bound = match &request {
+            Request::Send { timeout_ms, .. } => Duration::from_millis(timeout_ms.unwrap_or(0)),
+            Request::Stop { .. } => Duration::ZERO,
+        };
+        let reply = crate::send::ask(&target, &request, bound);
+        let _ = done.send(outcome(&request, &name, reply));
+    });
+}
+
+/// The footer line for a finished send/stop: what happened, or the wrapper's
+/// own words for why not (they name the gate, the lineage rule, …).
+fn outcome(request: &Request, name: &str, reply: Result<Reply, String>) -> String {
+    match (request, reply) {
+        (Request::Send { .. }, Ok(r)) if r.ok => {
+            // The baseline `wait --after` takes: the turn it opened ends at
+            // stops + 1.
+            format!("sent to {name} · stops {}", r.stops.unwrap_or(0))
+        }
+        (Request::Stop { .. }, Ok(r)) if r.ok => format!("stopped {name}"),
+        (_, Ok(r)) => format!("{name}: {}", r.error.unwrap_or_else(|| "refused".into())),
+        (_, Err(e)) => format!("{name}: {e}"),
+    }
+}
+
 fn refresh(app: &mut App) {
     // Follow the selected *session*, not its row index — under the urgency and
     // recent sorts, rows move as states change.
-    let selected_id = app
-        .list
-        .selected()
-        .and_then(|i| app.sessions.get(i))
-        .map(|s| s.id);
-    app.sessions = status::collect(app.sort);
-    let followed = selected_id.and_then(|id| app.sessions.iter().position(|s| s.id == id));
+    let selected_id = app.selected().map(|s| s.id);
+    app.rows = lineage(status::collect(app.sort));
+    let followed = selected_id.and_then(|id| app.rows.iter().position(|r| r.s.id == id));
     match followed {
         Some(i) => app.list.select(Some(i)),
-        None if app.sessions.is_empty() => app.list.select(None),
+        None if app.rows.is_empty() => app.list.select(None),
         // Selected session ended: clamp the old index into range.
         None => {
-            let i = app
-                .list
-                .selected()
-                .unwrap_or(0)
-                .min(app.sessions.len() - 1);
+            let i = app.list.selected().unwrap_or(0).min(app.rows.len() - 1);
             app.list.select(Some(i));
         }
     }
@@ -310,6 +605,8 @@ fn help_rows() -> &'static [(&'static str, &'static str)] {
         ("g/G", "first / last row"),
         ("enter", "jump to the agent"),
         ("click", "jump to that row"),
+        ("p", "send the agent a prompt"),
+        ("x", "stop the agent (asks y/n)"),
         ("s", "sort: urgency/dir/recent"),
         ("t", "columns: both/title/dir"),
         ("r", "refresh now"),
@@ -406,15 +703,15 @@ fn save_labels(labels: Label) {
 
 /// Select an absolute row (g/G), previewing like relative navigation does.
 fn jump_selection(app: &mut App, idx: usize) {
-    if app.sessions.is_empty() {
+    if app.rows.is_empty() {
         return;
     }
-    app.list.select(Some(idx.min(app.sessions.len() - 1)));
+    app.list.select(Some(idx.min(app.rows.len() - 1)));
     preview_selected(app);
 }
 
 fn move_selection(app: &mut App, delta: isize) {
-    let n = app.sessions.len();
+    let n = app.rows.len();
     if n == 0 {
         return;
     }
@@ -432,15 +729,12 @@ fn preview_selected(app: &mut App) {
     if app.hud_con_id.is_none() {
         app.hud_con_id = crate::window::focused_con_id();
     }
-    let Some(i) = app.list.selected() else {
-        return;
-    };
-    let Some(s) = app.sessions.get(i) else {
+    let Some(s) = app.selected() else {
         return;
     };
     // Looking at it counts as seeing it: done → idle.
     status::ack_session(s.id);
-    let name = label_of(s, app.labels).to_string();
+    let name = label_of(s, app.labels);
     match crate::window::preview_window(s.pid, app.hud_con_id) {
         Ok(()) => app.message = format!("previewing {name} · enter to jump"),
         Err(e) => app.message = e,
@@ -448,14 +742,11 @@ fn preview_selected(app: &mut App) {
 }
 
 fn focus_selected(app: &mut App) {
-    let Some(i) = app.list.selected() else {
-        return;
-    };
-    let Some(s) = app.sessions.get(i) else {
+    let Some(s) = app.selected() else {
         return;
     };
     status::ack_session(s.id);
-    let name = label_of(s, app.labels).to_string();
+    let name = label_of(s, app.labels);
     match crate::window::focus_window(s.pid) {
         Ok(()) => app.message = format!("focused {name} ({})", s.cmd),
         Err(e) => app.message = e,
@@ -467,7 +758,7 @@ fn focus_selected(app: &mut App) {
 /// visible row is not session 0).
 fn row_at(app: &App, row: u16) -> Option<usize> {
     let idx = row.checked_sub(app.rows_top)? as usize + app.list.offset();
-    (idx < app.sessions.len()).then_some(idx)
+    (idx < app.rows.len()).then_some(idx)
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -476,7 +767,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Rows start one line below the block's top border.
     app.rows_top = body.y + 1;
 
-    if app.sessions.is_empty() {
+    if app.rows.is_empty() {
         let empty = Paragraph::new("no agents tracked; launch one with `seagents run claude`")
             .block(agent_block(app.sort, app.labels, 0, 0))
             .style(Style::default().fg(Color::DarkGray));
@@ -485,7 +776,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         // Pre-apply the same scroll clamp the List does during render, so the
         // clipped-row indicators describe *this* frame, not the previous one.
         let visible = body.height.saturating_sub(2) as usize; // minus borders
-        let total = app.sessions.len();
+        let total = app.rows.len();
         let mut offset = app.list.offset();
         if let Some(sel) = app.list.selected() {
             if visible > 0 && sel >= offset + visible {
@@ -508,11 +799,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             .saturating_sub(2)
             .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16)
             as usize;
-        let cols = Cols::measure(&app.sessions);
+        let cols = Cols::measure(app.rows.iter().map(|r| (&r.s, r.level)));
         let items: Vec<ListItem> = app
-            .sessions
+            .rows
             .iter()
-            .map(|s| session_row(s, row_width, &cols, app.labels))
+            .map(|r| ListItem::new(session_line(&r.s, r.level, row_width, &cols, app.labels)))
             .collect();
         let list = List::new(items)
             .block(agent_block(app.sort, app.labels, above, below))
@@ -528,8 +819,57 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(help_panel(body.height), body);
     }
 
-    let footer = Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, chunks[1]);
+    let footer = chunks[1];
+    match &app.input {
+        None => f.render_widget(
+            Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::DarkGray)),
+            footer,
+        ),
+        Some(input) => {
+            let (line, cursor) = input_line(input, footer.width as usize);
+            f.render_widget(Paragraph::new(line), footer);
+            if let Some(x) = cursor {
+                f.set_cursor_position((footer.x + x as u16, footer.y));
+            }
+        }
+    }
+}
+
+/// The footer while it is an input, fitted to `width`, and the cursor column
+/// for a prompt. A prompt longer than the line shows its **end** — the part
+/// being typed — behind a `…`; newlines from a paste show as `↵` (they are
+/// sent as typed: the line is one row, the prompt need not be).
+fn input_line(input: &Input, width: usize) -> (Line<'static>, Option<usize>) {
+    match input {
+        Input::Prompt { name, text, .. } => {
+            let head = format!("send {name} › ");
+            let shown: String = text.chars().map(|c| if c == '\n' { '↵' } else { c }).collect();
+            // One column is kept for the cursor after the last character.
+            let room = width.saturating_sub(head.chars().count() + 1);
+            let n = shown.chars().count();
+            let tail = if n > room {
+                let keep = room.saturating_sub(1);
+                format!("…{}", shown.chars().skip(n - keep).collect::<String>())
+            } else {
+                shown
+            };
+            let cursor = head.chars().count() + tail.chars().count();
+            (
+                Line::from(vec![
+                    Span::styled(head, Style::default().fg(Color::Cyan)),
+                    Span::raw(tail),
+                ]),
+                Some(cursor.min(width.saturating_sub(1))),
+            )
+        }
+        Input::ConfirmStop { name, .. } => (
+            Line::from(Span::styled(
+                format!("stop {name}? y/n"),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            None,
+        ),
+    }
 }
 
 fn agent_block(
@@ -573,15 +913,27 @@ fn agent_block(
 /// the whole list, so it comes out of the space each row has to lay out in.
 const HIGHLIGHT_SYMBOL: &str = "▶ ";
 
+/// The lineage marker in front of a row's name: nothing at the top level,
+/// `└ ` under a parent, two more columns per further generation. In the name
+/// column rather than at the row's start, so the state and time columns stay
+/// aligned down the whole list.
+fn tree_prefix(level: usize) -> String {
+    match level {
+        0 => String::new(),
+        n => format!("{}└ ", "  ".repeat(n - 1)),
+    }
+}
+
 /// Column measurements taken once per frame and shared by every row, so the
 /// columns line up: sizing each row to its own contents makes the list ragged.
 struct Cols {
     /// Widest duration on screen. Sized from the data because it is the one
     /// column that is never allowed to truncate.
     time_w: usize,
-    /// Width of the directory column when a title column sits beside it: the
-    /// longest name on screen, capped so one deep project name (they run to
-    /// `20260612_doc_parser` here) can't eat the title's space.
+    /// Width of the name column when a title column sits beside it: the
+    /// longest name on screen (tree prefix included), capped so one deep
+    /// project name (they run to `20260612_doc_parser` here) can't eat the
+    /// title's space.
     dir_w: usize,
     /// Whether any agent on screen has named its conversation. When none has,
     /// `both` draws no title column rather than a frame of blanks.
@@ -591,26 +943,24 @@ struct Cols {
 impl Cols {
     const DIR_CAP: usize = 18;
 
-    fn measure(sessions: &[Session]) -> Cols {
+    fn measure<'a>(rows: impl IntoIterator<Item = (&'a Session, usize)> + Clone) -> Cols {
         Cols {
-            time_w: sessions
-                .iter()
-                .map(|s| crate::status::humanize_secs(s.state_secs).chars().count())
+            time_w: rows
+                .clone()
+                .into_iter()
+                .map(|(s, _)| crate::status::humanize_secs(s.state_secs).chars().count())
                 .max()
                 .unwrap_or(3),
-            dir_w: sessions
-                .iter()
-                .map(|s| s.dir.chars().count())
+            dir_w: rows
+                .clone()
+                .into_iter()
+                .map(|(s, level)| tree_prefix(level).chars().count() + name_of(s).chars().count())
                 .max()
                 .unwrap_or(4)
                 .min(Cols::DIR_CAP),
-            any_title: sessions.iter().any(|s| !s.title.is_empty()),
+            any_title: rows.into_iter().any(|(s, _)| !s.title.is_empty()),
         }
     }
-}
-
-fn session_row(s: &Session, width: usize, cols: &Cols, labels: Label) -> ListItem<'static> {
-    ListItem::new(session_line(s, width, cols, labels))
 }
 
 /// One agent row, laid out to fit `width` columns.
@@ -631,18 +981,23 @@ fn session_row(s: &Session, width: usize, cols: &Cols, labels: Label) -> ListIte
 ///
 /// `labels` picks which ladder:
 ///
-/// - **both** — directory *and* title. The title yields **last**, not first: a
+/// - **both** — name *and* title. The title yields **last**, not first: a
 ///   47-column HUD cannot hold four columns, and a `both` mode that dropped the
 ///   title there would silently be `dir` mode, which is the thing it exists not
 ///   to be. So the command and the state word are spent on the title before the
-///   row gives up and falls back to the directory alone.
-/// - **title** — the title as the row's whole name (directory when the agent
-///   has not named its conversation yet). Titles are sentences where
+///   row gives up and falls back to the name alone.
+/// - **title** — the title as the row's whole name (the name column's when the
+///   agent has not named its conversation yet). Titles are sentences where
 ///   directories are words, so it asks for a wider minimum.
 /// - **dir** — the original row.
-fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'static> {
+///
+/// The name is [`name_of`] — the directory, or a chosen `@tag` — behind the
+/// row's [`tree_prefix`] at `level`, whichever column it lands in.
+fn session_line(s: &Session, level: usize, width: usize, cols: &Cols, labels: Label) -> Line<'static> {
     let color = state_color(s.state);
     let time = crate::status::humanize_secs(s.state_secs);
+    let prefix = tree_prefix(level);
+    let name = format!("{prefix}{}", name_of(s));
 
     const DOT: usize = 2;
     const GAP: usize = 2;
@@ -664,7 +1019,10 @@ fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'
     let dir_w = cols.dir_w.min((width / 3).max(DIR_MIN));
 
     // The single flexible column, when no separate title column is drawn.
-    let solo = label_of(s, labels);
+    let solo = match labels {
+        Label::Title if !s.title.is_empty() => format!("{prefix}{}", s.title),
+        _ => name.clone(),
+    };
     let solo_min = match labels {
         Label::Title => TITLE_ALONE_MIN,
         _ => DIR_MIN,
@@ -710,12 +1068,12 @@ fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'
     let bold = Style::default().add_modifier(Modifier::BOLD);
     if show_title {
         spans.push(Span::styled(
-            format!("{:<dir_w$}", truncate(&s.dir, dir_w)),
+            format!("{:<dir_w$}", truncate(&name, dir_w)),
             bold,
         ));
     } else {
         spans.push(Span::styled(
-            format!("{:<flex_w$}", truncate(solo, flex_w)),
+            format!("{:<flex_w$}", truncate(&solo, flex_w)),
             bold,
         ));
     }
@@ -779,7 +1137,8 @@ mod tests {
             pid: 2,
             state_secs: secs,
             title: String::new(),
-            tag: format!("{dir}-0000"),
+            // What `run` would have minted for this directory.
+            tag: format!("{}-00af", dir.to_lowercase().replace('_', "-")),
             parent: None,
             depth: 0,
             agent: Default::default(),
@@ -800,18 +1159,18 @@ mod tests {
     }
 
     fn rendered_as(s: &Session, width: usize, time_w: usize, labels: Label) -> String {
-        let mut cols = Cols::measure(std::slice::from_ref(s));
+        let mut cols = Cols::measure([(s, 0)]);
         cols.time_w = time_w;
-        flatten(session_line(s, width, &cols, labels))
+        flatten(session_line(s, 0, width, &cols, labels))
     }
 
     /// Lay a whole list out together, so the shared column measurements are
     /// the ones a real frame would use.
     fn rendered_all(sessions: &[Session], width: usize, labels: Label) -> Vec<String> {
-        let cols = Cols::measure(sessions);
+        let cols = Cols::measure(sessions.iter().map(|s| (s, 0)));
         sessions
             .iter()
-            .map(|s| flatten(session_line(s, width, &cols, labels)))
+            .map(|s| flatten(session_line(s, 0, width, &cols, labels)))
             .collect()
     }
 
@@ -873,11 +1232,11 @@ mod tests {
             session("20260612_doc_parser", 56_100),
             session("mode-agent", 45),
         ];
-        let cols = Cols::measure(&sessions);
+        let cols = Cols::measure(sessions.iter().map(|s| (s, 0)));
         assert_eq!(cols.time_w, 6, "widest is 15h35m");
         let cmd_at: Vec<_> = sessions
             .iter()
-            .map(|s| flatten(session_line(s, 45, &cols, Label::Dir)).find("claude"))
+            .map(|s| flatten(session_line(s, 0, 45, &cols, Label::Dir)).find("claude"))
             .collect();
         assert!(cmd_at.iter().all(|c| c.is_some()), "{cmd_at:?}");
         assert!(
@@ -1010,18 +1369,7 @@ mod tests {
     }
 
     fn app_with(sessions: Vec<Session>, labels: Label) -> App {
-        let mut list = ListState::default();
-        list.select(Some(0));
-        App {
-            sessions,
-            list,
-            sort: status::Sort::Urgency,
-            labels,
-            help: false,
-            message: help_line(),
-            rows_top: 1,
-            hud_con_id: None,
-        }
+        App::new(sessions, status::Sort::Urgency, labels, help_line())
     }
 
     #[test]
@@ -1086,13 +1434,13 @@ mod tests {
         let mut app = app_with(vec![session("seagents", 45)], Label::Dir);
         app.help = true;
         // Tall enough: no indicator, and quit is visible.
-        let tall = frame(&mut app, 47, 13).join("\n");
+        let tall = frame(&mut app, 47, 14).join("\n");
         assert!(tall.contains("quit"), "{tall}");
         assert!(!tall.contains("more"), "{tall}");
         // Too short: the last bindings are gone, and the border admits it.
         let short = frame(&mut app, 47, 9).join("\n");
         assert!(!short.contains("quit"), "{short}");
-        assert!(short.contains("▼ 3 more"), "{short}");
+        assert!(short.contains("▼ 5 more"), "{short}");
     }
 
     #[test]
@@ -1121,5 +1469,185 @@ mod tests {
         let narrow = rendered(&s, 22, 6);
         assert!(!narrow.contains("blocked"), "{narrow:?}");
         assert!(narrow.ends_with("15h35m"), "{narrow:?}");
+    }
+
+    fn spawned(tag: &str, parent: Option<&str>, state: State, secs: u64) -> Session {
+        Session {
+            tag: tag.to_string(),
+            parent: parent.map(str::to_string),
+            depth: u32::from(parent.is_some()),
+            state,
+            ..session("seagents", secs)
+        }
+    }
+
+    fn shape(rows: &[Row]) -> Vec<(String, usize)> {
+        rows.iter().map(|r| (r.s.tag.clone(), r.level)).collect()
+    }
+
+    #[test]
+    fn lineage_puts_each_child_directly_under_its_parent() {
+        // Sorted as urgency would: the parent is idle, its children are not.
+        let sorted = vec![
+            spawned("c1", Some("p"), State::Blocked, 10),
+            spawned("solo", None, State::Working, 10),
+            spawned("orphan", Some("gone"), State::Working, 5),
+            spawned("p", None, State::Idle, 10),
+            spawned("c2", Some("p"), State::Idle, 20),
+            spawned("g", Some("c2"), State::Idle, 30),
+        ];
+        let want: Vec<(String, usize)> = [
+            // The family sits where its most urgent member would — c1 heads
+            // the list — so a blocked child is never buried under an idle
+            // parent; within it, siblings keep the sort's order.
+            ("p", 0),
+            ("c1", 1),
+            ("c2", 1),
+            ("g", 2),
+            ("solo", 0),
+            // A parent that is not live leaves its child top-level.
+            ("orphan", 0),
+        ]
+        .into_iter()
+        .map(|(t, l)| (t.to_string(), l))
+        .collect();
+        assert_eq!(shape(&lineage(sorted)), want);
+    }
+
+    #[test]
+    fn lineage_keeps_the_sort_when_nobody_was_spawned_and_loses_no_row_to_a_cycle() {
+        let flat = vec![
+            spawned("a", None, State::Idle, 1),
+            spawned("b", None, State::Idle, 2),
+            spawned("c", None, State::Idle, 3),
+        ];
+        let tags: Vec<String> = lineage(flat).into_iter().map(|r| r.s.tag).collect();
+        assert_eq!(tags, ["a", "b", "c"]);
+        // Tags make a parent cycle all but impossible; if a hand-edited
+        // `.meta` makes one anyway, both rows still show.
+        let cycle = vec![spawned("x", Some("y"), State::Idle, 1), spawned("y", Some("x"), State::Idle, 2)];
+        assert_eq!(lineage(cycle).len(), 2);
+        // An agent naming itself as parent is its own root, not a loop.
+        assert_eq!(shape(&lineage(vec![spawned("z", Some("z"), State::Idle, 1)])), [("z".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_drawn_frame_indents_children_and_keeps_the_columns_aligned() {
+        let mut app = app_with(
+            vec![
+                spawned("c", Some("p"), State::Working, 30),
+                spawned("p", None, State::Idle, 60),
+            ],
+            Label::Dir,
+        );
+        let shown = frame(&mut app, 60, 6);
+        let parent = shown.iter().position(|l| l.contains("@p")).expect("parent row");
+        let child = shown.iter().position(|l| l.contains("└ @c")).expect("child row, indented");
+        assert_eq!(child, parent + 1, "{shown:#?}");
+        let (parent, child) = (&shown[parent], &shown[child]);
+        // Screen columns, not bytes: the highlight symbol is multi-byte.
+        let col = |line: &str, pat: &str| line.find(pat).map(|b| line[..b].chars().count());
+        // The marker lives in the name column: dot, state and time line up.
+        assert_eq!(col(parent, "●"), col(child, "●"), "{shown:#?}");
+        assert_eq!(col(parent, "idle"), col(child, "working"), "{shown:#?}");
+        assert_eq!(col(parent, "claude"), col(child, "claude"), "{shown:#?}");
+        assert_eq!(parent.chars().count(), child.chars().count(), "{shown:#?}");
+    }
+
+    #[test]
+    fn a_chosen_tag_names_the_row_and_a_minted_one_leaves_the_directory() {
+        let minted = titled("seagents", 45, "Detection update");
+        assert_eq!(name_of(&minted), "seagents");
+        let chosen = Session { tag: "reviewer".into(), ..titled("seagents", 45, "Detection update") };
+        assert_eq!(name_of(&chosen), "@reviewer");
+        // Every mode that shows the name column shows the tag in it…
+        for labels in [Label::Dir, Label::Both] {
+            let row = rendered_as(&chosen, 70, 3, labels);
+            assert!(row.contains("@reviewer") && !row.contains("seagents"), "{row:?}");
+        }
+        // …and title mode still names the row by its conversation.
+        let row = rendered_as(&chosen, 70, 3, Label::Title);
+        assert!(row.contains("Detection update") && !row.contains("@reviewer"), "{row:?}");
+        // A tagless session (a wrapper older than tags) is addressed by pid.
+        let old = Session { tag: String::new(), ..session("seagents", 45) };
+        assert_eq!((name_of(&old), target_of(&old)), ("seagents".into(), "2".into()));
+        assert_eq!(target_of(&chosen), "reviewer");
+    }
+
+    #[test]
+    fn the_send_line_shows_its_target_and_the_end_of_a_long_prompt() {
+        let mut app = app_with(vec![spawned("c", None, State::Idle, 5)], Label::Dir);
+        app.input = Some(Input::Prompt {
+            target: "c".into(),
+            name: "@c".into(),
+            text: "fix the\nbuild".into(),
+        });
+        let shown = frame(&mut app, 47, 6);
+        assert_eq!(shown[5], "send @c › fix the↵build", "{shown:#?}");
+
+        let long = format!("start {} the end", "x".repeat(80));
+        app.input = Some(Input::Prompt { target: "c".into(), name: "@c".into(), text: long });
+        let footer = frame(&mut app, 47, 6)[5].clone();
+        assert!(footer.starts_with("send @c › …") && footer.ends_with("the end"), "{footer:?}");
+        assert!(footer.chars().count() < 47, "a column is kept for the cursor: {footer:?}");
+
+        app.input = Some(Input::ConfirmStop { target: "c".into(), name: "@c".into() });
+        assert_eq!(frame(&mut app, 47, 6)[5], "stop @c? y/n");
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        input_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_send_line_owns_the_keyboard_and_a_stop_needs_a_yes() {
+        let mut app = app_with(vec![spawned("c", None, State::Idle, 5)], Label::Dir);
+        open_prompt(&mut app);
+        // `q`, `j`, `x` are letters here, not quit/navigate/stop.
+        for c in "qjx!".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Backspace);
+        match &app.input {
+            Some(Input::Prompt { target, text, .. }) => {
+                assert_eq!((target.as_str(), text.as_str()), ("c", "qjx"))
+            }
+            _ => panic!("the send line closed"),
+        }
+        input_key(&mut app, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.input.is_none());
+        assert_eq!(app.message, "nothing to send");
+
+        app.input = Some(Input::ConfirmStop { target: "c".into(), name: "@c".into() });
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.input.is_none());
+        assert_eq!(app.message, "left @c running");
+    }
+
+    #[test]
+    fn a_blocked_row_is_not_offered_the_send_line() {
+        let mut app = app_with(vec![spawned("c", None, State::Blocked, 5)], Label::Dir);
+        open_prompt(&mut app);
+        assert!(app.input.is_none());
+        assert!(app.message.contains("@c is blocked"), "{}", app.message);
+    }
+
+    #[test]
+    fn outcomes_read_as_the_wrapper_answered() {
+        let send = Request::Send {
+            text: "hi".into(),
+            mode: Mode::Paste,
+            submit: true,
+            now: false,
+            answer_permission: false,
+            timeout_ms: None,
+        };
+        let ok = Reply { ok: true, stops: Some(3), ..Reply::default() };
+        assert_eq!(outcome(&send, "@c", Ok(ok.clone())), "sent to @c · stops 3");
+        assert_eq!(outcome(&Request::Stop { force: false }, "@c", Ok(ok)), "stopped @c");
+        let refused = Reply::refused(crate::send::Refusal::Blocked, "c is blocked at a bash permission prompt");
+        assert_eq!(outcome(&send, "@c", Ok(refused)), "@c: c is blocked at a bash permission prompt");
+        assert_eq!(outcome(&send, "@c", Err("no live agent".into())), "@c: no live agent");
     }
 }
