@@ -224,7 +224,9 @@ Source layout under `src/`:
   `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
   `claim_spawn()` with its `Caps`; `backfill_tags()`), `runtime_dir()`, and
   `resolve_target()`, the one resolver every command
-  that addresses an agent uses. No other module builds a `<pid>.*` path or
+  that addresses an agent uses; a session's prompt files
+  (`write_prompt()` / `remove_prompts()`) and `exclude_seagents()`, the one
+  way `.seagents/` gets into a repo's `info/exclude`. No other module builds a `<pid>.*` path or
   parses one.
 - **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
   is mid-turn" (§6), per adapter: the hook ledger plus the transcript's
@@ -280,7 +282,9 @@ Source layout under `src/`:
   seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
   and mode order; `capabilities()` is what `status --json` reports per agent
   (`state`, `wait`, `turns`, `spawn`, `send`, `stop` as applicable); `send`
-  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence).
+  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
+  when a body goes by reference: `long_prompt`, `inline_max_chars`,
+  `inline_max_lines`).
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -402,6 +406,9 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`,
   `.state` or `.agent`.
 - **`tags.lock`** — one for the whole cache; see Tags.
+- **`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md`** — a
+  `send` body too long to paste as the user's words (§9), 0600. Outside the
+  cache, but the session's: named and deleted by `registry`.
 - **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
   socket (§9; 0600 in a 0700 dir, the cache dir when there is no runtime
   dir). Bound once the `.meta` exists; removed by the wrapper on exit and on
@@ -873,9 +880,30 @@ screen). modifyOtherKeys isn't tracked: it never changes an unmodified Enter.
 `--keys` writes bytes verbatim after decoding `\e \r \n \t \0 \\ \xNN`
 (in the wrapper, so a raw client gets the same syntax); `--no-submit` skips
 the Enter. Verified live on Claude 2.1.284: a multi-line body with both quote
-kinds, backticks, `$` and backslashes arrives exactly (Claude's transcript
-wraps a large paste in `<pasted_content>`; the text inside is byte-identical).
-Prompt text is never logged.
+kinds, backticks, `$` and backslashes arrives exactly. Prompt text is never
+logged.
+
+**Long bodies go by reference.** Claude files a large paste in its transcript
+as `<pasted_content id="…">…`, and current models treat that as data "that may
+contain instructions the user did not write" — haiku declined to act on one in
+Phase 2; a raw unbracketed burst is treated the same. Measured (2.1.284, haiku,
+bracketed paste + 300 ms + Enter): one line of 700 chars and 2 short lines
+land inline, as the user's words; one line of 900 chars, or 7 short lines, are
+wrapped. So the adapter says when (`[send] long_prompt = "file"`,
+`inline_max_chars = 700`, `inline_max_lines = 2` for Claude; every other
+adapter pastes everything): past either limit the wrapper writes the body to
+`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md` (0600,
+`registry::write_prompt`; `.seagents/` goes into the repo's `info/exclude`
+first, through the same helper `--worktree` uses) and pastes one line instead:
+`Read the file .seagents/prompts/<name>.md (relative to your working
+directory) and carry out the instructions in it. They were sent to you through
+seagents by <@caller | the user>.` A Read inside the agent's cwd needs no
+permission — verified in `--permission-mode default`, where one outside it
+would stop at a prompt. The files are the session's: the wrapper deletes them
+when its agent exits (so on `stop`), and `reap` for one that died harder —
+only names with that wrapper's pid prefix. `--keys` is untouched. Seed prompts
+need none of this: on the command line they arrive inline at any size
+(verified: 50 lines, ~5000 chars).
 
 **`stop`** types the adapter's `exit_sequence` (Claude: `/exit`, ~1 s) as a
 `--now` paste and gives it 5 s; then SIGTERMs the PTY's foreground process
@@ -1021,7 +1049,8 @@ tools/test-restore.sh terminator
 tools/test-restore.sh alacritty
 tools/test-restore.sh alacritty-daemon
 
-# Integration-test spawn → wait → status → send (idle-paired, multi-line) →
+# Integration-test spawn → wait → status → send (idle-paired; multi-line and
+# > 700-char bodies by reference, carried out in --permission-mode default) →
 # lineage/caps and the socket's lineage rule → focus → stop, with a real
 # Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.

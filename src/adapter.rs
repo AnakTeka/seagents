@@ -37,6 +37,18 @@ pub(crate) enum Identity {
     None,
 }
 
+/// How a `send` body too long to pass as the user's own words is delivered.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LongPrompt {
+    /// Pasted like any other: the tool takes every paste as typed text.
+    #[default]
+    Paste,
+    /// Written to a prompt file in the agent's cwd, and a one-line
+    /// instruction to read it is pasted instead.
+    File,
+}
+
 /// Where the turn ledger's edges come from.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -91,6 +103,12 @@ pub(crate) struct Send {
     /// Sent as a prompt to ask the agent to exit; empty goes straight to
     /// SIGTERM.
     pub(crate) exit_sequence: String,
+    /// What happens to a body over `inline_max_chars` characters or
+    /// `inline_max_lines` lines. A tool that files a large paste as quoted
+    /// data rather than as the user's words (Claude) takes it by reference.
+    pub(crate) long_prompt: LongPrompt,
+    pub(crate) inline_max_chars: usize,
+    pub(crate) inline_max_lines: usize,
 }
 
 impl Default for Send {
@@ -99,7 +117,21 @@ impl Default for Send {
             submit_delay_ms: 300,
             pre_send: String::new(),
             exit_sequence: String::new(),
+            long_prompt: LongPrompt::Paste,
+            inline_max_chars: 0,
+            inline_max_lines: 0,
         }
+    }
+}
+
+impl Send {
+    /// Whether `body` goes by reference rather than pasted: only for a
+    /// `long_prompt = "file"` adapter, and only past either limit. Lines are
+    /// counted as the paste carries them, so a trailing newline is one more.
+    pub(crate) fn by_reference(&self, body: &str) -> bool {
+        self.long_prompt == LongPrompt::File
+            && (body.chars().count() > self.inline_max_chars
+                || body.split('\n').count() > self.inline_max_lines)
     }
 }
 
@@ -153,6 +185,10 @@ fn parse(text: &str) -> Result<Adapter, String> {
     let seed = &adapter.launch.seed_prompt;
     if !seed.is_empty() && !seed.iter().any(|a| a.contains("{prompt}")) {
         return Err("launch.seed_prompt has no {prompt}".to_string());
+    }
+    let send = &adapter.send;
+    if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
+        return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
     }
     Ok(adapter)
 }
@@ -249,11 +285,33 @@ mod tests {
         assert_eq!((claude.launch.identity, claude.launch.turns), (Identity::Hook, Turns::Hook));
         assert_eq!(claude.send.submit_delay_ms, 300);
         assert_eq!(claude.send.exit_sequence, "/exit");
+        assert_eq!(
+            (claude.send.long_prompt, claude.send.inline_max_chars, claude.send.inline_max_lines),
+            (LongPrompt::File, 700, 2)
+        );
 
         let codex = parse(BUNDLED[1].1).unwrap();
         assert_eq!(codex.launch.seed_prompt, ["{prompt}"]);
         assert_eq!(codex.launch.settings_flag, "");
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
+        assert_eq!(codex.send.long_prompt, LongPrompt::Paste);
+    }
+
+    #[test]
+    fn a_body_past_either_measured_limit_goes_by_reference() {
+        let claude = parse(BUNDLED[0].1).unwrap().send;
+        assert!(!claude.by_reference("Reply with exactly: ONE"));
+        assert!(!claude.by_reference(&"x".repeat(700)));
+        assert!(claude.by_reference(&"x".repeat(701)));
+        assert!(!claude.by_reference(&"é".repeat(700)), "characters, not bytes");
+        assert!(!claude.by_reference("one\ntwo"));
+        assert!(claude.by_reference("one\ntwo\nthree"));
+        assert!(claude.by_reference("one\ntwo\n"), "the trailing newline is pasted too");
+        // Every other adapter pastes whatever it is given.
+        let codex = parse(BUNDLED[1].1).unwrap().send;
+        assert!(!codex.by_reference(&"line\n".repeat(500)));
+        assert!(!Send::default().by_reference(&"x".repeat(10_000)));
+        assert!(parse("[send]\nlong_prompt = \"file\"\n").unwrap_err().contains("inline_max"));
     }
 
     #[test]

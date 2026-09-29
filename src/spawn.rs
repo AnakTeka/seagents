@@ -276,7 +276,6 @@ fn add_worktree(cwd: &Path, tag: &str) -> Result<PathBuf, String> {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let root = PathBuf::from(git(&["rev-parse", "--show-toplevel"]).map_err(|e| format!("--worktree: {e}"))?);
-    let common = PathBuf::from(git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
     let path = root.join(".seagents/worktrees").join(tag);
     let branch = format!("seagents/{tag}");
     if path.exists() {
@@ -285,25 +284,10 @@ fn add_worktree(cwd: &Path, tag: &str) -> Result<PathBuf, String> {
     if git(&["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
         return Err(format!("--worktree: branch {branch} already exists"));
     }
-    exclude_seagents_dir(&common.join("info/exclude"))?;
+    registry::exclude_seagents(&root)?;
     git(&["worktree", "add", &path.to_string_lossy(), "-b", &branch])?;
     let within = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
     Ok(Some(path.join(within)).filter(|p| p.is_dir()).unwrap_or(path))
-}
-
-/// Add `.seagents/` to a git `info/exclude`, once.
-fn exclude_seagents_dir(exclude: &Path) -> Result<(), String> {
-    const LINE: &str = ".seagents/";
-    let text = std::fs::read_to_string(exclude).unwrap_or_default();
-    if text.lines().any(|l| l.trim() == LINE) {
-        return Ok(());
-    }
-    if let Some(dir) = exclude.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-    std::fs::write(exclude, format!("{text}{sep}{LINE}\n"))
-        .map_err(|e| format!("{}: {e}", exclude.display()))
 }
 
 #[cfg(test)]
@@ -380,19 +364,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn the_exclude_line_is_added_once() {
-        let dir = scratch("exclude");
-        let ex = dir.join("info/exclude");
-        exclude_seagents_dir(&ex).unwrap();
-        assert_eq!(std::fs::read_to_string(&ex).unwrap(), ".seagents/\n");
-        std::fs::write(&ex, "# git ls-files --others\n*.o").unwrap();
-        exclude_seagents_dir(&ex).unwrap();
-        exclude_seagents_dir(&ex).unwrap();
-        assert_eq!(std::fs::read_to_string(&ex).unwrap(), "# git ls-files --others\n*.o\n.seagents/\n");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

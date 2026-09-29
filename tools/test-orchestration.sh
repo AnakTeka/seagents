@@ -70,7 +70,9 @@ walk(json.load(sys.stdin))"
 }
 
 # 1. spawn: a handle back, a window in the nested i3, and the .meta naming it.
-out=$(cd "$WORK" && "$SEA" spawn --tag it-a "${HAIKU[@]}" -- 'Reply with exactly: ALPHA') \
+# `default`, not this machine's bypass: a prompt sent by reference must be
+# readable without a permission prompt, and step 3d needs a real gate.
+out=$(cd "$WORK" && "$SEA" spawn --tag it-a --permission-mode default "${HAIKU[@]}" -- 'Reply with exactly: ALPHA') \
   || fail "spawn exited $?: $out"
 [ "$(echo "$out" | jq_ "d['tag'], d['depth'], d['stops'], d['parent']")" = "it-a 0 0 None" ] \
   || fail "spawn handle: $out"
@@ -106,29 +108,47 @@ echo "$s" | jq_ "' '.join(d['capabilities'])" | grep -q "send stop" || fail "cap
 pass "status --json lists it-a: tag, depth 0, stops 1, capabilities $(echo "$s" | jq_ "d['capabilities']")"
 
 # 3b. send: a follow-up into the idle agent returns the baseline, and the next
-#     turn is its answer. Then a multi-line body with quotes arrives whole.
+#     turn is its answer.
 out=$("$SEA" send it-a 'Reply with exactly: BRAVO'); rc=$?
 [ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['ok'], d['stops'], d['paired']")" = "True 1 True" ] \
   || fail "send: rc=$rc $out"
 out=$("$SEA" wait it-a --after 1 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q BRAVO || fail "wait after send: rc=$rc $out"
 pass "send returned stops 1, paired; wait --after 1 got BRAVO"
+# A body Claude would file as quoted <pasted_content> (more than 2 lines, or
+# more than 700 characters) goes by reference: written to a prompt file in the
+# agent's cwd, which it is told in one line to read — so it is carried out.
 printf 'First line with "double" and '"'"'single'"'"' quotes,\n  an indented $HOME `line`,\n\nand after a blank: reply with exactly: CHARLIE' \
   > "$ROOT/body.txt"
+wpid=$(meta_of it-a | jq_ "d['wrapper_pid']")
 out=$("$SEA" send it-a --prompt-file "$ROOT/body.txt"); rc=$?
 [ $rc -eq 0 ] || fail "multi-line send: rc=$rc $out"
-# Only delivery is checked: Claude files a multi-line paste as a bare
-# <pasted_content> block, and a model may decline to act on text it only sees
-# quoted like that, so CHARLIE itself is not a seagents property.
 out=$("$SEA" wait it-a --after 2 --timeout 90s); rc=$?
-[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['reason']")" = turn ] || fail "multi-line wait: rc=$rc $out"
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q CHARLIE || fail "multi-line wait: rc=$rc $out"
+pfile=$(ls "$WORK/.seagents/prompts/$wpid-2-"*.md 2>/dev/null)
+[ -n "$pfile" ] && cmp -s "$pfile" "$ROOT/body.txt" || fail "the prompt file ($pfile) is not the body byte for byte"
+[ "$(stat -c %a "$pfile")" = 600 ] || fail "the prompt file is not 0600"
 echo "$out" | python3 -c "
 import json,sys
-d=json.load(sys.stdin); want=open('$ROOT/body.txt').read()
+d=json.load(sys.stdin)
 users=[json.loads(l) for l in open(d['transcript_path'])]
 texts=[r['message']['content'] for r in users if r.get('type')=='user' and isinstance(r.get('message',{}).get('content'),str)]
-sys.exit(0 if any(want in t for t in texts) else 1)" || fail "the transcript lacks the exact multi-line body"
-pass "a multi-line body with quotes reached the transcript byte for byte"
+want='Read the file .seagents/prompts/$(basename "$pfile") (relative to your working directory)'
+sys.exit(0 if any(t.startswith(want) and 'by the user.' in t and 'pasted_content' not in t for t in texts) else 1)" \
+  || fail "the transcript lacks the one-line reference to $pfile"
+pass "a 4-line body with quotes went by reference ($(basename "$pfile"), byte for byte, 0600) and was carried out: CHARLIE"
+
+# 3c. A long multi-line body (> 700 chars), in --permission-mode default: read
+#     without a permission prompt, and done.
+python3 -c "
+for i in range(1, 12): print(f'Step {i}: this line is filler describing an imaginary task, and you can safely ignore it.')
+print('Reply with exactly: LONGOK')" > "$ROOT/long.txt"
+[ "$(wc -c < "$ROOT/long.txt")" -gt 700 ] || fail "the long body is not long"
+out=$("$SEA" send it-a --prompt-file "$ROOT/long.txt"); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['stops']")" = 3 ] || fail "long send: rc=$rc $out"
+out=$("$SEA" wait it-a --after 3 --timeout 90s); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "long wait: rc=$rc $out"
+pass "a $(wc -c < "$ROOT/long.txt")-char, 12-line body was carried out in default mode: LONGOK"
 
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
@@ -192,5 +212,6 @@ out=$(cat "$ROOT/exit.json")
 [ ! -e "$sock" ] || fail "the control socket outlived the agent"
 for _ in $(seq 1 20); do [ -z "$(window_of it-a)" ] && break; sleep 0.25; done
 [ -z "$(window_of it-a)" ] || fail "it-a's window stayed open after the agent exited"
-pass "stop it-a: wait --for exit returned exit (rc 4), the socket is gone, the window closed"
+[ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
+pass "stop it-a: wait --for exit returned exit (rc 4), the socket and its prompt files are gone, the window closed"
 exit 0

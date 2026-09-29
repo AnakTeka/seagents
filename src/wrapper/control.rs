@@ -22,6 +22,11 @@
 //! once, with the gate's rule. Submissions are serialized, and one only
 //! counts as landed once the agent's own prompt hook has fired for it, so two
 //! sends in quick succession cannot both see "idle" and fold into one turn.
+//!
+//! A body the agent would file as quoted data if pasted (the adapter's
+//! `long_prompt`, `adapter::Send::by_reference`) is written to a prompt file
+//! in its cwd (`registry::write_prompt`) and replaced by one line telling it
+//! to read that file and who sent it; the files go when the agent exits.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -134,7 +139,7 @@ pub(super) fn spawn(wiring: Wiring) -> Option<Control> {
 impl Control {
     /// The agent has exited: wake whatever waits on it, give in-flight
     /// requests a moment to reply (a `stop` is waiting to say it worked),
-    /// and remove the socket.
+    /// and remove the socket and the session's prompt files.
     pub(super) fn finish(self) {
         let deadline = Instant::now() + DRAIN;
         let mut life = self.shared.life();
@@ -154,6 +159,10 @@ impl Control {
         }
         drop(life);
         let _ = std::fs::remove_file(&self.sock);
+        // The agent is gone, so nothing will read them now.
+        if let Some(meta) = registry::read_meta(&self.shared.wiring.files) {
+            registry::remove_prompts(&meta);
+        }
     }
 }
 
@@ -254,7 +263,8 @@ fn serve(shared: &Shared, stream: &UnixStream) -> Result<Reply, Reply> {
                 ),
             };
             let timeout = timeout_ms.map_or(crate::send::DEFAULT_TIMEOUT, Duration::from_millis);
-            send(shared, &me, body, submit, now, answer_permission, timeout)
+            let who = caller.as_deref().map_or_else(|| "the user".to_string(), |t| format!("@{t}"));
+            send(shared, &me, &who, body, submit, now, answer_permission, timeout)
         }
         Request::Stop { force } => stop(shared, force),
     }
@@ -390,9 +400,26 @@ fn framing(adapter: &adapter::Adapter) -> Framing<'_> {
     }
 }
 
+/// The one line that stands in for a body sent by reference: where the
+/// prompt file is — relative when it is under the agent's working directory,
+/// as it is written to be — and who sent it, so the agent can tell its
+/// parent's instructions from text it merely found.
+fn reference_line(file: &std::path::Path, cwd: &str, who: &str) -> String {
+    let at = match file.strip_prefix(cwd) {
+        Ok(rel) if !cwd.is_empty() => format!("{} (relative to your working directory)", rel.display()),
+        _ => file.display().to_string(),
+    };
+    format!(
+        "Read the file {at} and carry out the instructions in it. They were sent to you through \
+         seagents by {who}."
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send(
     shared: &Shared,
     me: &str,
+    who: &str,
     body: Owned,
     submit: bool,
     now: bool,
@@ -415,8 +442,19 @@ fn send(
         match gate(state.as_ref(), in_turn, pending, detectable, now, answer) {
             Gate::Go { paired } => {
                 let stops = agent.stops;
+                let line = match &body {
+                    Paste(text) if adapter.send.by_reference(text) => {
+                        let meta = registry::read_meta(&w.files)
+                            .ok_or_else(|| Reply::refused(Refusal::Failed, "this agent's .meta is gone"))?;
+                        let file = registry::write_prompt(&meta, stops, text)
+                            .map_err(|e| Reply::refused(Refusal::Failed, format!("writing the prompt file: {e}")))?;
+                        Some(reference_line(&file, &meta.cwd, who))
+                    }
+                    _ => None,
+                };
+                let body = line.as_deref().map_or_else(|| body.body(), Body::Paste);
                 let ms = crate::clock::unix_now_ms();
-                inject::deliver(&w.writer, &w.modes, body.body(), submit, framing(&adapter))
+                inject::deliver(&w.writer, &w.modes, body, submit, framing(&adapter))
                     .map_err(|e| Reply::refused(Refusal::Failed, e))?;
                 if submit {
                     *last = Some(Submitted { at: Instant::now(), ms });
@@ -569,6 +607,23 @@ mod tests {
         assert_eq!(g(Some("blocked"), true, false, true, false, true), Gate::Go { paired: false });
         assert_eq!(g(Some("unknown"), false, false, false, false, false), Gate::Unsupported);
         assert_eq!(g(Some("unknown"), false, false, false, true, false), Gate::Go { paired: false });
+    }
+
+    #[test]
+    fn a_body_by_reference_is_one_line_naming_the_file_and_the_sender() {
+        let line = reference_line(
+            std::path::Path::new("/w/proj/.seagents/prompts/7-2-beef.md"),
+            "/w/proj",
+            "@planner",
+        );
+        assert_eq!(
+            line,
+            "Read the file .seagents/prompts/7-2-beef.md (relative to your working directory) and carry \
+             out the instructions in it. They were sent to you through seagents by @planner."
+        );
+        assert!(!line.contains('\n'));
+        let abs = reference_line(std::path::Path::new("/elsewhere/p.md"), "/w/proj", "the user");
+        assert!(abs.starts_with("Read the file /elsewhere/p.md and") && abs.ends_with("by the user."), "{abs}");
     }
 
     #[test]

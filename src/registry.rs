@@ -27,6 +27,10 @@
 //! updates (a healed con_id and a backfilled tag landing at once, one
 //! silently dropping the other).
 //!
+//! A session's **prompt files** (`<cwd>/.seagents/prompts/<wrapper_pid>-…`,
+//! [`write_prompt`]) live outside the cache, in the agent's working
+//! directory, but are the session's all the same: named here, deleted with it.
+//!
 //! Liveness is one rule, [`procfs::alive`] on the child pid, and two
 //! operations: [`list`] returns live sessions and never deletes anything;
 //! [`reap`] deletes the files of dead ones. Only `status`/the HUD reap.
@@ -344,7 +348,8 @@ fn list_in(dir: &Dirs) -> Vec<Session> {
         .collect()
 }
 
-/// Delete every file of every session whose agent has exited. A fully exited
+/// Delete every file of every session whose agent has exited — its prompt
+/// files in its cwd included ([`remove_prompts`]). A fully exited
 /// agent isn't interesting — "idle" already means finished-and-waiting — so
 /// the HUD and `status` only ever show live agents. A `.meta` that does not
 /// parse is left alone: it is not known to be dead.
@@ -365,6 +370,7 @@ fn reap_in(dir: &Dirs) {
         for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock, &f.sock] {
             let _ = fs::remove_file(path);
         }
+        remove_prompts(&s.meta);
     }
     let owned: HashSet<u64> = all
         .iter()
@@ -835,6 +841,130 @@ pub(crate) fn runtime_dir() -> PathBuf {
         }
     }
     cache_dir()
+}
+
+// ---------------------------------------------------------------------------
+// Prompt files
+// ---------------------------------------------------------------------------
+
+/// Where a session's prompt files go: `<cwd>/.seagents/prompts`. Inside the
+/// agent's own working directory because that is where it may read without
+/// asking — a Read there needs no permission in any mode, where one in the
+/// runtime or cache dir would stop a `default`-mode agent at a prompt.
+fn prompts_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".seagents/prompts")
+}
+
+/// Write `body` to a new prompt file of session `meta`,
+/// `<wrapper_pid>-<stops>-<4 hex>.md` (0600, dirs 0700), and return its
+/// path. A body some tools would file as quoted data if pasted (see
+/// `adapter::Send::by_reference`) travels this way instead, and the agent is
+/// told to read it. In a git work tree `.seagents/` is excluded first, so
+/// the file never shows up as an untracked change another agent might
+/// commit; a work tree whose exclude cannot be written refuses the prompt.
+pub(crate) fn write_prompt(meta: &Meta, stops: u64, body: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let cwd = Path::new(&meta.cwd);
+    if meta.cwd.is_empty() || !cwd.is_dir() {
+        return Err(format!("the agent's working directory {:?} is gone", meta.cwd));
+    }
+    exclude_seagents(cwd)?;
+    let dir = prompts_dir(cwd);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Two sends at one `stops` are serialized by the wrapper, but the suffix
+    // is random; retry the rare collision rather than overwrite.
+    for _ in 0..16 {
+        let path = dir.join(format!("{}-{stops}-{}.md", meta.wrapper_pid, tag_suffix()));
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(mut f) => {
+                return f
+                    .write_all(body.as_bytes())
+                    .map(|_| path.clone())
+                    .map_err(|e| format!("{}: {e}", path.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err(format!("{}: no free prompt file name", dir.display()))
+}
+
+/// Delete session `meta`'s prompt files — those named
+/// `<its wrapper_pid>-<stops>-<4 hex>.md`, nothing else — and the prompts
+/// dir and `.seagents/` when that leaves them empty. Called when the
+/// wrapper's agent exits and by [`reap`] for a wrapper that could not.
+pub(crate) fn remove_prompts(meta: &Meta) {
+    if meta.cwd.is_empty() {
+        return;
+    }
+    let cwd = Path::new(&meta.cwd);
+    let dir = prompts_dir(cwd);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_str().is_some_and(|n| is_prompt_of(n, meta.wrapper_pid)) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    // Only ever removes an empty directory.
+    let _ = fs::remove_dir(&dir);
+    let _ = fs::remove_dir(cwd.join(".seagents"));
+}
+
+/// Whether `name` is one of wrapper `pid`'s prompt files.
+fn is_prompt_of(name: &str, pid: u64) -> bool {
+    let Some(rest) = name
+        .strip_prefix(&format!("{pid}-"))
+        .and_then(|r| r.strip_suffix(".md"))
+    else {
+        return false;
+    };
+    let Some((stops, hex)) = rest.split_once('-') else {
+        return false;
+    };
+    !stops.is_empty()
+        && stops.bytes().all(|b| b.is_ascii_digit())
+        && hex.len() == 4
+        && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Keep `.seagents/` (worktrees, prompt files) out of the git work tree
+/// `dir` is in, through the repository's local `info/exclude` — never a
+/// tracked file. Nothing to do outside a work tree.
+pub(crate) fn exclude_seagents(dir: &Path) -> Result<(), String> {
+    let common = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .stderr(std::process::Stdio::null())
+        .output();
+    match common {
+        Ok(out) if out.status.success() => {
+            let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            add_exclude_line(&common.join("info/exclude"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Add `.seagents/` to a git `info/exclude`, once.
+fn add_exclude_line(exclude: &Path) -> Result<(), String> {
+    const LINE: &str = ".seagents/";
+    let text = fs::read_to_string(exclude).unwrap_or_default();
+    if text.lines().any(|l| l.trim() == LINE) {
+        return Ok(());
+    }
+    if let Some(dir) = exclude.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+    fs::write(exclude, format!("{text}{sep}{LINE}\n")).map_err(|e| format!("{}: {e}", exclude.display()))
 }
 
 /// Give every live session that has no tag one — sessions whose wrapper
@@ -1336,6 +1466,77 @@ mod tests {
         reap_in(&dir);
         assert!(!gone.agent.exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_exclude_line_is_added_once() {
+        let dir = scratch("exclude");
+        let ex = dir.as_ref().join("info/exclude");
+        add_exclude_line(&ex).unwrap();
+        assert_eq!(fs::read_to_string(&ex).unwrap(), ".seagents/\n");
+        fs::write(&ex, "# git ls-files --others\n*.o").unwrap();
+        add_exclude_line(&ex).unwrap();
+        add_exclude_line(&ex).unwrap();
+        assert_eq!(fs::read_to_string(&ex).unwrap(), "# git ls-files --others\n*.o\n.seagents/\n");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_files_are_private_excluded_from_git_and_go_with_their_session_only() {
+        let dir = scratch("prompts");
+        let root = dir.as_ref().to_path_buf();
+        let repo = root.join("repo");
+        let cwd = repo.join("sub");
+        fs::create_dir_all(&cwd).unwrap();
+        let git_ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .is_ok_and(|s| s.success());
+        let meta = |pid: u64, child: Option<u64>| Meta {
+            cwd: cwd.to_string_lossy().into_owned(),
+            ..sample(pid, child)
+        };
+
+        let p = write_prompt(&meta(42, None), 3, "do\nthe\nthing").unwrap();
+        assert_eq!(p.parent().unwrap(), cwd.join(".seagents/prompts"));
+        let name = p.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(is_prompt_of(&name, 42) && name.starts_with("42-3-"), "{name}");
+        assert_eq!(fs::read_to_string(&p).unwrap(), "do\nthe\nthing");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(write_prompt(&meta(42, None), 3, "again").unwrap(), p, "never overwritten");
+        if git_ok {
+            let ex = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+            assert_eq!(ex.lines().filter(|l| *l == ".seagents/").count(), 1);
+            let st = std::process::Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
+            assert!(st.stdout.is_empty(), "{}", String::from_utf8_lossy(&st.stdout));
+        }
+
+        // Another session's files, and anything not named like a prompt
+        // file, survive a removal.
+        let other = write_prompt(&meta(420, None), 0, "theirs").unwrap();
+        let stray = cwd.join(".seagents/prompts/42-notes.md");
+        fs::write(&stray, "mine").unwrap();
+        for bad in ["42-3-ABCD.md", "42--abcd.md", "42-3-abcde.md", "42-3-abcd.txt", "142-3-abcd.md", "4-3-abcd.md"] {
+            assert!(!is_prompt_of(bad, 42), "{bad}");
+        }
+        remove_prompts(&meta(42, None));
+        assert!(!p.exists());
+        assert!(other.exists() && stray.exists());
+
+        // Reap removes a dead session's; the directories go once empty.
+        fs::remove_file(&stray).unwrap();
+        write_new_meta(&Files::in_dirs(&dir, 420), &meta(420, Some(u32::MAX as u64)));
+        reap_in(&dir);
+        assert!(!other.exists());
+        assert!(!cwd.join(".seagents").exists());
+        // Nowhere to write: an error, not a panic.
+        let mut gone = meta(7, None);
+        gone.cwd = root.join("missing").to_string_lossy().into_owned();
+        assert!(write_prompt(&gone, 0, "x").unwrap_err().contains("gone"));
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

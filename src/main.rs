@@ -162,7 +162,10 @@ enum Command {
     /// (a permission prompt, a trust dialog) is refused at once, with the
     /// gate's `rule`. From inside an agent, only that agent's own descendants
     /// can be sent to. The text goes in as a bracketed paste when the agent
-    /// takes one, then Enter 300 ms later. Refusals print
+    /// takes one, then Enter 300 ms later. Text an agent would take as
+    /// quoted data rather than as your words (Claude: over 700 characters or
+    /// 2 lines) is written to `<its cwd>/.seagents/prompts/` instead, and it
+    /// is sent one line telling it to read that file. Refusals print
     /// `{"ok":false,"reason","error"[,"rule"]}` and exit: 3 blocked, 2
     /// busy_timeout (still busy at --timeout; nothing was sent), 4 exit, 5
     /// forbidden, 1 anything else (incl. `unsupported`: no detector knows

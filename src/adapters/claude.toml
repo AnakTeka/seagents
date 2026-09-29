@@ -22,3 +22,16 @@ watch_dir        = ""
 submit_delay_ms  = 300
 pre_send         = ""
 exit_sequence    = "/exit"
+# A paste Claude Code (2.1.284) takes as the user's words lands in its
+# transcript inline; a longer one is wrapped in <pasted_content>, which the
+# model treats as data that may carry instructions the user did not write, and
+# can decline to act on. Measured with bracketed paste + 300 ms + Enter: one
+# line of 700 chars and 2 short lines stay inline; 900 chars on one line, or
+# 7 short lines, are wrapped. So past either limit the body is written to
+# <cwd>/.seagents/prompts/ and the agent is sent one line telling it to read
+# the file — a Read inside its cwd needs no permission, in any mode
+# (verified in `default`, 2026-09-29). A seed prompt on the command line is
+# never wrapped (verified: 50 lines, ~5000 chars), so seeds stay as they are.
+long_prompt      = "file"
+inline_max_chars = 700
+inline_max_lines = 2
