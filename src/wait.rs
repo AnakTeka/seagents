@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use crate::adapter::Turns;
-use crate::registry::{self, AgentRecord, StateRecord};
+use crate::registry::{self, AgentRecord, Found, StateRecord};
 use crate::turn::Ledger;
 
 const POLL: Duration = Duration::from_millis(250);
@@ -157,29 +157,42 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
 /// prints the outcome JSON; the exit code says the same as its `reason`
 /// (1 for an error, with the message on stderr).
 pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration) -> i32 {
-    let session = match registry::resolve_target(target) {
-        Ok(s) => s,
+    // An agent that has exited is still answered for — from its files while
+    // they last, then from the tombstone its reap left — so a caller whose
+    // child finished and exited between two waits gets its result, not
+    // "no such agent".
+    let found = match registry::resolve_exited(target) {
+        Ok(f) => f,
         Err(e) => {
             eprintln!("seagents wait: {e}");
             return 1;
         }
     };
-    let ledger = Ledger::for_command(session.meta.agent());
-    let child = session.child_pid();
-    let look = || {
-        let agent = registry::read_agent(&session.files);
-        let state = registry::read_state(&session.files);
-        let in_turn = ledger.in_turn(&agent, state.as_ref());
-        (agent, state, crate::procfs::alive(child), in_turn)
+    let (tag, command) = match &found {
+        Found::Session(s) => (s.meta.tag.clone(), s.meta.agent().to_string()),
+        Found::Exited(t) => (t.tag.clone(), t.agent.clone()),
+    };
+    let ledger = Ledger::for_command(&command);
+    // A gone agent has no screen and no turn: its ledger is final, and all
+    // that is left to say is how its last turn ended, or that it exited.
+    let look = || match &found {
+        Found::Session(s) if crate::procfs::alive(s.child_pid()) => {
+            let agent = registry::read_agent(&s.files);
+            let state = registry::read_state(&s.files);
+            let in_turn = ledger.in_turn(&agent, state.as_ref());
+            (agent, state, true, in_turn)
+        }
+        Found::Session(s) => (registry::final_agent(s), None, false, false),
+        Found::Exited(t) => (t.ledger(), None, false, false),
     };
 
     let (agent, state, alive, in_turn) = look();
     let after = match (what, after) {
         (For::Turn, Some(n)) if n > agent.stops => {
             eprintln!(
-                "seagents wait: --after {n} is ahead of {}'s ledger (stops = {}); a restored agent \
+                "seagents wait: --after {n} is ahead of {tag}'s ledger (stops = {}); a restored agent \
                  starts again at 0 — wait without --after",
-                session.meta.tag, agent.stops
+                agent.stops
             );
             return 1;
         }
@@ -200,7 +213,7 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
         let reason = decide(what, after, &now)
             .or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
         if let Some(reason) = reason {
-            return report(&session.meta.tag, reason, &ledger, agent, state.as_ref(), *in_turn);
+            return report(&tag, reason, &ledger, agent, state.as_ref(), *in_turn);
         }
         std::thread::sleep(POLL);
         seen = look();

@@ -239,8 +239,10 @@ Source layout under `src/`:
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
   `Dirs` (the cache and the runtime dir — sockets live in the latter),
-  `list()` (live, never deletes) / `reap()` (deletes the dead, and sweeps
-  control sockets no live session owns) /
+  `list()` (live, never deletes) / `reap()` (deletes the dead, leaving each a
+  `<tag>.exited` tombstone, and sweeps control sockets no live session owns) /
+  `resolve_exited()` + `final_agent()` (an agent that may have exited, for
+  `wait`/`read`) /
   `by_child_pid()` / `enclosing_session(pid)` (the session a process runs
   inside, by `/proc` ancestry — "who is calling"), the locked `update_meta()` / `update_state()` / `update_agent()`;
   tags (`valid_tag()`,
@@ -458,6 +460,16 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`,
   `.state` or `.agent`.
 - **`tags.lock`** — one for the whole cache; see Tags.
+- **`<tag>.exited`** — a tombstone: what `reap` keeps of a session it
+  deletes (`{tag, wrapper_pid, exited_at, agent, cwd, stops, last_message,
+  transcript_path, session_id}`), written before anything is removed, so
+  `wait` and `read` still answer for a child that exited (§8, §10). Not
+  written while a live agent holds the tag; removed when a new agent claims
+  it (`TagClaim::create_meta`) and by `reap` after 24 h.
+  `registry::resolve_exited()` is the resolver that sees them (live, then a
+  dead unreaped session by that tag, then the tombstone) and
+  `registry::final_agent()` the ledger read that falls back to one; `send`,
+  `stop` and `focus` use `resolve_target()`, live agents only.
 - **`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md`** — a
   `send` body too long to paste as the user's words (§9), 0600. Outside the
   cache, but the session's: named and deleted by `registry`.
@@ -913,7 +925,7 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 | `idle` | 0 | no `--after`, not in a turn, alive and not at a gate: nothing to wait for, the last result at once |
 | `timeout` | 2 | `--timeout` (default 5m; `30s`/`5m`/`1h`/seconds) passed — call again with the same N; nothing is consumed |
 | `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
-| `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) |
+| `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) — also for a reaped agent, from its tombstone (§2), for a day |
 | `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
 
 1 is an error (unknown target; an N ahead of the ledger — a restored agent's
@@ -923,6 +935,10 @@ with no turn running the agent's condition is the answer at once, by the same
 rules — `blocked` at a gate (the trust dialog comes before any prompt, so no
 turn is open there), `exit` when gone, else `idle`. `wait::decide()` is the
 whole table, a pure function over one look, tested row by row.
+An exited agent is answered for by the same table: its ledger is final (from
+its files while they last, then its tombstone — a waiter that had the session
+in hand when a reap came reads the tombstone), so a turn past N is still
+`turn`, anything else `exit` with the last `last_message`; `state` is null.
 The reported `state` follows the ledger for hook agents (`.state` lags a turn's
 end by up to one monitor tick). `wait` only reads: it never acknowledges
 `done` and never writes `.state`.
@@ -1033,7 +1049,8 @@ removed.
 ### 10. `seagents read` — the conversation
 
 Content comes from the agent's own transcript (the path its hooks
-reported in `.agent`; `--transcript PATH` reads any file, its format told
+reported in `.agent`, or kept in its tombstone once it has exited and been
+reaped; `--transcript PATH` reads any file, its format told
 from its first lines — a Codex rollout wraps every line in `{timestamp,
 type, payload}`, a Claude transcript never does), never the screen.
 Everything is parsed into the **common record model** (`transcript/model.rs`):

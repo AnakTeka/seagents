@@ -140,22 +140,38 @@ fn source(args: &Args) -> Result<Source, String> {
         return Ok(Source { path: p.clone(), format, cwd: None, ended_at: None });
     }
     let target = args.target.as_deref().unwrap_or_default();
-    let session = registry::resolve_target(target)?;
-    let tag = &session.meta.tag;
-    let adapter = crate::adapter::for_command(session.meta.agent())?;
+    // An exited agent's conversation is still on disk: its files say where
+    // while they last, then the tombstone its reap left.
+    let (tag, command, cwd, agent, ended) = match registry::resolve_exited(target)? {
+        registry::Found::Session(s) => {
+            let alive = crate::procfs::alive(s.child_pid());
+            let agent = if alive { registry::read_agent(&s.files) } else { registry::final_agent(&s) };
+            (s.meta.tag.clone(), s.meta.agent().to_string(), s.meta.cwd.clone(), agent, !alive)
+        }
+        registry::Found::Exited(t) => {
+            let agent = t.ledger();
+            (t.tag, t.agent, t.cwd, agent, true)
+        }
+    };
+    let adapter = crate::adapter::for_command(&command)?;
     let format = adapter
         .read
         .transcript
-        .ok_or_else(|| format!("{tag} runs {:?}, whose transcript seagents cannot read", session.meta.agent()))?;
-    let agent = registry::read_agent(&session.files);
+        .ok_or_else(|| format!("{tag} runs {command:?}, whose transcript seagents cannot read"))?;
     let path = agent
         .transcript_path
-        .ok_or_else(|| format!("{tag} has not reported its transcript yet (no hook has fired)"))?;
-    let ended_at = agent.stopped_at.filter(|&s| agent.prompted_at.is_none_or(|p| p <= s));
+        .ok_or_else(|| match ended {
+            true => format!("{tag} exited without reporting a transcript (no hook fired)"),
+            false => format!("{tag} has not reported its transcript yet (no hook has fired)"),
+        })?;
+    // Nothing more will be written by an agent that has exited.
+    let ended_at = agent
+        .stopped_at
+        .filter(|&s| !ended && agent.prompted_at.is_none_or(|p| p <= s));
     Ok(Source {
         path: PathBuf::from(path),
         format,
-        cwd: Some(PathBuf::from(&session.meta.cwd)),
+        cwd: Some(PathBuf::from(cwd)),
         ended_at,
     })
 }

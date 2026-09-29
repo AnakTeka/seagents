@@ -80,7 +80,7 @@ seagents wait review-auth --after 0 --timeout 100s
 | `idle` | 0 | (no `--after`) nothing running; `last_message` is its last result |
 | `timeout` | 2 | call the same `wait` again |
 | `blocked` | 3 | **stop and tell the human**: which child (tag), and the gate (`rule`, e.g. a permission prompt or the folder-trust dialog). Never answer it yourself. Then wait again with the same N |
-| `exit` | 4 | the child is gone (crashed, or someone closed it); use the last `last_message` you got. Once it has been cleaned up, `wait` exits 1 with "no live agent tagged …" instead: same meaning |
+| `exit` | 4 | the child is gone (crashed, stopped, or someone closed it); `last_message` is its last turn's result. `wait` and `read` keep answering for an exited child for a day (until its tag is reused); `send`/`stop` exit 1 |
 | `interrupted` | 5 | a human pressed Esc on that turn; it has no report. Ask the human, or `send` again |
 
 A restored agent (after a reboot) starts again at `stops: 0`: call `wait`

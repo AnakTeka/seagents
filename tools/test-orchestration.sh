@@ -334,6 +334,21 @@ for _ in $(seq 1 20); do [ -z "$(window_of it-a)" ] && break; sleep 0.25; done
 [ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
 pass "stop it-a: wait --for exit returned exit (rc 4), the socket and its prompt files are gone, the window closed"
 
+# 6b. After the reap (any status does it), it-a is a tombstone: wait still
+#     answers for it — exit, or the turn it was asked about — and read still
+#     reads its transcript; driving it needs a live agent.
+"$SEA" status > /dev/null
+[ -z "$(meta_of it-a)" ] && [ -f "$CACHE/it-a.exited" ] || fail "it-a was not reaped into a tombstone"
+out=$("$SEA" wait it-a --timeout 5s); rc=$?
+[ $rc -eq 4 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "exit 6" ] \
+  && echo "$out" | jq_ "d['last_message']" | grep -q DELTA || fail "wait on a reaped agent: rc=$rc $out"
+out=$("$SEA" wait it-a --after 5 --timeout 5s); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['reason']")" = turn ] || fail "wait --after 5 on a reaped agent: rc=$rc $out"
+"$SEA" read it-a --tail 2 | grep -q DELTA || fail "read of a reaped agent"
+"$SEA" send it-a 'never' > /dev/null 2>&1; rc=$?
+[ $rc -eq 1 ] || fail "send to a reaped agent: rc=$rc"
+pass "reaped it-a: wait says exit (rc 4, last_message DELTA), --after 5 still gets its turn, read works, send refuses"
+
 # 7. Codex: the same loop through its adapter — hooks injected as one trusted
 #    `-c hooks=…` (no "hooks need review" dialog, or no turn would land), the
 #    rollout read as the transcript, an Esc read as an interrupt, pastes of

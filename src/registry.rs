@@ -374,18 +374,27 @@ pub(crate) fn reap() {
 
 fn reap_in(dir: &Dirs) {
     let all = all_in(dir);
-    for s in all.iter().filter(|s| !is_alive(&s.meta)) {
+    let (live, dead): (Vec<&Session>, Vec<&Session>) = all.iter().partition(|s| is_alive(&s.meta));
+    let live_tags: HashSet<&str> = live.iter().map(|s| s.meta.tag.as_str()).collect();
+    let now = crate::clock::unix_now();
+    for s in dead {
+        // Written before anything goes, so a reader that finds the `.agent`
+        // gone finds this ([`final_agent`]). A live agent holding the tag
+        // again has superseded it.
+        if !s.meta.tag.is_empty() && !live_tags.contains(s.meta.tag.as_str()) {
+            let stone = Tombstone::of(s, now);
+            if let Ok(text) = serde_json::to_vec(&stone) {
+                write_atomic(&tombstone_path(dir, &s.meta.tag), &text);
+            }
+        }
         let f = &s.files;
         for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock, &f.sock] {
             let _ = fs::remove_file(path);
         }
         remove_prompts(&s.meta);
     }
-    let owned: HashSet<u64> = all
-        .iter()
-        .filter(|s| is_alive(&s.meta))
-        .map(|s| s.meta.wrapper_pid)
-        .collect();
+    prune_tombstones(dir, now);
+    let owned: HashSet<u64> = live.iter().map(|s| s.meta.wrapper_pid).collect();
     let Ok(entries) = fs::read_dir(&dir.runtime) else {
         return;
     };
@@ -441,6 +450,154 @@ fn resolve_target_in(dir: &Dirs, target: &str) -> Result<Session, String> {
 
 fn live_by_tag(dir: &Dirs, tag: &str) -> Option<Session> {
     list_in(dir).into_iter().find(|s| s.meta.tag == tag)
+}
+
+// ---------------------------------------------------------------------------
+// Exited agents
+// ---------------------------------------------------------------------------
+
+/// Tombstones older than this are pruned by [`reap`].
+const TOMBSTONE_TTL: u64 = 24 * 3600;
+
+/// What is left of an agent once its session is reaped: `<tag>.exited` in
+/// the cache, so a caller that waits on a child which has since exited — and
+/// been cleaned up by whoever looked first — still gets its last result
+/// rather than "no such agent". Written by [`reap`] (which deletes the
+/// session), removed when a new agent claims the tag
+/// ([`TagClaim::create_meta`]) and by [`reap`] after a day. Only `wait` and
+/// `read` look at it ([`resolve_exited`]); everything that drives an agent
+/// needs a live one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct Tombstone {
+    pub(crate) tag: String,
+    pub(crate) wrapper_pid: u64,
+    /// When the session was found gone (Unix s) — within one `status`/HUD
+    /// poll of its exit, as they are what reap.
+    pub(crate) exited_at: u64,
+    /// The agent's command (`claude`, `codex`): which adapter reads its
+    /// transcript.
+    #[serde(default)]
+    pub(crate) agent: String,
+    /// Its working directory, which a prompt sent by reference is relative to.
+    #[serde(default)]
+    pub(crate) cwd: String,
+    /// The ledger as it ended.
+    #[serde(default)]
+    pub(crate) stops: u64,
+    #[serde(default)]
+    pub(crate) last_message: Option<String>,
+    #[serde(default)]
+    pub(crate) transcript_path: Option<String>,
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
+}
+
+impl Tombstone {
+    fn of(s: &Session, exited_at: u64) -> Tombstone {
+        let a = read_agent(&s.files);
+        Tombstone {
+            tag: s.meta.tag.clone(),
+            wrapper_pid: s.meta.wrapper_pid,
+            exited_at,
+            agent: s.meta.agent().to_string(),
+            cwd: s.meta.cwd.clone(),
+            stops: a.stops,
+            last_message: a.last_message,
+            transcript_path: a.transcript_path,
+            session_id: a.session_id,
+        }
+    }
+
+    /// The ledger it keeps, as the record a live agent's `.agent` would be.
+    pub(crate) fn ledger(&self) -> AgentRecord {
+        AgentRecord {
+            stops: self.stops,
+            last_message: self.last_message.clone(),
+            transcript_path: self.transcript_path.clone(),
+            session_id: self.session_id.clone(),
+            ..AgentRecord::default()
+        }
+    }
+}
+
+fn tombstone_path(dir: &Dirs, tag: &str) -> PathBuf {
+    dir.join(&format!("{tag}.exited"))
+}
+
+fn read_tombstone(dir: &Dirs, tag: &str) -> Option<Tombstone> {
+    serde_json::from_str(&fs::read_to_string(tombstone_path(dir, tag)).ok()?).ok()
+}
+
+/// Remove tombstones past [`TOMBSTONE_TTL`], and any that do not parse.
+fn prune_tombstones(dir: &Dirs, now: u64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("exited") {
+            continue;
+        }
+        let stale = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Tombstone>(&t).ok())
+            .is_none_or(|t| now.saturating_sub(t.exited_at) > TOMBSTONE_TTL);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// What a target names when it may have exited: a session (live, or dead
+/// and not yet reaped — its files still say how it ended), or the tombstone
+/// of one that has been reaped.
+#[derive(Debug)]
+pub(crate) enum Found {
+    Session(Session),
+    Exited(Tombstone),
+}
+
+/// [`resolve_target`], then — for a tag no live agent holds — the newest
+/// dead session holding it, then its tombstone. For `wait` and `read` only:
+/// a finished child's result stays readable after it exits.
+pub(crate) fn resolve_exited(target: &str) -> Result<Found, String> {
+    resolve_exited_in(&Dirs::live(), target)
+}
+
+fn resolve_exited_in(dir: &Dirs, target: &str) -> Result<Found, String> {
+    let err = match resolve_target_in(dir, target) {
+        Ok(s) => return Ok(Found::Session(s)),
+        Err(e) => e,
+    };
+    let tag = target.strip_prefix('@').unwrap_or(target);
+    if !valid_tag(tag) {
+        return Err(err);
+    }
+    let dead = all_in(dir)
+        .into_iter()
+        .filter(|s| s.meta.tag == tag)
+        .max_by_key(|s| (s.meta.started, s.meta.wrapper_pid));
+    if let Some(s) = dead {
+        return Ok(Found::Session(s));
+    }
+    read_tombstone(dir, tag).map(Found::Exited).ok_or(err)
+}
+
+/// A session's ledger when it may have ended: its `.agent`, or — once a
+/// reap has deleted that — what its tombstone kept. `reap` writes the
+/// tombstone before it deletes anything, so one of the two is always there.
+pub(crate) fn final_agent(session: &Session) -> AgentRecord {
+    final_agent_in(&Dirs::live(), session)
+}
+
+fn final_agent_in(dir: &Dirs, session: &Session) -> AgentRecord {
+    match fs::read_to_string(&session.files.agent) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => read_tombstone(dir, &session.meta.tag)
+            .filter(|t| t.wrapper_pid == session.meta.wrapper_pid)
+            .map(|t| t.ledger())
+            .unwrap_or_default(),
+    }
 }
 
 /// The live session process `pid` runs inside: the first of its `/proc`
@@ -556,6 +713,8 @@ pub(crate) struct TagClaim {
     pub(crate) depth: u32,
     /// Where a `spawn` reservation of this tag would be; consumed on create.
     pending: PathBuf,
+    /// Where a previous holder's tombstone would be; superseded on create.
+    exited: PathBuf,
     _lock: Lock,
 }
 
@@ -569,8 +728,10 @@ impl TagClaim {
         meta.depth = self.depth;
         write_new_meta(files, &meta);
         // The session now holds the tag itself; a `spawn` that reserved it
-        // for us has nothing left to hold.
+        // for us has nothing left to hold, and an agent that held it before
+        // is no longer what the name means.
         let _ = fs::remove_file(&self.pending);
+        let _ = fs::remove_file(&self.exited);
     }
 }
 
@@ -629,6 +790,7 @@ fn claim_tag_in(
     };
     Ok(TagClaim {
         pending: pending_path(dir, &tag),
+        exited: tombstone_path(dir, &tag),
         tag,
         parent,
         depth,
@@ -1496,6 +1658,80 @@ mod tests {
         assert!(gone.agent.exists());
         reap_in(&dir);
         assert!(!gone.agent.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reaped_agent_leaves_a_tombstone_that_wait_and_read_resolve() {
+        let dir = scratch("tombstone");
+        let gone = Files::in_dir(&dir, 2);
+        let mut meta = sample(2, Some(u32::MAX as u64));
+        meta.tag = "worker".into();
+        write_new_meta(&gone, &meta);
+        update_agent(&gone, |r| {
+            r.stops = 3;
+            r.last_message = Some("done: 4 files".into());
+            r.transcript_path = Some("/t.jsonl".into());
+            r.session_id = Some("s1".into());
+        });
+        let session = || Session { files: gone.clone(), meta: meta.clone() };
+
+        // Dead but not reaped: the session itself, its ledger from its files.
+        assert!(resolve_target_in(&dir, "worker").is_err(), "not a live agent");
+        assert!(matches!(resolve_exited_in(&dir, "@worker"), Ok(Found::Session(s)) if s.meta.wrapper_pid == 2));
+        assert_eq!(final_agent_in(&dir, &session()).stops, 3);
+
+        reap_in(&dir);
+        assert!(!gone.agent.exists());
+        let Ok(Found::Exited(t)) = resolve_exited_in(&dir, "worker") else {
+            panic!("no tombstone");
+        };
+        assert_eq!((t.wrapper_pid, t.agent.as_str(), t.cwd.as_str()), (2, "claude", "/home/u/proj"));
+        let ledger = t.ledger();
+        assert_eq!((ledger.stops, ledger.last_message.as_deref()), (3, Some("done: 4 files")));
+        assert_eq!((ledger.transcript_path.as_deref(), ledger.session_id.as_deref()), (Some("/t.jsonl"), Some("s1")));
+        // A waiter that had the session in hand when the reap came reads the
+        // same ledger from the tombstone.
+        assert_eq!(final_agent_in(&dir, &session()), ledger);
+        // Unknown tags and live-only resolution are unchanged.
+        assert!(resolve_exited_in(&dir, "nobody").unwrap_err().contains("no live agent"));
+        assert!(resolve_target_in(&dir, "worker").is_err());
+
+        // A new agent claiming the name supersedes it.
+        create(&dir, 5, Some("worker"), None).unwrap();
+        assert!(!tombstone_path(&dir, "worker").exists());
+        assert!(matches!(resolve_exited_in(&dir, "worker"), Ok(Found::Session(s)) if s.meta.wrapper_pid == 5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_tombstone_while_a_live_agent_holds_the_tag_and_old_ones_are_pruned() {
+        let dir = scratch("tombprune");
+        create(&dir, 1, Some("busy"), None).unwrap();
+        let mut dead = sample(2, Some(u32::MAX as u64));
+        dead.tag = "busy".into();
+        write_new_meta(&Files::in_dir(&dir, 2), &dead);
+        let old = Tombstone {
+            tag: "old".into(),
+            wrapper_pid: 9,
+            exited_at: crate::clock::unix_now() - TOMBSTONE_TTL - 1,
+            agent: "claude".into(),
+            cwd: String::new(),
+            stops: 1,
+            last_message: None,
+            transcript_path: None,
+            session_id: None,
+        };
+        fs::write(tombstone_path(&dir, "old"), serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::write(tombstone_path(&dir, "torn"), "{").unwrap();
+        let fresh = Tombstone { tag: "fresh".into(), exited_at: crate::clock::unix_now(), ..old.clone() };
+        fs::write(tombstone_path(&dir, "fresh"), serde_json::to_vec(&fresh).unwrap()).unwrap();
+
+        reap_in(&dir);
+        assert!(!tombstone_path(&dir, "busy").exists(), "the live holder is what `busy` means");
+        assert!(!tombstone_path(&dir, "old").exists());
+        assert!(!tombstone_path(&dir, "torn").exists());
+        assert!(tombstone_path(&dir, "fresh").exists());
         fs::remove_dir_all(&dir).ok();
     }
 
