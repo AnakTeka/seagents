@@ -60,7 +60,15 @@ fi
 nd_start
 
 WORK="$REPO/target/sg-it/orchestration"
-mkdir -p "$WORK"
+# Codex runs in a directory of its own: its Linux sandbox leaves empty `.git`,
+# `.codex` and `.agents` mount points in its cwd, and Claude reads that `.git`
+# as the root of a separate, never-trusted project — every later Claude run in
+# the shared directory would open on the folder-trust dialog.
+CODEX_WORK="$REPO/target/sg-it/orchestration-codex"
+for d in "$WORK" "$CODEX_WORK"; do
+  mkdir -p "$d"
+  for m in .git .codex .agents; do rmdir "$d/$m" 2>/dev/null; done
+done
 CACHE="$HOME/.cache/seagents"
 HAIKU=(--arg --model --arg haiku)
 
@@ -332,7 +340,7 @@ model_reasoning_effort = "low"
 [projects."$REPO"]
 trust_level = "trusted"
 EOF
-out=$(cd "$WORK" && "$SEA" spawn --agent codex --tag it-c -- 'Reply with exactly: CHARLIE') \
+out=$(cd "$CODEX_WORK" && "$SEA" spawn --agent codex --tag it-c -- 'Reply with exactly: CHARLIE') \
   || fail "codex spawn exited $?: $out"
 argv=$(meta_of it-c | jq_ "d['argv']")
 [ "$argv" = "['codex']" ] || fail "codex recorded argv: $argv"
@@ -366,7 +374,7 @@ python3 -c "print('\n'.join(['Line %d: filler for the paste test' % i for i in r
 out=$("$SEA" send it-c --prompt-file "$body"); n=$(echo "$out" | jq_ "d['stops']")
 out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "codex long send: rc=$rc $out"
-[ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "a codex paste went by reference"
+[ -z "$(ls "$CODEX_WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "a codex paste went by reference"
 pass "a 41-line send was pasted whole (no prompt file) and answered LONGOK"
 
 # Esc mid-turn: Codex records turn_aborted, and no Stop comes.

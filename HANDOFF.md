@@ -1163,6 +1163,12 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ## Limitations & gotchas
 
+- **Codex leaves empty `.git`/`.codex`/`.agents` directories in its cwd** (its
+  Linux sandbox's mount points) when the cwd is not already a repo root. Claude
+  then reads that `.git` as the root of a separate, never-trusted project, so
+  the next Claude started there opens on the folder-trust dialog (`wait` reports
+  it as `blocked`). Mixing both tools in one non-root directory hits this; the
+  integration test runs Codex in a directory of its own for that reason.
 - **Existing sessions need relaunching after upgrades** — the tee/`con_id` only
   exist for agents started via `seagents run`. Agents already running, or started
   before a change, won't be tracked/fixed until relaunched.
