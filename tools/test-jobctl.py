@@ -43,20 +43,26 @@ def main() -> int:
 
     out = b""
 
-    def drain(timeout: float) -> None:
+    def read_until(pattern: str, timeout: float) -> bool:
+        """Read until `pattern` matches the transcript so far, or `timeout`.
+        Waiting on the event instead of a fixed window keeps a slow box from
+        failing and a fast one from checking too early."""
         nonlocal out
         end = time.time() + timeout
         while time.time() < end:
+            if re.search(pattern, out.decode(errors="replace")):
+                return True
             try:
                 data = os.read(fd, 4096)
-                if data:
-                    out += data
-                else:
-                    time.sleep(0.05)
             except BlockingIOError:
-                time.sleep(0.05)
+                time.sleep(0.02)
+                continue
             except OSError:
                 break
+            if not data:
+                break
+            out += data
+        return bool(re.search(pattern, out.decode(errors="replace")))
 
     def send(s: str) -> None:
         os.write(fd, s.encode())
@@ -69,33 +75,43 @@ def main() -> int:
 
     # Markers are quote-split on the command line so the terminal's echo of the
     # command itself can never satisfy the assertions.
-    drain(1.0)
+    if not read_until(r"SHELL\$ ", 5.0):
+        return fail("bash never showed its prompt")
     send(f"{binary} run sh -c 'echo ST''ART; kill -TSTP $$; echo RES''UMED'\n")
-    drain(2.0)
+    # bash reports the job only once the wrapper has stopped itself, and the
+    # wrapper stops only after relaying what the agent printed before its
+    # stop — so START must already be here when Stopped is. (It used to race:
+    # the wrapper froze its own output pump with START still on the pty.)
+    if not read_until(r"Stopped", 5.0):
+        if "START" not in out.decode(errors="replace"):
+            return fail("inner command never ran")
+        return fail("shell never reported the job Stopped — suspend did not propagate")
     text = out.decode(errors="replace")
     if "START" not in text:
-        return fail("inner command never ran")
+        return fail("inner command never ran — or its output was not relayed before the stop")
     if "RESUMED" in text:
         return fail("inner command resumed before fg — stop was not delivered")
-    if not re.search(r"Stopped", text):
-        return fail("shell never reported the job Stopped — suspend did not propagate")
     print("OK: suspend propagated to the shell")
 
     send("fg\n")
-    drain(2.0)
-    if "RESUMED" not in out.decode(errors="replace"):
+    if not read_until(r"RESUMED", 5.0):
         return fail("fg did not resume the inner command")
     print("OK: fg resumed the inner command")
 
+    # Until the wrapper has exited, its input pump owns the keyboard: anything
+    # typed now goes to the finished agent's pty, not to bash. Wait for bash.
+    if not read_until(r"RESUMED[\s\S]*SHELL\$ ", 5.0):
+        return fail("the wrapper never exited back to the shell")
+
     send("echo EXIT_$?\n")
-    drain(1.0)
+    read_until(r"EXIT_\d+", 5.0)
     m = re.search(r"EXIT_(\d+)", out.decode(errors="replace"))
     if not m or m.group(1) != "0":
         return fail(f"wrapper exit code was {m.group(1) if m else 'missing'}, expected 0")
     print("OK: wrapper exited 0 — full suspend/resume round trip works")
 
     send("exit\n")
-    drain(0.5)
+    os.waitpid(pid, 0)
     return 0
 
 if __name__ == "__main__":

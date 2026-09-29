@@ -263,8 +263,11 @@ raises on Ctrl+Z (this is why suspend "did nothing" before 2026-07-08). Instead
 `run` spawns a hidden anchor (`seagents __lead <cmd>`) as session leader, which
 forks the agent into its own foreground process group — de-orphaned, so Ctrl+Z
 stops it normally. The anchor mirrors the stop upward with `raise(SIGSTOP)`
-(not discardable); the wrapper waits with `WUNTRACED`, restores the outer
-terminal, and suspends itself, so your shell shows the job as `Stopped`. `fg`
+(not discardable); the wrapper waits with `WUNTRACED`, has its output pump
+relay whatever the agent printed on its way down (stopping itself freezes the
+pump too — until 2026-09 that race left Claude's "run `fg`" line, or any last
+output, unshown until `fg`, and made `tools/test-jobctl.py` flake), restores the
+outer terminal, and suspends itself, so your shell shows the job as `Stopped`. `fg`
 unwinds the chain: wrapper re-raws + resizes, continues the anchor, anchor
 continues the agent's group and nudges a repaint with SIGWINCH.
 

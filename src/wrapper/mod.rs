@@ -103,6 +103,11 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
             return 1;
         }
     };
+    // Always there on unix; the pump polls it alongside its blocking reads.
+    let Some(master_fd) = pair.master.as_raw_fd() else {
+        eprintln!("seagents: the pty master has no file descriptor");
+        return 1;
+    };
     let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
     // Open the tee target and write the identity sidecar. Both best-effort.
@@ -117,7 +122,7 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
     // through untouched (the inner PTY's line discipline does the cooking).
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
 
-    let reader_handle = pumps::spawn_output(reader, tee, files.clone());
+    let (reader_handle, drain) = pumps::spawn_output(reader, master_fd, tee, files.clone());
     pumps::spawn_input(writer, files.clone());
     pumps::spawn_resize(&master);
 
@@ -128,7 +133,7 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
         monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd);
     }
 
-    let code = wait_forwarding_job_control(&mut child, &master, raw);
+    let code = wait_forwarding_job_control(&mut child, &master, drain.as_ref(), raw);
 
     // Let the output pump drain anything buffered before we tear down.
     let _ = reader_handle.join();
@@ -169,13 +174,15 @@ fn identify_window(handle: Option<&str>) -> (Option<u64>, Option<u64>) {
 /// Claude (and other TUIs) implement Ctrl+Z by stopping themselves on the
 /// inner PTY — a plain wait() never sees that, so the wrapper would sit
 /// running while the child is frozen and the user's shell never gets its
-/// prompt back. Waiting with WUNTRACED mirrors the stop: restore the outer
-/// terminal, suspend ourselves (now the shell shows the job as suspended);
-/// when the user resumes us, re-enter raw mode, push the possibly-changed
-/// size, and continue the child.
+/// prompt back. Waiting with WUNTRACED mirrors the stop: let the output pump
+/// relay what the agent wrote before stopping, restore the outer terminal,
+/// suspend ourselves (now the shell shows the job as suspended); when the
+/// user resumes us, re-enter raw mode, push the possibly-changed size, and
+/// continue the child.
 fn wait_forwarding_job_control(
     child: &mut Box<dyn Child + Send + Sync>,
     master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    drain: Option<&pumps::OutputDrain>,
     raw: bool,
 ) -> i32 {
     match child.process_id() {
@@ -193,6 +200,13 @@ fn wait_forwarding_job_control(
                     break 1; // ECHILD: nothing left to wait for
                 }
                 if libc::WIFSTOPPED(status) {
+                    // Stopping ourselves freezes the output pump with us, so
+                    // first let it relay what the agent printed on its way
+                    // down (Claude's "run `fg`" line). Nothing new can come:
+                    // the agent and the anchor are both stopped by now.
+                    if let Some(drain) = drain {
+                        drain.wait();
+                    }
                     if raw {
                         let _ = crossterm::terminal::disable_raw_mode();
                     }

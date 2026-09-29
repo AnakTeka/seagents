@@ -3,7 +3,8 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use portable_pty::MasterPty;
@@ -12,12 +13,25 @@ use crate::registry::Files;
 use crate::window;
 
 /// Output pump: master -> stdout (+ tee). This owns the "T-junction".
+///
+/// It waits in `poll` rather than a blocking `read` so that it can also be
+/// woken by [`OutputDrain::wait`]: the wrapper stops its *whole process* when
+/// the agent suspends, pump thread included, and whatever the agent wrote just
+/// before stopping — Claude's "run `fg` to resume" line — would otherwise sit
+/// unread on the master until `fg`.
 pub(super) fn spawn_output(
     mut reader: Box<dyn Read + Send>,
+    master_fd: RawFd,
     tee: Option<File>,
     files: Files,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
+) -> (JoinHandle<()>, Option<OutputDrain>) {
+    // Without a pipe (fd exhaustion) the pump just relays; suspends then work
+    // as they did before draining existed.
+    let (drain, wake) = match OutputDrain::new() {
+        Some((drain, wake, done)) => (Some(drain), Some((wake, done))),
+        None => (None, None),
+    };
+    let handle = thread::spawn(move || {
         let mut out = std::io::stdout();
         let mut tee = tee;
         let mut buf = [0u8; 8192];
@@ -29,36 +43,124 @@ pub(super) fn spawn_output(
         const ROTATE_AT: u64 = 16 * 1024 * 1024;
         const CHECK_EVERY: u64 = 4 * 1024 * 1024;
         let mut since_check: u64 = 0;
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let data = &buf[..n];
-                    if out.write_all(data).is_err() {
-                        break;
-                    }
-                    let _ = out.flush();
-                    if let Some(f) = tee.as_mut() {
-                        let _ = f.write_all(data);
-                        let _ = f.flush();
-                        since_check += n as u64;
-                        if since_check >= CHECK_EVERY {
-                            since_check = 0;
-                            let oversize =
-                                f.metadata().map(|m| m.len() > ROTATE_AT).unwrap_or(false);
-                            if oversize {
-                                if let Some(rotated) = rotate_tee(&files) {
-                                    tee = Some(rotated);
+        // One read + relay. False once the pty is gone (child exited: EIO) or
+        // stdout is.
+        let mut relay = |reader: &mut Box<dyn Read + Send>| -> bool {
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => return false,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        if out.write_all(data).is_err() {
+                            return false;
+                        }
+                        let _ = out.flush();
+                        if let Some(f) = tee.as_mut() {
+                            let _ = f.write_all(data);
+                            let _ = f.flush();
+                            since_check += n as u64;
+                            if since_check >= CHECK_EVERY {
+                                since_check = 0;
+                                let oversize =
+                                    f.metadata().map(|m| m.len() > ROTATE_AT).unwrap_or(false);
+                                if oversize {
+                                    if let Some(rotated) = rotate_tee(&files) {
+                                        tee = Some(rotated);
+                                    }
                                 }
                             }
                         }
+                        return true;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return false,
+                }
+            }
+        };
+        loop {
+            let wake_fd = wake.as_ref().map_or(-1, |(w, _)| w.as_raw_fd());
+            let (output, drain_asked) = match poll_output(master_fd, wake_fd, true) {
+                Some(ready) => ready,
+                None => break,
+            };
+            if output && !relay(&mut reader) {
+                break;
+            }
+            if let Some((wake, done)) = wake.as_ref().filter(|_| drain_asked) {
+                let _ = (&*wake).read(&mut [0u8; 64]);
+                // Relay until the master has nothing left. The agent is stopped
+                // by now, so nothing new can arrive behind this.
+                while poll_output(master_fd, -1, false) == Some((true, false)) {
+                    if !relay(&mut reader) {
+                        return;
                     }
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                let _ = done.send(());
             }
         }
-    })
+    });
+    (handle, drain)
+}
+
+/// `poll` the master for output and the drain-request pipe `wake` (-1: none);
+/// blocking, or returning at once. `(output ready, drain asked)`, or `None`
+/// when polling itself failed.
+///
+/// A hangup counts as output ready: the read that follows is what reports the
+/// pty gone. The zero-timeout form is exact, not a guess: before answering
+/// "nothing to read", the tty layer's `poll` flushes the work queue that moves
+/// bytes the slave side wrote across to the master (`tty_buffer_flush_work`),
+/// so a write that returned before the agent stopped is visible here.
+fn poll_output(master_fd: RawFd, wake: RawFd, block: bool) -> Option<(bool, bool)> {
+    // A negative fd is skipped by `poll` and reports no events.
+    let mut fds = [
+        libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+    ];
+    let timeout = if block { -1 } else { 0 };
+    loop {
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if r >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+    let ready = |p: &libc::pollfd| p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+    Some((ready(&fds[0]), ready(&fds[1])))
+}
+
+/// The wrapper's handle on the output pump for a suspend: see
+/// [`OutputDrain::wait`].
+pub(super) struct OutputDrain {
+    wake: File,
+    done: mpsc::Receiver<()>,
+}
+
+impl OutputDrain {
+    /// A pipe to wake the pump's `poll` (the pump keeps its read end) and a
+    /// channel for its answer.
+    fn new() -> Option<(OutputDrain, File, mpsc::Sender<()>)> {
+        let mut fds = [-1 as libc::c_int; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        Some((OutputDrain { wake: write, done: rx }, read, tx))
+    }
+
+    /// Block until everything already on the master has reached stdout (and
+    /// the tee) — called once the agent has stopped, before the wrapper stops
+    /// itself. Bounded, so a terminal that won't take output can delay a
+    /// suspend but never swallow it; returns at once if the pump has ended.
+    pub(super) fn wait(&self) {
+        while self.done.try_recv().is_ok() {} // a stale answer from a timed-out wait
+        if (&self.wake).write_all(b"d").is_ok() {
+            let _ = self.done.recv_timeout(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// Input pump: stdin -> master. Detached; the process exit reaps it.
