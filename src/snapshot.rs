@@ -60,7 +60,7 @@ const SNAPSHOT_INTERVAL_SECS: u64 = 30;
 /// Seconds between window launches during a restore. Resuming a conversation
 /// replays its transcript, so twenty at once would hammer a machine that is
 /// still finishing its own boot.
-const DEFAULT_STAGGER_SECS: u64 = 2;
+pub(crate) const DEFAULT_STAGGER_SECS: u64 = 2;
 
 pub(crate) fn snapshot_path() -> PathBuf {
     let dir = crate::vendor::herdr_detect::config::state_dir();
@@ -757,19 +757,7 @@ fn workspace_sort_key(name: &str) -> (u8, u64, String) {
 // ---------------------------------------------------------------------------
 
 /// `seagents snapshot [--refresh] [--print]` — force a capture now.
-pub fn snapshot_cmd(args: &[String]) -> i32 {
-    let mut refresh = false;
-    let mut print_json = false;
-    for a in args {
-        match a.as_str() {
-            "--refresh" => refresh = true,
-            "--print" => print_json = true,
-            other => {
-                eprintln!("seagents snapshot: unknown option {other}");
-                return 2;
-            }
-        }
-    }
+pub fn snapshot_cmd(refresh: bool, print_json: bool) -> i32 {
     match capture(refresh) {
         Ok(snapshot) => {
             if print_json {
@@ -839,28 +827,7 @@ fn summarize(snapshot: &Value) {
 }
 
 /// `seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]`
-pub fn restore_cmd(args: &[String]) -> i32 {
-    let mut dry_run = false;
-    let mut stagger = DEFAULT_STAGGER_SECS;
-    let mut only: Option<String> = None;
-    for a in args {
-        match a.as_str() {
-            "--dry-run" | "-n" => dry_run = true,
-            s if s.starts_with("--stagger=") => match s[10..].parse::<u64>() {
-                Ok(n) => stagger = n,
-                Err(_) => {
-                    eprintln!("seagents restore: --stagger wants seconds, got {}", &s[10..]);
-                    return 2;
-                }
-            },
-            s if s.starts_with("--workspace=") => only = Some(s[12..].to_string()),
-            other => {
-                eprintln!("seagents restore: unknown option {other}");
-                return 2;
-            }
-        }
-    }
-
+pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
     let path = snapshot_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(

@@ -94,8 +94,9 @@ pub(crate) struct Session {
     pub(crate) title: String,
 }
 
-/// The three questions the list can be ordered to answer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// The three questions the list can be ordered to answer. Also the value of
+/// `status --sort`, so the variant docs double as its help text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub(crate) enum Sort {
     /// Triage: who needs me most, longest-waiting first.
     Urgency,
@@ -114,13 +115,9 @@ impl Sort {
         }
     }
 
+    /// The inverse of [`Sort::word`]; the same spelling `--sort` accepts.
     pub(crate) fn parse(s: &str) -> Option<Sort> {
-        match s {
-            "urgency" => Some(Sort::Urgency),
-            "dir" => Some(Sort::Dir),
-            "recent" => Some(Sort::Recent),
-            _ => None,
-        }
+        <Sort as clap::ValueEnum>::from_str(s, false).ok()
     }
 
     /// Cycle order for the HUD's `s` key.
@@ -182,7 +179,7 @@ pub fn print(sort: Sort) -> i32 {
             cw = cmd_w,
         );
     }
-    if let Some(warning) = crate::manifest_health_warning() {
+    if let Some(warning) = crate::detect::manifest_health_warning() {
         eprintln!("⚠ {warning}");
     }
     0

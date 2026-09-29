@@ -26,7 +26,7 @@ const REFRESH: Duration = Duration::from_millis(750);
 pub fn run() -> i32 {
     // Long-lived surface → good place to opportunistically refresh detection
     // manifests (daily-throttled, background, silent).
-    crate::spawn_manifest_update();
+    crate::detect::spawn_manifest_update();
     if enable_raw_mode().is_err() {
         eprintln!("seagents: the HUD needs a terminal (try `seagents status` instead)");
         return 1;
@@ -147,7 +147,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
         help: false,
         // Surface detection-rule update problems where they'll be seen; the
         // help line is one keypress away from rediscovery.
-        message: crate::manifest_health_warning()
+        message: crate::detect::manifest_health_warning()
             .map(|w| format!("⚠ {w}"))
             .unwrap_or_else(help_line),
         rows_top: 1,

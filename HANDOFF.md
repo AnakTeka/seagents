@@ -129,9 +129,18 @@ seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]
                            rebuild that layout after a reboot, each window
                            resuming its own conversation
 seagents update-manifests  fetch fresh detection rules from herdr.dev now
-seagents debug-screen <raw_file> [cols] [rows] [--json] [--agent=<id>]
+seagents debug-screen <FILE> [COLS] [ROWS] [--agent A] [--json]
                            dev tool: render a .raw + the engine's explain verdict
 ```
+
+`seagents --help` and `seagents <command> --help` are generated from the clap
+definition in `main.rs`, so they are the authoritative reference. Every flag
+takes both `--flag value` and `--flag=value`. `run` passes everything after
+the agent's first word through untouched (`seagents run claude --model opus
+--help` hands `--help` to claude); `--window` is only `run`'s own when it comes
+before the command. Usage errors exit 2. `debug-screen` used to guess which
+argument was the file and which were the geometry (any number was a
+dimension); since the move to clap it is strictly file, then cols, then rows.
 
 HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
 keep focus on HUD); `g`/`G` = first/last row (vim-style, also previews);
@@ -154,7 +163,8 @@ says `▼ n more` — otherwise `q / esc` would silently fall off the end.
 
 Source layout under `src/`:
 
-- **`src/main.rs`** — CLI dispatch; manifest-update helpers.
+- **`src/main.rs`** — the command line only: the clap-derived `Cli`/`Command`
+  and `dispatch()` to the module that owns each command, plus parse tests.
 - **`src/wrapper/`** — `seagents run`, the pty-tee wrapper (§1):
   - `mod.rs` — setup and wiring: `run()` (window identity, pty + child,
     `.meta`, raw mode, thread start, the job-control wait loop),
@@ -176,7 +186,9 @@ Source layout under `src/`:
   `.state` transition rules), OSC-title parsing (`all_titles`,
   `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
-  vendored engine's verdicts on live-capture scenarios.
+  vendored engine's verdicts on live-capture scenarios; `debug_screen()`; the
+  manifest-update helpers (`update_manifests_now()`, the HUD's daily
+  `spawn_manifest_update()`, `manifest_health_warning()`).
 - **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
   (see its `VENDORED.md`): per-agent TOML rule manifests evaluated by a
   region/priority engine, self-updating from herdr.dev. This replaced our
