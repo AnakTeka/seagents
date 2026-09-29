@@ -1,7 +1,7 @@
 //! Launching a terminal window seagents can recognize afterwards.
 //!
-//! A window seagents opens itself — a restored agent today, a spawned one once
-//! orchestration lands — is launched carrying a minted handle,
+//! A window seagents opens itself — a restored or a spawned agent — is
+//! launched carrying a minted handle,
 //! `seagents-<tag>` ([`handle_for`]), so i3 can swallow it into a placeholder
 //! and `seagents run --tag` can identify it without a focus race. *Which*
 //! X11 property carries the handle is the terminal's business — a role for
@@ -184,42 +184,36 @@ pub(crate) fn matcher_for(class: &str) -> WindowMatch {
         .unwrap_or(WindowMatch::Instance)
 }
 
-/// Launch one terminal window running `argv` under `seagents run --tag <tag>`
-/// (and `--parent`, when given), carrying the handle minted from that tag.
+/// What a window seagents opens runs: `argv` under `seagents run --tag <tag>`
+/// (with `--parent` and `--seed-file` when given).
+pub(crate) struct Run<'a> {
+    pub(crate) tag: &'a str,
+    pub(crate) parent: Option<&'a str>,
+    /// A prompt file `run` delivers to the agent and deletes (`spawn`).
+    pub(crate) seed_file: Option<&'a Path>,
+    pub(crate) argv: &'a [String],
+    /// Leave the window at a shell when the agent exits — `restore`, which
+    /// reproduces windows you opened by hand, where closing the agent drops
+    /// you back to your prompt. `spawn` doesn't: a fan-out would otherwise
+    /// leave a dead shell per child.
+    pub(crate) keep_shell: bool,
+}
+
+/// Launch one terminal window running `run`, carrying the handle minted from
+/// its tag. The one launcher `restore` and `spawn` share.
 ///
-/// The agent runs under `seagents run` so the session is teed and
-/// tracked from its first byte, and the shell survives it — closing the agent
-/// leaves the window sitting at a prompt, exactly as it does when you start one
-/// by hand.
+/// The agent runs under `seagents run` so the session is teed and tracked
+/// from its first byte.
 ///
 /// `SEAGENTS_TERMINAL_CMD` overrides the whole invocation for terminals without
 /// a built-in recipe; `{handle}` (alias `{role}`), `{cwd}` and `{cmd}` are
 /// substituted.
-pub(crate) fn spawn_terminal(
-    tag: &str,
-    parent: Option<&str>,
-    cwd: &str,
-    argv: &[String],
-    class: &str,
-) -> Result<(), String> {
-    let handle = handle_for(tag);
+pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), String> {
+    let handle = handle_for(run.tag);
     // This very binary, by absolute path: the new window's shell has whatever
     // PATH its rc files give it, and the one it finds need not be us.
     let exe = std::env::current_exe().map_err(|e| format!("locating seagents: {e}"))?;
-    // `--tag` so the wrapper identifies its own window by `handle_for(tag)`
-    // rather than by winning a focus race it cannot win.
-    let mut inner = format!(
-        "{} run --tag {}",
-        shell_quote(&exe.to_string_lossy()),
-        shell_quote(tag)
-    );
-    if let Some(parent) = parent {
-        inner.push_str(&format!(" --parent {}", shell_quote(parent)));
-    }
-    inner.push_str(&format!(
-        " -- {}; exec \"$SHELL\"",
-        argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
-    ));
+    let inner = inner_command(&exe, run);
     let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
         return Err("terminal command is empty".to_string());
@@ -234,6 +228,29 @@ pub(crate) fn spawn_terminal(
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("launching {program}: {e}"))
+}
+
+/// The `sh -c` line the terminal runs. `--tag` so the wrapper identifies its
+/// own window by `handle_for(tag)` rather than by winning a focus race it
+/// cannot win.
+fn inner_command(exe: &Path, run: &Run) -> String {
+    let mut inner = format!(
+        "{} run --tag {}",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(run.tag)
+    );
+    if let Some(parent) = run.parent {
+        inner.push_str(&format!(" --parent {}", shell_quote(parent)));
+    }
+    if let Some(seed) = run.seed_file {
+        inner.push_str(&format!(" --seed-file {}", shell_quote(&seed.to_string_lossy())));
+    }
+    let argv = run.argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    if run.keep_shell {
+        format!("{inner} -- {argv}; exec \"$SHELL\"")
+    } else {
+        format!("exec {inner} -- {argv}")
+    }
 }
 
 /// Single-quote for `sh -c`.
@@ -259,6 +276,31 @@ mod tests {
         }
         assert_eq!(recipe_for_class("alacritty").as_deref(), Some("alacritty"));
         assert_eq!(recipe_for_class("Konsole"), None);
+    }
+
+    #[test]
+    fn the_inner_command_runs_this_binary_and_keeps_a_shell_only_when_asked() {
+        let argv: Vec<String> = ["claude", "--resume", "it's"].iter().map(|s| s.to_string()).collect();
+        let mut run = Run {
+            tag: "t1",
+            parent: None,
+            seed_file: None,
+            argv: &argv,
+            keep_shell: true,
+        };
+        let exe = Path::new("/opt/my bin/seagents");
+        assert_eq!(
+            inner_command(exe, &run),
+            r#"'/opt/my bin/seagents' run --tag 't1' -- 'claude' '--resume' 'it'\''s'; exec "$SHELL""#
+        );
+        run.parent = Some("boss");
+        run.seed_file = Some(Path::new("/run/user/1/seagents/seed-t1"));
+        run.keep_shell = false;
+        assert_eq!(
+            inner_command(exe, &run),
+            "exec '/opt/my bin/seagents' run --tag 't1' --parent 'boss' \
+             --seed-file '/run/user/1/seagents/seed-t1' -- 'claude' '--resume' 'it'\\''s'"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
 //! `spawn`, `send` and `stop` are its other consumers.
 
-// The seed, permission and send facts have no reader until spawn/send land.
+// The send facts have no reader until send/stop land (Phase 2).
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::PathBuf;
@@ -103,6 +103,43 @@ impl Default for Send {
             pre_send: String::new(),
             exit_sequence: String::new(),
         }
+    }
+}
+
+/// The longest single argv string the kernel accepts (`MAX_ARG_STRLEN`, 32
+/// pages), terminating NUL included.
+const MAX_ARG_STRLEN: usize = 128 * 1024;
+
+impl Launch {
+    /// The argv a seed prompt adds to the agent's command line, per
+    /// `seed_prompt`. Refused — the error is for the user — when the adapter
+    /// seeds by pasting (an empty template) or the prompt cannot be one argv
+    /// string: over `MAX_ARG_STRLEN`, or holding a NUL. Pasting such a seed
+    /// through the wrapper's own PTY writer is the spec's answer to both; it
+    /// is not built yet, as no bundled adapter needs it.
+    pub(crate) fn seed_args(&self, prompt: &str) -> Result<Vec<String>, String> {
+        if self.seed_prompt.is_empty() {
+            return Err("this agent's adapter has no launch.seed_prompt; seeding by paste is not \
+                        implemented yet"
+                .to_string());
+        }
+        if prompt.contains('\0') {
+            return Err("the prompt contains a NUL byte".to_string());
+        }
+        let args: Vec<String> = self
+            .seed_prompt
+            .iter()
+            .map(|a| a.replace("{prompt}", prompt))
+            .collect();
+        if let Some(long) = args.iter().find(|a| a.len() >= MAX_ARG_STRLEN) {
+            return Err(format!(
+                "the prompt is too long to pass on the command line ({} bytes; the limit is {}); \
+                 seeding by paste is not implemented yet",
+                long.len(),
+                MAX_ARG_STRLEN - 1
+            ));
+        }
+        Ok(args)
     }
 }
 
@@ -190,6 +227,23 @@ mod tests {
         assert_eq!(codex.launch.seed_prompt, ["{prompt}"]);
         assert_eq!(codex.launch.settings_flag, "");
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
+    }
+
+    #[test]
+    fn a_seed_becomes_the_templates_argv_or_a_clear_refusal() {
+        let claude = parse(BUNDLED[0].1).unwrap();
+        assert_eq!(claude.launch.seed_args("-rf? it's fine").unwrap(), ["--", "-rf? it's fine"]);
+        let codex = parse(BUNDLED[1].1).unwrap();
+        assert_eq!(codex.launch.seed_args("go").unwrap(), ["go"]);
+
+        assert!(Adapter::default().launch.seed_args("go").unwrap_err().contains("seed_prompt"));
+        assert!(claude.launch.seed_args("a\0b").unwrap_err().contains("NUL"));
+        let limit = MAX_ARG_STRLEN - 1;
+        assert!(claude.launch.seed_args(&"x".repeat(limit)).is_ok());
+        assert!(claude.launch.seed_args(&"x".repeat(limit + 1)).unwrap_err().contains("too long"));
+        // The template's own text counts toward the one string.
+        let wrapped = parse("[launch]\nseed_prompt = [\"--prompt={prompt}\"]\n").unwrap();
+        assert!(wrapped.launch.seed_args(&"x".repeat(limit - 5)).is_err());
     }
 
     #[test]

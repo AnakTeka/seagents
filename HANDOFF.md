@@ -114,9 +114,14 @@ windows.
 
 ```
 seagents [hud]              floating agent HUD (also the default with no args)
-seagents run [--tag T] [--parent P] <cmd> [args]
+seagents run [--tag T] [--parent P] [--seed-file F] <cmd> [args]
                            launch an agent, teeing its output (this is how
                            tracking happens); every agent gets a tag (below)
+seagents spawn [--cwd DIR] [--tag T] [--agent claude] [--permission-mode M]
+               [--worktree] [--arg A]... (--prompt-file F | [--] PROMPT)
+                           open a new terminal running an agent on a prompt;
+                           prints {"tag","child_pid","wrapper_pid","cwd",
+                           "parent","depth","stops"} (§7)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
@@ -187,11 +192,12 @@ Source layout under `src/`:
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
   `list()` (live, never deletes) / `reap()` (deletes the dead) /
-  `by_child_pid()` / `enclosing_session()` (the caller's session, by `/proc`
-  ancestry), the locked `update_meta()` / `update_state()` / `update_agent()`;
+  `by_child_pid()` / `enclosing_session(pid)` (the session a process runs
+  inside, by `/proc` ancestry — "who is calling"), the locked `update_meta()` / `update_state()` / `update_agent()`;
   tags (`valid_tag()`,
   `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
-  `backfill_tags()`) and `resolve_target()`, the one resolver every command
+  `claim_spawn()` with its `Caps`; `backfill_tags()`), `runtime_dir()`, and
+  `resolve_target()`, the one resolver every command
   that addresses an agent uses. No other module builds a `<pid>.*` path or
   parses one.
 - **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
@@ -218,14 +224,20 @@ Source layout under `src/`:
   `focus` command), `focus_window()` (exact handles: con_id, then X window id,
   with healing), `preview_window()`, `record_window()` (identity capture),
   `focused_con_id()`/`focused_terminal_ids()`, `window_ids_from_env()`,
-  `window_ids_by_pid()`, `window_ids_for_handle()`.
+  `window_ids_by_pid()`, `window_ids_for_handle()`, `terminal_class()` (which
+  terminal `spawn` opens its window in).
 - **`src/launch.rs`** — opening a terminal window seagents can recognize
   afterwards: `handle_for()` (the minted `seagents-<tag>` handle),
   `WindowMatch` (which X11 property carries it), the per-terminal recipes
   (`terminal()`, `recipe_for_class()`, `matcher_for()`), `spawn_terminal()`,
-  `shell_quote()`. `spawn_terminal()` runs `<abs path of this binary> run
-  --tag <tag> [--parent <p>]`, so the new window's PATH doesn't matter. Used
-  by `restore`; `spawn` will share it.
+  `shell_quote()`. `spawn_terminal(&Run)` runs `<abs path of this binary> run
+  --tag <tag> [--parent <p>] [--seed-file <f>] -- <argv>`, so the new
+  window's PATH doesn't matter; `Run::keep_shell` is the one difference
+  between its two callers — `restore` leaves the window at a shell when the
+  agent exits (`; exec "$SHELL"`), `spawn` closes it with the agent.
+- **`src/spawn.rs`** — `seagents spawn` (§7): prompt checks, permission-mode
+  resolution (`permission_args()`), caps from the environment, the seed file,
+  `--worktree`, the launch, and the wait for the child's `.meta`.
 - **`src/adapter.rs`** + **`src/adapters/*.toml`** — per-agent orchestration
   facts as data (ORCHESTRATION-SPEC "agent adapters"): how a seed prompt is
   passed, the settings/permission flags and mode order, where identity and
@@ -235,8 +247,9 @@ Source layout under `src/`:
   silent default); unknown agents get the generic state-only adapter. Bundled:
   `claude`, and a conservative `codex` (no hooks, screen turns) until its
   `notify` hook is verified. `run` reads it to decide on hook injection
-  (`settings_flag`, `hookless_flags`, `identity`/`turns`); spawn/send will
-  read the rest.
+  (`settings_flag`, `hookless_flags`, `identity`/`turns`) and to turn a
+  seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
+  and mode order; send/stop (Phase 2) will read the rest.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -366,8 +379,16 @@ the pty open and the fork — until `TagClaim::create_meta()` has written the
 spawned. Minting also avoids every tag recorded in `layout.json`, so a new
 agent can't take a placeholder a pending restore will want back; a *requested*
 tag may be one of those — that is how `restore` relaunches an agent under its
-old name. `parent`/`depth` are lineage (0 without a parent); nothing enforces
-anything with them yet.
+old name. `parent`/`depth` are lineage (0 without a parent); `spawn` derives
+them from its caller and caps them (§7).
+
+**Spawn reservations — `<tag>.pending`.** `spawn` and the `run` it launches are
+different processes with a terminal between them, so the tags lock can't be
+held from `spawn`'s check to the child's `.meta`. Instead `claim_spawn()`, under
+the lock, writes `<tag>.pending` (`{tag, parent, spawner}`): other claims treat
+the tag as taken (and count it against the caps), the spawned `run --tag`
+may claim it and deletes it in `create_meta()`, and it lives only as long as
+the spawner's pid (dead ones are swept by the next claim).
 
 **Every sidecar goes through `registry.rs`**, because each has writers in
 several processes (`.meta`: the wrapper at launch, window healing from its
@@ -587,7 +608,9 @@ doesn't matter). Every payload carries `session_id` and `transcript_path`;
 claude → `__lead` → wrapper) to the first pid with a live `.meta`
 (`registry::enclosing_session`), and records the event in `.agent`. The
 snapshot capture copies `.agent`'s `session_id` into the layout, and `restore`
-resumes it. Because `/clear` (and compact, and a resume) fires `SessionStart`
+resumes it (`resume_argv`: any stale `--resume`/`-c` flag dropped, and
+`--resume <id>` inserted before a `--` — after one it would be read as prompt
+text, and nothing after one is touched). Because `/clear` (and compact, and a resume) fires `SessionStart`
 again with the new conversation, the id is always the one the window is
 writing *now* — the stale-after-`/clear` problem the old resolvers had is gone,
 and so is their `~/.claude/projects` hardcoding, which pointed at the wrong
@@ -680,7 +703,54 @@ still alive can relaunch them as duplicates, and an old-format tag that happens
 to be all digits is refused and not restored. Restart those agents (or reboot
 and restore) once; after that every agent is tagged at launch.
 
----
+### 7. `seagents spawn` — starting an agent on a prompt
+
+The first command where seagents *acts* rather than observes, drawn narrowly:
+it only launches, through the same launcher `restore` uses. Its primary
+caller is another agent (ORCHESTRATION-SPEC), so every bound is derived from
+something the caller can't casually change:
+
+1. **Who is calling** = `registry::enclosing_session(own pid)`: the first
+   `/proc` ancestor that is a live wrapper. None → a human. (Not an
+   environment variable: everything an agent runs inherits and can edit
+   those. An agent that deliberately escapes its tree — `setsid`,
+   `systemd-run` — looks human; that is the threat model's line.)
+2. **Caps and tag, under `tags.lock`** (`registry::claim_spawn`): for an
+   agent caller the child is its child (`parent` = its tag, depth + 1), and
+   depth ≤ 3, ≤ 4 live children per parent and ≤ 12 live agent-spawned
+   agents machine-wide (`SEAGENTS_MAX_DEPTH` / `_MAX_CHILDREN` /
+   `_MAX_SPAWNED`), counting other spawns' reservations; the refusal names the
+   children in the way. A human's spawn has no parent and no caps. A
+   requested `--tag` must be free of live agents, reservations **and the
+   saved layout(s)** — unlike `run --tag`, which restore needs to reuse them.
+3. **Permission mode**: from an agent, always explicit — the parent's own
+   hook-reported `permission_mode` by default, refused above it (the adapter's
+   `permission_modes` order, least privileged first), the least privileged
+   when the parent's is unknown. From a human, passed only if given (the
+   tool's configured default otherwise, as when typing `claude`). The reason
+   for the asymmetry: this machine's default mode is `bypassPermissions`.
+4. **`--worktree`**: `git worktree add <repo>/.seagents/worktrees/<tag> -b
+   seagents/<tag>`, refusing an existing path or branch, with `.seagents/` in
+   the repo's local `info/exclude`. Inside the repo because Claude's
+   folder-trust dialog blocks every never-trusted directory (any mode), and a
+   subdirectory inherits its parent's trust.
+5. **The prompt** goes to `$XDG_RUNTIME_DIR/seagents/seed-<tag>` (0600;
+   `registry::runtime_dir()`, falling back to the cache dir). `run --seed-file`
+   reads and deletes it first thing and appends the adapter's `seed_prompt`
+   (Claude: `-- <prompt>`, submitted as the first turn) to the **child's** argv
+   only — never `.meta`'s, which `restore` replays. Adapters with no template,
+   and prompts of 128 KiB or more (one argv string's limit), are refused before
+   a window opens; the spec's paste-once-idle path for them isn't built, since
+   no bundled adapter needs it. The prompt is visible in the agent's
+   `/proc/<pid>/cmdline` to anyone who can read it (single-user machine).
+6. **Launch** via `launch::spawn_terminal` with `keep_shell: false`, in the
+   terminal class of the caller's own window (the focused one for a human;
+   `SEAGENTS_TERMINAL` overrides), then **return** once the child's `.meta`
+   exists (≤ 5 s) with its handle JSON. It does not wait for the agent to
+   start: a never-trusted `--cwd` sits at Claude's trust dialog before any
+   hook fires, which the detector calls `blocked` — `wait` reports it.
+
+Errors exit 1 with the reason on stderr; stdout carries only the JSON.
 
 ---
 

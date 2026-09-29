@@ -347,13 +347,18 @@ fn live_by_tag(dir: &Path, tag: &str) -> Option<Session> {
     list_in(dir).into_iter().find(|s| s.meta.tag == tag)
 }
 
-/// The live session the calling process runs inside: the first of its `/proc`
+/// The live session process `pid` runs inside: the first of its `/proc`
 /// ancestors that is a wrapper with a live `.meta` (for a hook: sh → the agent
-/// → `__lead` → the wrapper). Derived from ancestry rather than an environment
-/// variable, which everything the agent runs inherits and can rewrite. None
-/// for a process outside every session.
-pub(crate) fn enclosing_session() -> Option<Session> {
-    enclosing_session_in(&cache_dir(), &procfs::ancestors(u64::from(std::process::id())))
+/// → `__lead` → the wrapper). This is "who is calling" for every command that
+/// cares — a hook finding its ledger, `spawn` deriving lineage, and (Phase 2)
+/// the control socket judging an `SO_PEERCRED` pid. None is a human caller.
+///
+/// Derived from ancestry rather than an environment variable, which
+/// everything the agent runs inherits and can rewrite: unforgeable by
+/// accident, though an agent that deliberately escapes its tree (`setsid`,
+/// `systemd-run`) will look human — the line the threat model draws.
+pub(crate) fn enclosing_session(pid: u64) -> Option<Session> {
+    enclosing_session_in(&cache_dir(), &procfs::ancestors(pid))
 }
 
 fn enclosing_session_in(dir: &Path, ancestors: &[u64]) -> Option<Session> {
@@ -442,6 +447,8 @@ pub(crate) struct TagClaim {
     pub(crate) tag: String,
     pub(crate) parent: Option<String>,
     pub(crate) depth: u32,
+    /// Where a `spawn` reservation of this tag would be; consumed on create.
+    pending: PathBuf,
     _lock: Lock,
 }
 
@@ -454,6 +461,9 @@ impl TagClaim {
         meta.parent = self.parent;
         meta.depth = self.depth;
         write_new_meta(files, &meta);
+        // The session now holds the tag itself; a `spawn` that reserved it
+        // for us has nothing left to hold.
+        let _ = fs::remove_file(&self.pending);
     }
 }
 
@@ -465,7 +475,8 @@ impl TagClaim {
 /// A requested tag may be one the snapshot recorded (`reserved`): that is
 /// precisely how `restore` relaunches an agent under its old name. Minting
 /// avoids them, so a new agent never takes a placeholder a pending restore
-/// will want back.
+/// will want back. It may also be one a `spawn` reserved ([`claim_spawn`]):
+/// that is the spawned `run` taking the name it was launched with.
 pub(crate) fn claim_tag(
     requested: Option<&str>,
     parent: Option<&str>,
@@ -482,11 +493,7 @@ fn claim_tag_in(
     cwd: &Path,
     reserved: &HashSet<String>,
 ) -> Result<TagClaim, String> {
-    if let Some(tag) = requested.filter(|t| !valid_tag(t)) {
-        return Err(format!(
-            "invalid tag {tag:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits"
-        ));
-    }
+    check_requested(requested)?;
     // Unlike a session lock, this one must hold: without it two runs can both
     // pass the check. Failing to take it is failing to claim.
     let lock = Lock::acquire(&dir.join("tags.lock"))
@@ -504,20 +511,247 @@ fn claim_tag_in(
         }
     };
 
-    let taken: HashSet<String> = live.into_iter().map(|s| s.meta.tag).collect();
+    let pending: HashSet<String> = live_pending(dir).into_iter().map(|p| p.tag).collect();
+    let live: HashSet<String> = live.into_iter().map(|s| s.meta.tag).collect();
     let tag = match requested {
-        Some(t) if taken.contains(t) => {
+        Some(t) if live.contains(t) => {
             return Err(format!("tag {t} is already held by a live agent"));
         }
         Some(t) => t.to_string(),
-        None => mint_tag(cwd, &taken, reserved),
+        None => mint_tag(cwd, &live, &reserved.union(&pending).cloned().collect()),
     };
     Ok(TagClaim {
+        pending: pending_path(dir, &tag),
         tag,
         parent,
         depth,
         _lock: lock,
     })
+}
+
+fn check_requested(requested: Option<&str>) -> Result<(), String> {
+    match requested.filter(|t| !valid_tag(t)) {
+        Some(tag) => Err(format!(
+            "invalid tag {tag:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits"
+        )),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spawn reservations and fan-out caps
+// ---------------------------------------------------------------------------
+
+/// Fan-out limits for agent-spawned agents (ORCHESTRATION-SPEC "Fan-out
+/// caps"). Depth alone would not stop an agent opening fifty windows at
+/// depth 1, hence breadth and a global count too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Caps {
+    /// Deepest generation a spawn may create.
+    pub(crate) depth: u32,
+    /// Live children one agent may have.
+    pub(crate) children: usize,
+    /// Live agent-spawned agents, machine-wide.
+    pub(crate) spawned: usize,
+}
+
+impl Default for Caps {
+    fn default() -> Caps {
+        Caps {
+            depth: 3,
+            children: 4,
+            spawned: 12,
+        }
+    }
+}
+
+/// A tag `spawn` holds for a child whose `run` has not yet created its
+/// `.meta`, recorded as `<tag>.pending` in the cache. `spawn` and the `run` it
+/// launches are separate processes with a terminal between them, so the tags
+/// lock cannot be held from the check to the `.meta`; the reservation is what
+/// makes the tag — and the child's place under the caps — taken in between.
+/// It lives as long as its spawner (a crashed `spawn` leaves nothing held).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Pending {
+    tag: String,
+    parent: Option<String>,
+    spawner: u64,
+}
+
+fn pending_path(dir: &Path, tag: &str) -> PathBuf {
+    dir.join(format!("{tag}.pending"))
+}
+
+/// Every reservation whose spawner is still running. Only called under the
+/// tags lock, which is also what makes deleting the dead ones here safe.
+fn live_pending(dir: &Path) -> Vec<Pending> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("pending") {
+            continue;
+        }
+        match fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Pending>(&t).ok()) {
+            Some(p) if procfs::alive(p.spawner) => out.push(p),
+            _ => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    out
+}
+
+/// A `spawn`'s claim on its child's tag and lineage: the reservation file,
+/// removed when this is dropped (the child's `run` removes it first when it
+/// creates the `.meta`).
+#[derive(Debug)]
+pub(crate) struct SpawnClaim {
+    pub(crate) tag: String,
+    pub(crate) parent: Option<String>,
+    file: PathBuf,
+}
+
+impl Drop for SpawnClaim {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.file);
+    }
+}
+
+/// Claim a tag for an agent `spawn` is about to launch, under the tags lock:
+/// its lineage from the calling session (`caller`, a wrapper pid; None for a
+/// human), the fan-out caps (agent callers only — they bound runaway agents,
+/// and a human is not one), and the tag — `requested`, which must be free of
+/// live agents, other spawns' reservations and the snapshot's tags
+/// (`reserved`: a spawn must not take a placeholder a pending restore will
+/// swallow, which `run --tag` alone allows), or one minted avoiding all three.
+pub(crate) fn claim_spawn(
+    requested: Option<&str>,
+    caller: Option<u64>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+    caps: &Caps,
+) -> Result<SpawnClaim, String> {
+    claim_spawn_in(&cache_dir(), requested, caller, cwd, reserved, caps, std::process::id())
+}
+
+fn claim_spawn_in(
+    dir: &Path,
+    requested: Option<&str>,
+    caller: Option<u64>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+    caps: &Caps,
+    spawner: u32,
+) -> Result<SpawnClaim, String> {
+    check_requested(requested)?;
+    let _lock = Lock::acquire(&dir.join("tags.lock")).ok_or("could not lock the tag registry")?;
+    let live = list_in(dir);
+    let pending = live_pending(dir);
+
+    let parent = match caller {
+        None => None,
+        Some(pid) => {
+            let Some(me) = live.iter().find(|s| s.meta.wrapper_pid == pid) else {
+                return Err("the calling agent's session is gone".to_string());
+            };
+            let mut lineage: Vec<(String, Option<String>)> = live
+                .iter()
+                .map(|s| (s.meta.tag.clone(), s.meta.parent.clone()))
+                .collect();
+            lineage.extend(pending.iter().map(|p| (p.tag.clone(), p.parent.clone())));
+            check_caps(caps, &me.meta.tag, me.meta.depth, &lineage)?;
+            Some(me.meta.tag.clone())
+        }
+    };
+
+    let taken: HashSet<String> = live
+        .into_iter()
+        .map(|s| s.meta.tag)
+        .chain(pending.into_iter().map(|p| p.tag))
+        .collect();
+    let tag = match requested {
+        Some(t) if taken.contains(t) => return Err(format!("tag {t} is already held by a live agent")),
+        Some(t) if reserved.contains(t) => {
+            return Err(format!(
+                "tag {t} belongs to an agent in the saved layout that `restore` would bring back; pick another"
+            ))
+        }
+        Some(t) => t.to_string(),
+        None => mint_tag(cwd, &taken, reserved),
+    };
+    let file = pending_path(dir, &tag);
+    let record = Pending {
+        tag: tag.clone(),
+        parent: parent.clone(),
+        spawner: u64::from(spawner),
+    };
+    let text = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    fs::write(&file, text).map_err(|e| format!("reserving tag {tag}: {e}"))?;
+    Ok(SpawnClaim { tag, parent, file })
+}
+
+/// Whether agent `parent` (at `depth`) may have one more child, given every
+/// live or reserved agent's (tag, parent). The error names what is in the way,
+/// so the caller can `wait` on a child instead of piling on.
+fn check_caps(
+    caps: &Caps,
+    parent: &str,
+    depth: u32,
+    lineage: &[(String, Option<String>)],
+) -> Result<(), String> {
+    if depth + 1 > caps.depth {
+        return Err(format!(
+            "{parent} is at depth {depth}: a child would be depth {}, past the cap of {} \
+             (SEAGENTS_MAX_DEPTH)",
+            depth + 1,
+            caps.depth
+        ));
+    }
+    let children: Vec<&str> = lineage
+        .iter()
+        .filter(|(_, p)| p.as_deref() == Some(parent))
+        .map(|(t, _)| t.as_str())
+        .collect();
+    if children.len() >= caps.children {
+        return Err(format!(
+            "{parent} already has {} live children ({}), the cap is {} (SEAGENTS_MAX_CHILDREN); \
+             wait on one of them first",
+            children.len(),
+            children.join(", "),
+            caps.children
+        ));
+    }
+    let spawned: Vec<&str> = lineage
+        .iter()
+        .filter(|(_, p)| p.is_some())
+        .map(|(t, _)| t.as_str())
+        .collect();
+    if spawned.len() >= caps.spawned {
+        return Err(format!(
+            "{} agent-spawned agents are live ({}), the cap is {} (SEAGENTS_MAX_SPAWNED)",
+            spawned.len(),
+            spawned.join(", "),
+            caps.spawned
+        ));
+    }
+    Ok(())
+}
+
+/// Where per-session runtime files go — spawn's seed prompts today, control
+/// sockets in Phase 2: `$XDG_RUNTIME_DIR/seagents` (tmpfs, private, gone at
+/// logout), created `0700`; the cache dir when there is no runtime dir.
+pub(crate) fn runtime_dir() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(base).join("seagents");
+        if fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).is_ok() {
+            return dir;
+        }
+    }
+    cache_dir()
 }
 
 /// Give every live session that has no tag one — sessions whose wrapper
@@ -1028,6 +1262,82 @@ mod tests {
         // A dead session is skipped, not matched.
         assert_eq!(found(&[500, 30, 20]), Some(20));
         assert_eq!(found(&[500, 501]), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn spawn_claim(
+        dir: &Path,
+        requested: Option<&str>,
+        caller: Option<u64>,
+        reserved: &HashSet<String>,
+        caps: &Caps,
+    ) -> Result<SpawnClaim, String> {
+        claim_spawn_in(dir, requested, caller, Path::new("/p/proj"), reserved, caps, std::process::id())
+    }
+
+    #[test]
+    fn a_spawn_reservation_holds_its_tag_until_the_spawned_run_takes_it() {
+        let dir = scratch("spawnres");
+        let caps = Caps::default();
+        let layout: HashSet<String> = ["old".to_string()].into();
+        // A spawn may not take a tag the saved layout will restore (run may).
+        assert!(spawn_claim(&dir, Some("old"), None, &layout, &caps).unwrap_err().contains("restore"));
+        assert!(spawn_claim(&dir, Some("Bad"), None, &layout, &caps).unwrap_err().contains("invalid"));
+
+        let a = spawn_claim(&dir, Some("kid"), None, &layout, &caps).unwrap();
+        assert_eq!((a.tag.as_str(), a.parent.as_deref()), ("kid", None));
+        assert!(dir.join("kid.pending").exists());
+        // Another spawn cannot have it meanwhile, nor mint over it…
+        assert!(spawn_claim(&dir, Some("kid"), None, &layout, &caps).unwrap_err().contains("held"));
+        // …but the `run` it launches can, and consumes the reservation.
+        let c = claim(&dir, Some("kid"), None).unwrap();
+        c.create_meta(&Files::in_dir(&dir, 1), sample(1, Some(std::process::id() as u64)));
+        assert!(!dir.join("kid.pending").exists());
+        drop(a);
+        assert!(spawn_claim(&dir, Some("kid"), None, &layout, &caps).unwrap_err().contains("held"));
+
+        // A reservation dies with its spawner (and is swept), and is removed
+        // when the claim is dropped.
+        let dead = Pending { tag: "ghost".into(), parent: None, spawner: u32::MAX as u64 };
+        fs::write(dir.join("ghost.pending"), serde_json::to_string(&dead).unwrap()).unwrap();
+        let g = spawn_claim(&dir, Some("ghost"), None, &layout, &caps).unwrap();
+        drop(g);
+        assert!(!dir.join("ghost.pending").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_agent_callers_spawn_is_its_child_within_the_caps() {
+        let dir = scratch("spawncaps");
+        let none = HashSet::new();
+        let caps = Caps { depth: 2, children: 2, spawned: 3 };
+        create(&dir, 1, Some("root"), None).unwrap();
+        let a = spawn_claim(&dir, None, Some(1), &none, &caps).unwrap();
+        assert_eq!(a.parent.as_deref(), Some("root"));
+        assert!(a.tag.starts_with("proj-"), "{}", a.tag);
+        let b = spawn_claim(&dir, Some("b"), Some(1), &none, &caps).unwrap();
+        // Breadth: two reserved children already; the error names them.
+        let e = spawn_claim(&dir, None, Some(1), &none, &caps).unwrap_err();
+        assert!(e.contains("2 live children") && e.contains(&a.tag) && e.contains("b"), "{e}");
+        drop(a);
+        // b's run registers it; it then spawns at depth 2, the cap.
+        let c = claim(&dir, Some("b"), Some("root")).unwrap();
+        c.create_meta(&Files::in_dir(&dir, 2), sample(2, Some(std::process::id() as u64)));
+        drop(b);
+        let c = claim(&dir, Some("c"), Some("b")).unwrap();
+        c.create_meta(&Files::in_dir(&dir, 3), sample(3, Some(std::process::id() as u64)));
+        assert_eq!(read_meta(&Files::in_dir(&dir, 3)).unwrap().depth, 2);
+        let e = spawn_claim(&dir, None, Some(3), &none, &caps).unwrap_err();
+        assert!(e.contains("depth 3") && e.contains("SEAGENTS_MAX_DEPTH"), "{e}");
+        // Global: b and c are spawned, one reservation makes three.
+        let _d = spawn_claim(&dir, Some("d"), Some(1), &none, &caps).unwrap();
+        let e = spawn_claim(&dir, None, Some(2), &none, &caps).unwrap_err();
+        assert!(e.contains("3 agent-spawned") && e.contains("SEAGENTS_MAX_SPAWNED"), "{e}");
+        // A human is not capped, and has no parent.
+        let h = spawn_claim(&dir, None, None, &none, &caps).unwrap();
+        assert_eq!(h.parent, None);
+        // A caller whose session is gone is refused rather than made human.
+        assert!(spawn_claim(&dir, None, Some(99), &none, &caps).unwrap_err().contains("gone"));
         fs::remove_dir_all(&dir).ok();
     }
 }

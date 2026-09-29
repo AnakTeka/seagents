@@ -65,7 +65,7 @@ pub(crate) fn run() -> i32 {
 /// the common path pays nothing.
 fn find_session() -> Option<registry::Session> {
     for attempt in 0..10 {
-        if let Some(s) = registry::enclosing_session() {
+        if let Some(s) = registry::enclosing_session(u64::from(std::process::id())) {
             return Some(s);
         }
         if attempt < 9 {

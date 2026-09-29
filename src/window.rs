@@ -265,6 +265,32 @@ fn collect_handle(node: &serde_json::Value, value: &str, out: &mut Vec<(u64, Opt
     }
 }
 
+/// The WM_CLASS of the terminal window `con_id` (else of the focused
+/// window), when it is a terminal — what a window seagents opens on the
+/// caller's behalf should match: an agent's children open in the terminal the
+/// agent runs in, a human's in the one they typed `spawn` into. Empty when
+/// neither is a terminal, which leaves the launcher to its default.
+pub(crate) fn terminal_class(con_id: Option<u64>) -> String {
+    let Some(tree) = i3::tree() else {
+        return String::new();
+    };
+    fn find(node: &serde_json::Value, pred: &dyn Fn(&serde_json::Value) -> bool) -> Option<String> {
+        if pred(node) {
+            return node["window_properties"]["class"].as_str().map(str::to_string);
+        }
+        ["nodes", "floating_nodes"]
+            .iter()
+            .filter_map(|k| node[*k].as_array())
+            .flatten()
+            .find_map(|c| find(c, pred))
+    }
+    con_id
+        .and_then(|id| find(&tree, &|n| n["id"].as_u64() == Some(id)))
+        .or_else(|| find(&tree, &|n| n["focused"].as_bool() == Some(true)))
+        .filter(|c| looks_like_terminal(c))
+        .unwrap_or_default()
+}
+
 fn looks_like_terminal(class: &str) -> bool {
     let c = class.to_lowercase();
     c.contains("term") || c.contains("kitty") || c.contains("alacritty") || c.contains("ghostty")

@@ -25,18 +25,41 @@ mod pumps;
 
 pub(crate) use lead::lead;
 
-/// `seagents run [--tag T] [--parent P] <cmd…>`. Exit 2 — before anything is
-/// spawned — when the tag cannot be had (malformed, or held by a live agent)
-/// or the parent is not a live agent.
-pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>) -> i32 {
+/// `seagents run [--tag T] [--parent P] [--seed-file F] <cmd…>`. Exit 2 —
+/// before anything is spawned — when the tag cannot be had (malformed, or
+/// held by a live agent), the parent is not a live agent, or the seed cannot
+/// be delivered.
+pub(crate) fn run(
+    cmd: Vec<String>,
+    tag: Option<String>,
+    parent: Option<String>,
+    seed_file: Option<PathBuf>,
+) -> i32 {
     if let Some(t) = tag.as_deref().filter(|t| !registry::valid_tag(t)) {
         eprintln!("seagents: invalid tag {t:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits");
         return 2;
     }
+    // Read and deleted first thing, whatever happens next: the prompt must
+    // not outlive `run`'s startup on disk.
+    let seed = match seed_file.as_deref().map(take_seed).transpose() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("seagents: {e}");
+            return 2;
+        }
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let argv = match child_argv(&cmd, &exe, &cwd, seed.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("seagents: {e}");
+            return 2;
+        }
+    };
     // A requested tag is also the window's handle: whoever launched us with
     // one (restore) put `handle_for(tag)` on the terminal it opened.
     let (con_id, window_id) = identify_window(tag.as_deref().map(handle_for).as_deref());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Held from here until the `.meta` exists, so no other `run` can take the
     // same tag in between. Only the pty and the fork happen under it.
@@ -67,10 +90,9 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
     // Build the child command, inheriting cwd and environment. The agent runs
     // under the `__lead` anchor (see `lead()`): spawned directly it would be a
     // lone, orphaned process group whose Ctrl+Z SIGTSTP the kernel discards.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
     let mut builder = CommandBuilder::new(&exe);
     builder.arg("__lead");
-    for arg in child_argv(&cmd, &exe, &cwd) {
+    for arg in argv {
         builder.arg(arg);
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -143,26 +165,40 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
     code
 }
 
+/// Read a seed prompt file and delete it. The file is written 0600 into the
+/// runtime dir by `spawn`, and its one reader is this.
+fn take_seed(path: &Path) -> Result<String, String> {
+    let text = std::fs::read(path).map_err(|e| format!("seed file {}: {e}", path.display()));
+    let _ = std::fs::remove_file(path);
+    String::from_utf8(text?).map_err(|_| format!("seed file {}: not UTF-8", path.display()))
+}
+
 /// What the agent is actually started with: the user's `cmd`, plus our hooks
-/// when its adapter takes them. Only the child sees this; `.meta` records
-/// `cmd` itself, because `restore` relaunches from the recorded argv and
-/// would otherwise stack a second `--settings` on every restore.
-fn child_argv(cmd: &[String], exe: &Path, cwd: &Path) -> Vec<String> {
+/// when its adapter takes them, plus the seed prompt per the adapter's
+/// `seed_prompt`. Only the child sees this; `.meta` records `cmd` itself,
+/// because `restore` relaunches from the recorded argv — it would otherwise
+/// stack a second `--settings`, and re-submit the seed into the resumed
+/// conversation, on every restore (and the prompt stays out of `.meta`).
+fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Result<Vec<String>, String> {
     let adapter = match crate::adapter::for_command(&cmd[0]) {
         Ok(a) => a,
+        // The agent still starts — a broken override must not take every
+        // `claude` launch down with it — just without anything the adapter
+        // would have added. A seed has nowhere to go without it, though.
+        Err(e) if seed.is_some() => return Err(format!("agent adapter: {e}; cannot seed the prompt")),
         Err(e) => {
-            // The agent still starts — a broken override must not take every
-            // `claude` launch down with it — just without anything the
-            // adapter would have added.
             eprintln!("seagents: agent adapter: {e}; launching without hooks");
-            return cmd.to_vec();
+            return Ok(cmd.to_vec());
         }
     };
-    let (argv, warning) = crate::hook::inject_settings(cmd, &adapter, exe, cwd);
+    let (mut argv, warning) = crate::hook::inject_settings(cmd, &adapter, exe, cwd);
     if let Some(w) = warning {
         eprintln!("seagents: {w}");
     }
-    argv
+    if let Some(prompt) = seed {
+        argv.extend(adapter.launch.seed_args(prompt)?);
+    }
+    Ok(argv)
 }
 
 /// Capture the i3 window this agent lives in, as (con_id, X window id).
@@ -347,7 +383,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let before = cmd.clone();
-        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"));
+        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), None).unwrap();
         assert_eq!(child[1], "--settings");
         assert!(child[2].contains("'/x/seagents' __hook"));
         assert_eq!(&child[3..], &cmd[1..]);
@@ -356,6 +392,38 @@ mod tests {
         assert_eq!(cmd, before);
         // A tool with no hook support is started exactly as typed.
         let bash = vec!["bash".to_string()];
-        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/")), bash);
+        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), bash);
+    }
+
+    #[test]
+    fn a_seed_goes_after_the_separator_in_the_childs_argv_only() {
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cmd: Vec<String> = ["claude", "--permission-mode", "plan", "--model", "haiku"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), Some("-v: do it")).unwrap();
+        assert_eq!((child[1].as_str(), child.len()), ("--settings", 9));
+        assert_eq!(&child[3..], ["--permission-mode", "plan", "--model", "haiku", "--", "-v: do it"]);
+        // A command with no way to take one is refused, not launched unseeded.
+        let bash = vec!["bash".to_string()];
+        assert!(child_argv(&bash, Path::new("/x"), Path::new("/"), Some("hi")).is_err());
+    }
+
+    #[test]
+    fn a_seed_file_is_gone_once_read() {
+        let dir = std::env::temp_dir().join(format!("seagents-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("seed-x");
+        std::fs::write(&f, "hello\nworld").unwrap();
+        assert_eq!(take_seed(&f).unwrap(), "hello\nworld");
+        assert!(!f.exists());
+        assert!(take_seed(&f).unwrap_err().contains("seed-x"));
+        std::fs::write(&f, [0xff, 0xfe]).unwrap();
+        assert!(take_seed(&f).is_err());
+        assert!(!f.exists(), "deleted even when unusable");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

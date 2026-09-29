@@ -842,13 +842,17 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
             let parent = a["parent"]
                 .as_str()
                 .filter(|p| parent_is_up(p, &live, &started));
-            if let Err(e) = launch::spawn_terminal(
+            let argv = resume_argv(a);
+            let run = launch::Run {
                 tag,
                 parent,
-                cwd,
-                &resume_argv(a),
-                a["terminal_class"].as_str().unwrap_or_default(),
-            ) {
+                seed_file: None,
+                argv: &argv,
+                keep_shell: true,
+            };
+            if let Err(e) =
+                launch::spawn_terminal(&run, cwd, a["terminal_class"].as_str().unwrap_or_default())
+            {
                 eprintln!("seagents: {}: {e}", a["dir"].as_str().unwrap_or("?"));
                 continue;
             }
@@ -912,12 +916,14 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
 
 /// The command a restored window runs: the agent's original argv with any
 /// stale `--resume`/`-r` replaced by the conversation we captured. Model flags
-/// and anything else the user launched with are preserved.
+/// and anything else the user launched with are preserved. The flag goes
+/// before a `--`, if there is one: everything after it is the agent's
+/// positional text, and `--resume <id>` there would be read as prompt.
 fn resume_argv(agent: &Value) -> Vec<String> {
     let mut out = argv_without_resume(&argv_of(agent));
     if let Some(id) = agent["session_id"].as_str() {
-        out.push("--resume".to_string());
-        out.push(id.to_string());
+        let at = out.iter().position(|a| a == "--").unwrap_or(out.len());
+        out.splice(at..at, ["--resume".to_string(), id.to_string()]);
     }
     out
 }
@@ -949,6 +955,12 @@ fn argv_without_resume(argv: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut it = argv.iter().peekable();
     while let Some(arg) = it.next() {
+        if arg == "--" {
+            // Positional text from here on: a `-c` in it is words, not a flag.
+            out.push(arg.clone());
+            out.extend(it.cloned());
+            break;
+        }
         if arg == "--resume" || arg == "-r" || arg == "--continue" || arg == "-c" {
             // Drop the flag, and its value when it carries one.
             if it.peek().map(|v| is_uuid(v)).unwrap_or(false) {
@@ -1059,6 +1071,17 @@ mod tests {
     fn resume_argv_drops_a_valueless_resume_and_restores_fresh_without_an_id() {
         let agent = json!({ "argv": ["claude", "--resume"], "session_id": null });
         assert_eq!(resume_argv(&agent), vec!["claude"]);
+    }
+
+    #[test]
+    fn resume_goes_before_the_separator_and_positional_text_is_left_alone() {
+        let id = "5c603939-bf27-47c8-8b0f-13731d2cc6eb";
+        let agent = json!({ "argv": ["claude", "-c", "--model", "haiku", "--", "say", "-c", "--resume"],
+                            "session_id": id });
+        assert_eq!(
+            resume_argv(&agent),
+            ["claude", "--model", "haiku", "--resume", id, "--", "say", "-c", "--resume"]
+        );
     }
 
     #[test]

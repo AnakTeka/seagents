@@ -17,6 +17,7 @@ mod launch;
 mod procfs;
 mod registry;
 mod snapshot;
+mod spawn;
 mod status;
 mod transcript;
 mod turn;
@@ -56,6 +57,13 @@ enum Command {
         #[arg(long, value_name = "TAG")]
         parent: Option<String>,
 
+        /// A prompt to start the agent on (as `spawn` writes it): read,
+        /// deleted, and passed per the agent's adapter — for Claude, as a
+        /// positional prompt after `--` on the agent's command line, never in
+        /// the command line recorded for `restore`
+        #[arg(long, value_name = "FILE")]
+        seed_file: Option<PathBuf>,
+
         /// The agent's command line
         #[arg(
             value_name = "CMD",
@@ -64,6 +72,56 @@ enum Command {
             allow_hyphen_values = true
         )]
         cmd: Vec<String>,
+    },
+
+    /// Open a new terminal running an agent on a prompt; prints its handle
+    ///
+    /// Prints `{"tag","child_pid","wrapper_pid","cwd","parent","depth","stops"}`
+    /// once the agent is registered (not once it has started working: follow
+    /// with `seagents wait <tag> --after 0`). Run from inside an agent, the
+    /// child is that agent's: its `parent` and depth come from the caller's
+    /// process ancestry, fan-out is capped (SEAGENTS_MAX_DEPTH=3,
+    /// SEAGENTS_MAX_CHILDREN=4, SEAGENTS_MAX_SPAWNED=12), and its permission
+    /// mode never ranks above the caller's. The window closes when the agent
+    /// exits. Exit 1, with the reason on stderr, on any refusal.
+    Spawn {
+        /// Directory to run the agent in (default: this one)
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+
+        /// The new agent's name (minted as `<dir>-<4 hex>` when omitted);
+        /// refused while live, reserved by another spawn, or recorded in the
+        /// saved layout
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+
+        /// Which agent to launch
+        #[arg(long, value_name = "AGENT", default_value = "claude")]
+        agent: String,
+
+        /// Permission mode for the agent. From an agent: default the
+        /// caller's own, never above it. From a human: passed only if given
+        #[arg(long, value_name = "MODE")]
+        permission_mode: Option<String>,
+
+        /// Run in a new git worktree, <repo>/.seagents/worktrees/<TAG> on
+        /// branch seagents/<TAG> — without any of the caller's uncommitted
+        /// changes, and with a cold build directory
+        #[arg(long)]
+        worktree: bool,
+
+        /// One extra argument for the agent, repeatable:
+        /// `--arg --model --arg haiku`
+        #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Read the prompt from this file
+        #[arg(long, value_name = "FILE", conflicts_with = "prompt")]
+        prompt_file: Option<PathBuf>,
+
+        /// The prompt (one argument; `--` before it if it starts with `-`)
+        #[arg(value_name = "PROMPT", required_unless_present = "prompt_file")]
+        prompt: Option<String>,
     },
 
     /// The in-PTY job-control anchor `run` wraps around the agent (internal)
@@ -168,7 +226,31 @@ fn main() {
 fn dispatch(command: Command) -> i32 {
     match command {
         Command::Hud => hud::run(),
-        Command::Run { tag, parent, cmd } => wrapper::run(cmd, tag, parent),
+        Command::Run {
+            tag,
+            parent,
+            seed_file,
+            cmd,
+        } => wrapper::run(cmd, tag, parent, seed_file),
+        Command::Spawn {
+            cwd,
+            tag,
+            agent,
+            permission_mode,
+            worktree,
+            args,
+            prompt_file,
+            prompt,
+        } => spawn::run(spawn::Args {
+            cwd,
+            tag,
+            agent,
+            permission_mode,
+            worktree,
+            args,
+            prompt_file,
+            prompt,
+        }),
         Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
@@ -244,12 +326,46 @@ mod tests {
             &["seagents", "run", "--tag", "ab", "--parent", "p", "--", "claude", "--resume", "id"][..],
             &["seagents", "run", "--parent=p", "--tag=ab", "claude", "--resume", "id"][..],
         ] {
-            let Command::Run { tag, parent, cmd } = parse(args) else {
+            let Command::Run { tag, parent, cmd, .. } = parse(args) else {
                 panic!("not run");
             };
             assert_eq!(tag.as_deref(), Some("ab"));
             assert_eq!(parent.as_deref(), Some("p"));
             assert_eq!(cmd, ["claude", "--resume", "id"]);
+        }
+        let Command::Run { seed_file, cmd, .. } =
+            parse(&["seagents", "run", "--tag", "t", "--seed-file", "/r/seed-t", "--", "claude"])
+        else {
+            panic!("not run");
+        };
+        assert_eq!(seed_file, Some(PathBuf::from("/r/seed-t")));
+        assert_eq!(cmd, ["claude"]);
+    }
+
+    #[test]
+    fn spawn_takes_agent_args_with_hyphens_and_a_prompt_or_a_file() {
+        let Command::Spawn { args, prompt, agent, tag, .. } = parse(&[
+            "seagents", "spawn", "--tag", "it-a", "--arg", "--model", "--arg=haiku", "--", "-say: ALPHA",
+        ]) else {
+            panic!("not spawn");
+        };
+        assert_eq!(args, ["--model", "haiku"]);
+        assert_eq!(prompt.as_deref(), Some("-say: ALPHA"));
+        assert_eq!((agent.as_str(), tag.as_deref()), ("claude", Some("it-a")));
+
+        let Command::Spawn { prompt_file, prompt, worktree, .. } =
+            parse(&["seagents", "spawn", "--worktree", "--prompt-file", "p.md"])
+        else {
+            panic!("not spawn");
+        };
+        assert_eq!((prompt_file, prompt, worktree), (Some(PathBuf::from("p.md")), None, true));
+
+        for bad in [
+            &["seagents", "spawn"][..],
+            &["seagents", "spawn", "--prompt-file", "p", "hi"][..],
+            &["seagents", "spawn", "two", "words"][..],
+        ] {
+            assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
         }
     }
 
