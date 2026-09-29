@@ -62,10 +62,6 @@ pub(crate) fn run(
             return 2;
         }
     };
-    // A requested tag is also the window's handle: whoever launched us with
-    // one (restore) put `handle_for(tag)` on the terminal it opened.
-    let (con_id, window_id) = identify_window(tag.as_deref().map(handle_for).as_deref());
-
     // Held from here until the `.meta` exists, so no other `run` can take the
     // same tag in between. Only the pty and the fork happen under it.
     let claim = match registry::claim_tag(
@@ -140,7 +136,24 @@ pub(crate) fn run(
     // Open the tee target and write the identity sidecar. Both best-effort.
     let files = Files::of(u64::from(std::process::id()));
     let tee = File::create(&files.raw).ok();
-    write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, (con_id, window_id), hooked);
+    write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, hooked);
+    // Only now, with the agent registered, is its window looked for: the
+    // handle path polls i3 for up to 5 s (all of it where there is no i3),
+    // and `spawn` returns the moment the `.meta` exists. Until the ids land
+    // the session is unplaced — `focus` says "not identified", a snapshot
+    // capture lists it without a window — like any session before its first
+    // keystroke.
+    {
+        // A requested tag is also the window's handle: whoever launched us
+        // with one (spawn, restore) put `handle_for(tag)` on the terminal.
+        let handle = tag.as_deref().map(handle_for);
+        let files = files.clone();
+        std::thread::spawn(move || {
+            if let Some((con_id, xid)) = identify_window(handle.as_deref()) {
+                window::record_window(&files, con_id, xid);
+            }
+        });
+    }
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
         eprintln!("seagents: teeing to {}", files.raw.display());
     }
@@ -244,13 +257,11 @@ fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Res
 ///   3. the handle `restore` put on the terminal, `handle_for(--tag)`;
 ///   4. the focused terminal, which is right when a human just typed the
 ///      command into it and wrong for anything spawned programmatically.
-fn identify_window(handle: Option<&str>) -> (Option<u64>, Option<u64>) {
+fn identify_window(handle: Option<&str>) -> Option<(u64, Option<u64>)> {
     window::window_ids_from_env()
         .or_else(window::window_ids_by_pid)
-        .map(|(con, xid)| (Some(con), xid))
         .or_else(|| handle.and_then(window::window_ids_for_handle))
-        .or_else(|| window::focused_terminal_ids().map(|(con, xid)| (Some(con), xid)))
-        .unwrap_or((None, None))
+        .or_else(window::focused_terminal_ids)
 }
 
 /// Block until the child exits, forwarding job control along the way.
@@ -366,7 +377,7 @@ fn terminal_size() -> PtySize {
 /// Record who this agent is so the daemon can label it and locate its process /
 /// i3 window, under the tag `claim` holds (and releasing it). cwd here is the
 /// launch cwd; the daemon can also read the live cwd from /proc/<child_pid>/cwd.
-#[allow(clippy::too_many_arguments)]
+/// The window ids start out unknown and are recorded once found.
 fn write_meta(
     claim: registry::TagClaim,
     files: &Files,
@@ -374,7 +385,6 @@ fn write_meta(
     cwd: &Path,
     argv: &[String],
     size: &PtySize,
-    (con_id, window_id): (Option<u64>, Option<u64>),
     hooks: bool,
 ) {
     let meta = registry::Meta {
@@ -386,9 +396,6 @@ fn write_meta(
         // Geometry so the daemon can re-render the raw stream at the right size.
         cols: Some(size.cols),
         rows: Some(size.rows),
-        // The i3 window this agent runs in, captured at launch.
-        con_id,
-        window_id,
         hooks,
         ..registry::Meta::default()
     };

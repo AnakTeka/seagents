@@ -18,9 +18,12 @@ use crate::adapter::Launch;
 use crate::launch;
 use crate::registry::{self, Caps};
 
-/// How long the child's `.meta` may take to appear. It is written by `run`
-/// before the agent starts, so this covers only the terminal opening.
-const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the child's `.meta` may take to appear. `run` writes it right
+/// after forking the agent, before it looks for its window, so this covers
+/// the terminal opening and the shell in it starting `run` — normally well
+/// under a second; the margin is for a loaded machine or a cold terminal, and
+/// only a launch that failed outright ever waits it out.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct Args {
     pub(crate) cwd: Option<PathBuf>,

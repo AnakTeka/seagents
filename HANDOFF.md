@@ -212,8 +212,8 @@ Source layout under `src/`:
 - **`src/main.rs`** — the command line only: the clap-derived `Cli`/`Command`
   and `dispatch()` to the module that owns each command, plus parse tests.
 - **`src/wrapper/`** — `seagents run`, the pty-tee wrapper (§1):
-  - `mod.rs` — setup and wiring: `run()` (window identity, pty + child,
-    `.meta`, raw mode, thread start, the job-control wait loop),
+  - `mod.rs` — setup and wiring: `run()` (pty + child, `.meta`, then window
+    identity on a thread, raw mode, thread start, the job-control wait loop),
     `identify_window()`, `terminal_size()`, `write_meta()`.
   - `pumps.rs` — the output pump (stdout + tee, with `.raw` rotation), the
     input pump (with window-identity healing, `input_capture_eligible()`), and
@@ -932,7 +932,13 @@ something the caller can't casually change:
 6. **Launch** via `launch::spawn_terminal` with `keep_shell: false`, in the
    terminal class of the caller's own window (the focused one for a human;
    `SEAGENTS_TERMINAL` overrides), then **return** once the child's `.meta`
-   exists (≤ 5 s) with its handle JSON. It does not wait for the agent to
+   exists (≤ 15 s; normally ~0.1 s) with its handle JSON. `run` writes the
+   `.meta` right after forking the agent, with the window ids unknown, and
+   only then looks for its window (the handle poll can take 5 s, and all 5
+   where there is no i3 — which used to outlast `spawn`'s wait, so a spawn
+   that had worked reported failure); the ids land in the `.meta` a moment
+   later, and until then the agent is unplaced, as before its first
+   keystroke. It does not wait for the agent to
    start: a never-trusted `--cwd` sits at Claude's trust dialog before any
    hook fires, which the detector calls `blocked` — `wait` reports it.
 

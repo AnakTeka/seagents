@@ -228,7 +228,7 @@ pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
 /// the handle never appears, or if two windows carry it — an ambiguous handle
 /// is worse than none, and the input-driven re-capture will heal it on the
 /// first keystroke.
-pub(crate) fn window_ids_for_handle(value: &str) -> Option<(Option<u64>, Option<u64>)> {
+pub(crate) fn window_ids_for_handle(value: &str) -> Option<(u64, Option<u64>)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let mut hits = Vec::new();
@@ -238,7 +238,7 @@ pub(crate) fn window_ids_for_handle(value: &str) -> Option<(Option<u64>, Option<
         hits.sort();
         hits.dedup();
         match hits.len() {
-            1 => return Some((Some(hits[0].0), hits[0].1)),
+            1 => return Some(hits[0]),
             0 if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }

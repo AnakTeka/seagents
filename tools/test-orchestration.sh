@@ -112,9 +112,12 @@ out=$(cd "$WORK" && "$SEA" spawn --tag it-a --permission-mode default "${HAIKU[@
 [ "$(echo "$out" | jq_ "d['tag'], d['depth'], d['stops'], d['parent']")" = "it-a 0 0 None" ] \
   || fail "spawn handle: $out"
 pass "spawn returned the handle ($out)"
-want=""
-for _ in $(seq 1 40); do want=$(window_of it-a); [ -n "$want" ] && break; sleep 0.25; done
-got=$(meta_of it-a | jq_ "d.get('con_id')")
+# spawn returns once the child registers; `run` records its window after that.
+want="" got=""
+for _ in $(seq 1 40); do
+  want=$(window_of it-a); got=$(meta_of it-a | jq_ "d.get('con_id')")
+  [ -n "$want" ] && [ "$want" = "$got" ] && break; sleep 0.25
+done
 [ -n "$want" ] && [ "$want" = "$got" ] || fail "window: i3 has '$want', .meta has '$got'"
 argv=$(meta_of it-a | jq_ "d['argv']")
 case $argv in *ALPHA*|*--settings*) fail "recorded argv carries the seed or our settings: $argv" ;; esac
