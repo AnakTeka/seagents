@@ -102,8 +102,10 @@ enum Command {
         #[arg(long, value_name = "AGENT", default_value = "claude")]
         agent: String,
 
-        /// Permission mode for the agent. From an agent: default the
-        /// caller's own, never above it. From a human: passed only if given
+        /// Permission mode for the agent: plan, default, acceptEdits or
+        /// bypassPermissions (Codex gets the matching -a/-s pair). From an
+        /// agent: default the caller's own, never above it. From a human:
+        /// passed only if given
         #[arg(long, value_name = "MODE")]
         permission_mode: Option<String>,
 

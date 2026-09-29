@@ -21,6 +21,7 @@
 //! `spawn`, `send` and `stop` are its other consumers, and `[read]` names the
 //! transcript format ([`crate::transcript`]) `read` and the turn ledger parse.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -139,11 +140,15 @@ pub(crate) struct Launch {
     /// `{prompt}` substituted. Empty: the prompt is pasted instead, once the
     /// agent first reaches idle.
     pub(crate) seed_prompt: Vec<String>,
-    /// The flag that sets a permission mode; empty when there is none.
-    pub(crate) permission_flag: String,
-    /// The modes that flag takes, least privileged first — the order a child
-    /// is checked against so it never outranks its parent.
+    /// The permission modes, least privileged first — the order a child is
+    /// checked against so it never outranks its parent. Named in Claude's
+    /// vocabulary whatever the tool, because that is what every bundled
+    /// tool's hooks report a parent's mode in. Empty: no modes.
     pub(crate) permission_modes: Vec<String>,
+    /// The argv that starts the tool in each of `permission_modes` (every
+    /// one, and nothing else): Claude's `--permission-mode <m>`, Codex's
+    /// `-a`/`-s` pair.
+    pub(crate) permission_argv: BTreeMap<String, Vec<String>>,
     pub(crate) identity: Identity,
     pub(crate) turns: Turns,
     /// For `identity = "watch"`.
@@ -250,6 +255,19 @@ fn parse(text: &str) -> Result<Adapter, String> {
     let seed = &adapter.launch.seed_prompt;
     if !seed.is_empty() && !seed.iter().any(|a| a.contains("{prompt}")) {
         return Err("launch.seed_prompt has no {prompt}".to_string());
+    }
+    // A mode with no argv could not be launched, and argv for an unlisted
+    // mode has no rank to bound a child by.
+    let launch = &adapter.launch;
+    let listed: std::collections::BTreeSet<&String> = launch.permission_modes.iter().collect();
+    if listed.len() != launch.permission_modes.len() {
+        return Err("launch.permission_modes lists a mode twice".to_string());
+    }
+    if !listed.iter().copied().eq(launch.permission_argv.keys()) {
+        return Err("launch.permission_argv must give argv for each of permission_modes, and only those".to_string());
+    }
+    if let Some((mode, _)) = launch.permission_argv.iter().find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-'))) {
+        return Err(format!("launch.permission_argv.{mode} does not start with a flag"));
     }
     if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
         return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
@@ -405,11 +423,13 @@ mod tests {
         assert_eq!(claude.hooks.events, crate::hook::KNOWN_EVENTS);
         assert_eq!(claude.hooks.hookless_flags, ["--bare"]);
         assert_eq!(claude.restore.resume, ["--resume", "{session}"]);
-        assert_eq!(claude.launch.permission_flag, "--permission-mode");
         assert_eq!(
             claude.launch.permission_modes,
             ["plan", "default", "acceptEdits", "bypassPermissions"]
         );
+        for m in &claude.launch.permission_modes {
+            assert_eq!(claude.launch.permission_argv[m], ["--permission-mode", m.as_str()]);
+        }
         assert_eq!((claude.launch.identity, claude.launch.turns), (Identity::Hook, Turns::Hook));
         assert_eq!(claude.read.transcript, Some(crate::transcript::Format::Claude));
         assert_eq!(claude.send.submit_delay_ms, 300);
@@ -428,6 +448,29 @@ mod tests {
         assert_eq!(codex.send.exit_sequence, "/exit");
         assert_eq!(codex.read.transcript, Some(crate::transcript::Format::Codex));
         assert_eq!(codex.restore.resume, ["resume", "{session}"]);
+        // Same vocabulary as Claude's, since its hooks report a parent's mode
+        // in it; never `-a never` below bypass, since Codex reports that as
+        // bypassPermissions whatever the sandbox.
+        assert_eq!(codex.launch.permission_modes, claude.launch.permission_modes);
+        let argv = |m: &str| codex.launch.permission_argv[m].join(" ");
+        assert_eq!(argv("plan"), "-a on-request -s read-only");
+        assert_eq!(argv("default"), "-a on-request -s read-only");
+        assert_eq!(argv("acceptEdits"), "-a on-request -s workspace-write");
+        assert_eq!(argv("bypassPermissions"), "-a never -s danger-full-access");
+    }
+
+    #[test]
+    fn permission_argv_must_cover_exactly_the_modes() {
+        let with = |launch: &str| parse(&format!("[launch]\n{launch}"));
+        assert!(with("permission_modes = [\"a\", \"b\"]\n[launch.permission_argv]\na = [\"-m\", \"a\"]\nb = [\"-m\", \"b\"]").is_ok());
+        assert!(with("permission_modes = [\"a\", \"b\"]\n[launch.permission_argv]\na = [\"-m\", \"a\"]")
+            .unwrap_err()
+            .contains("each of"));
+        assert!(with("permission_modes = [\"a\"]\n[launch.permission_argv]\na = [\"-m\"]\nz = [\"-z\"]").is_err());
+        assert!(with("[launch.permission_argv]\na = [\"-m\"]").is_err());
+        assert!(with("permission_modes = [\"a\", \"a\"]\n[launch.permission_argv]\na = [\"-m\"]").unwrap_err().contains("twice"));
+        assert!(with("permission_modes = [\"a\"]\n[launch.permission_argv]\na = [\"a\"]").unwrap_err().contains("flag"));
+        assert!(with("permission_modes = [\"a\"]\n[launch.permission_argv]\na = []").is_err());
     }
 
     #[test]

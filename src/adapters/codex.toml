@@ -8,11 +8,11 @@
 # (verified).
 seed_prompt      = ["--", "{prompt}"]
 # Codex has no permission-mode flag: an approval policy (-a) and a sandbox
-# (-s) instead, and its hooks report Claude's vocabulary for the pair
-# (`default`, `bypassPermissions`). A child runs at the user's configured
-# default.
-permission_flag  = ""
-permission_modes = []
+# (-s) instead, mapped from Claude's mode words under
+# [launch.permission_argv] — those words because Codex's hooks report a
+# parent's mode in them, so a Claude parent and a Codex parent bound their
+# children alike.
+permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
 watch_dir        = ""
@@ -29,6 +29,27 @@ session_env      = [
   "CODEX_NETWORK_PROXY_ACTIVE",
   "CODEX_ESCALATE_SOCKET",
 ]
+
+# `-a` takes on-request | never (0.152 refuses untrusted/on-failure); `-s`
+# read-only | workspace-write | danger-full-access. What the hooks then
+# report as `permission_mode` (measured, every pair, 2026-09-29) follows the
+# approval policy alone: on-request → "default", never →
+# "bypassPermissions", whatever the sandbox (and no flags, the configured
+# on-request, → "default"). So nothing short of bypass may use `-a never`:
+# its child would read as bypass and its own children inherit that.
+# No mode has an exact twin, and each takes the nearest that is not more
+# privileged:
+#   plan, default — read-only sandbox; any write, and anything the sandbox
+#     stops, is an approval request to a human, as Claude's edits are in
+#     `default` and leaving plan mode is in `plan`.
+#   acceptEdits — the workspace is writable without asking (commands run
+#     sandboxed to it, no network); leaving it asks.
+#   bypassPermissions — no approvals, no sandbox.
+[launch.permission_argv]
+plan              = ["-a", "on-request", "-s", "read-only"]
+default           = ["-a", "on-request", "-s", "read-only"]
+acceptEdits       = ["-a", "on-request", "-s", "workspace-write"]
+bypassPermissions = ["-a", "never", "-s", "danger-full-access"]
 
 [hooks]
 # Codex's hooks are Claude's (same events, same payload fields, and

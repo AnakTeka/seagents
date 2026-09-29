@@ -160,7 +160,8 @@ enum Caller {
     Agent { mode: Option<String> },
 }
 
-/// The permission flag and mode to launch the child with.
+/// The argv that starts the child in its permission mode, per the adapter's
+/// `permission_argv`.
 ///
 /// A human gets exactly what they asked for, and the tool's own configured
 /// default when they asked for nothing — the same as typing the command in a
@@ -168,18 +169,16 @@ enum Caller {
 /// tool's default on this machine is `bypassPermissions`: the parent's own
 /// mode when none is asked for, never one ranked above it in the adapter's
 /// `permission_modes` (least privileged first), and the least privileged
-/// one when the parent's mode is unknown.
+/// one when the parent's mode is unknown. The parent's mode is a word from
+/// its own hooks and the child's adapter ranks it, which works across tools
+/// because every bundled adapter names its modes in the one vocabulary
+/// (Claude's) that every bundled tool's hooks report in.
 fn permission_args(launch: &Launch, caller: &Caller, requested: Option<&str>) -> Result<Vec<String>, String> {
     let modes = &launch.permission_modes;
-    if launch.permission_flag.is_empty() || modes.is_empty() {
-        return match (requested, caller) {
-            (Some(_), _) => Err("this agent has no permission modes".to_string()),
-            // Nothing can be passed, so nothing bounds the child: say so
-            // rather than launching an agent's child at the tool's default.
-            (None, Caller::Agent { .. }) if !launch.permission_flag.is_empty() => {
-                Err("the adapter lists no permission_modes to bound the child by".to_string())
-            }
-            (None, _) => Ok(Vec::new()),
+    if modes.is_empty() {
+        return match requested {
+            Some(_) => Err("this agent has no permission modes".to_string()),
+            None => Ok(Vec::new()),
         };
     }
     let rank = |m: &str| modes.iter().position(|x| x == m);
@@ -205,7 +204,8 @@ fn permission_args(launch: &Launch, caller: &Caller, requested: Option<&str>) ->
             }
         }
     };
-    Ok(vec![launch.permission_flag.clone(), chosen])
+    // `parse` guarantees argv for every listed mode.
+    Ok(launch.permission_argv.get(&chosen).cloned().unwrap_or_default())
 }
 
 /// Caps from `SEAGENTS_MAX_DEPTH` / `_MAX_CHILDREN` / `_MAX_SPAWNED`, else
@@ -342,16 +342,33 @@ mod tests {
     }
 
     #[test]
-    fn an_adapter_without_modes_takes_none_and_cannot_bound_a_child_by_one() {
+    fn an_adapter_without_modes_takes_none() {
         let none = Launch::default();
         assert_eq!(permission_args(&none, &agent(Some("x")), None).unwrap(), Vec::<String>::new());
         assert!(permission_args(&none, &Caller::Human, Some("plan")).is_err());
-        let flag_only = Launch {
-            permission_flag: "--mode".into(),
-            ..Launch::default()
+    }
+
+    #[test]
+    fn a_codex_child_gets_the_approval_and_sandbox_pair_for_its_mode() {
+        let l = {
+            let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::adapter::for_agent("codex").unwrap().launch
         };
-        assert!(permission_args(&flag_only, &agent(Some("x")), None).is_err());
-        assert!(permission_args(&flag_only, &Caller::Human, None).unwrap().is_empty());
+        let args = |caller: &Caller, req: Option<&str>| permission_args(&l, caller, req).map(|a| a.join(" "));
+        const READ_ONLY: &str = "-a on-request -s read-only";
+        // A Codex parent reports "default" (on-request) or "bypassPermissions"
+        // (never), as a Claude parent reports any of its four.
+        assert_eq!(args(&agent(Some("default")), None).unwrap(), READ_ONLY);
+        assert_eq!(args(&agent(Some("plan")), None).unwrap(), READ_ONLY);
+        assert_eq!(args(&agent(None), None).unwrap(), READ_ONLY);
+        assert_eq!(args(&agent(Some("acceptEdits")), None).unwrap(), "-a on-request -s workspace-write");
+        assert_eq!(args(&agent(Some("bypassPermissions")), None).unwrap(), "-a never -s danger-full-access");
+        assert!(args(&agent(Some("default")), Some("acceptEdits")).unwrap_err().contains("outranks"));
+        assert_eq!(args(&agent(Some("bypassPermissions")), Some("plan")).unwrap(), READ_ONLY);
+        // A human who asks for nothing gets Codex's own configured default.
+        assert_eq!(args(&Caller::Human, None).unwrap(), "");
     }
 
     #[test]

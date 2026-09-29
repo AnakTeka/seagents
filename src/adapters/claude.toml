@@ -6,8 +6,7 @@
 # `--`, so a prompt starting with `-` is never parsed as a flag; interactive
 # mode still submits it (verified 2026-09-29).
 seed_prompt      = ["--", "{prompt}"]
-permission_flag  = "--permission-mode"
-# Least to most privileged.
+# Least to most privileged; each one's argv is under [launch.permission_argv].
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
@@ -32,6 +31,12 @@ session_env      = [
   "CLAUDE_EFFORT",
   "AI_AGENT",
 ]
+
+[launch.permission_argv]
+plan              = ["--permission-mode", "plan"]
+default           = ["--permission-mode", "default"]
+acceptEdits       = ["--permission-mode", "acceptEdits"]
+bypassPermissions = ["--permission-mode", "bypassPermissions"]
 
 [hooks]
 # One --settings JSON carrying the hooks. Repeated --settings flags replace

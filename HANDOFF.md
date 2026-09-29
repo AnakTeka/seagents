@@ -322,7 +322,8 @@ Source layout under `src/`:
   `--worktree`, the launch, and the wait for the child's `.meta`.
 - **`src/adapter.rs`** + **`src/adapters/*.toml`** — per-agent orchestration
   facts as data (ORCHESTRATION-SPEC "agent adapters"): how a seed prompt is
-  passed, the settings/permission flags and mode order, where identity and
+  passed, the settings flag, the permission modes (in order) and each one's
+  argv, where identity and
   turns come from, submit delay / pre-send / exit sequence. Keyed by the
   detection engine's agent id for `argv[0]`; `~/.config/seagents/agents/<agent>.toml`
   replaces the bundled file whole (an unparseable override is an error, not a
@@ -332,8 +333,8 @@ Source layout under `src/`:
   the events, `hookless_flags`; and `identity`/`turns`) and to turn a
   seed into argv (`Launch::seed_args()`); `restore` reads `[restore]` (the
   argv that resumes a conversation, and the stale words it replaces);
-  `spawn` reads the permission flag
-  and mode order; `capabilities()` is what `status --json` reports per agent
+  `spawn` reads the mode order and
+  `permission_argv`; `capabilities()` is what `status --json` reports per agent
   (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
   and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
   when a body goes by reference: `long_prompt`, `inline_max_chars`,
@@ -923,6 +924,11 @@ something the caller can't casually change:
    when the parent's is unknown. From a human, passed only if given (the
    tool's configured default otherwise, as when typing `claude`). The reason
    for the asymmetry: this machine's default mode is `bypassPermissions`.
+   The mode becomes argv through the adapter's `[launch.permission_argv]`
+   (Claude: `--permission-mode <m>`; Codex: an `-a`/`-s` pair, §11). Every
+   bundled adapter names its modes in Claude's words, because every bundled
+   tool's hooks report the parent's mode in them — so either tool bounds a
+   child of either tool.
 4. **`--worktree`**: `git worktree add <repo>/.seagents/worktrees/<tag> -b
    seagents/<tag>`, refusing an existing path or branch, with `.seagents/` in
    the repo's local `info/exclude`. Inside the repo because Claude's
@@ -1211,8 +1217,23 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   input answers it.
 - **Resume**: `codex resume <id> …` takes every TUI option, and a `-c`
   before the subcommand still applies (our hooks fire in the resumed
-  session). No permission-mode flag (`-a`/`-s` instead), so `spawn` passes
-  none: a child runs at the user's configured Codex default.
+  session).
+- **Permission modes**: no mode flag; `-a` (0.152 takes only `on-request`
+  | `never`) and `-s` (`read-only` | `workspace-write` |
+  `danger-full-access`). The adapter names Claude's four modes and maps each
+  to a pair (`[launch.permission_argv]`, nearest not more privileged):
+  `plan` and `default` → `-a on-request -s read-only` (every write is an
+  approval request — verified live: a write prompt stopped at Codex's "Would
+  you like to run" gate, `wait` rc 3, no file), `acceptEdits` → `-a
+  on-request -s workspace-write`, `bypassPermissions` → `-a never -s
+  danger-full-access`. Measured for every pair: the hooks' `permission_mode`
+  follows `-a` alone — `on-request` → `default`, `never` →
+  `bypassPermissions`, whatever `-s` — so no mode short of bypass may use
+  `never`. Consequences: a Codex parent reads as `default` in any
+  on-request setup, so its children are capped at `default` even if it runs
+  `workspace-write`; and a Codex a human started with `-a never -s
+  read-only` reads as `bypassPermissions`, so its children may be spawned in
+  bypass (only its argv could tell, and nothing reads that).
 - **The rollout** is a log, not a tree: no uuids, no parents. Nodes are its
   lines (uuid = byte offset + 1), chained; `thread_rolled_back {num_turns}`
   hangs off the node before the user turns it drops, so they become a side
