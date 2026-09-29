@@ -237,7 +237,9 @@ fn caps_from(var: impl Fn(&str) -> Option<String>) -> Result<Caps, String> {
 fn write_seed(tag: &str, prompt: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = registry::runtime_dir().join(format!("seed-{tag}"));
+    let path = registry::runtime_dir()
+        .map_err(|e| format!("no runtime dir for the seed prompt: {e}"))?
+        .join(format!("seed-{tag}"));
     // A leftover from a spawn of this tag that died before `run` read it.
     let _ = std::fs::remove_file(&path);
     std::fs::OpenOptions::new()

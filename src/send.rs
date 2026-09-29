@@ -231,7 +231,11 @@ pub(crate) fn ask(target: &str, request: &Request, bound: Duration) -> Result<Re
 /// One request/reply round trip with `session`'s wrapper.
 fn call(session: &Session, request: &Request, reply_within: Duration) -> Result<Reply, String> {
     let tag = &session.meta.tag;
-    let sock = &session.files.sock;
+    let sock = session
+        .files
+        .sock
+        .as_ref()
+        .map_err(|e| format!("{tag} can have no control socket: {e}"))?;
     let mut stream = UnixStream::connect(sock).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!(
             "{tag} has no control socket at {}: its wrapper predates `send`, or could not bind \

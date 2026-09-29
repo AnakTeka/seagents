@@ -77,11 +77,12 @@ pub(crate) fn sessions_dir() -> Option<PathBuf> {
 #[derive(Clone, Debug)]
 pub(crate) struct Dirs {
     cache: PathBuf,
-    runtime: PathBuf,
+    /// Err: why there is no usable runtime dir (and so no sockets).
+    runtime: Result<PathBuf, String>,
 }
 
 impl Dirs {
-    /// This machine's: `~/.cache/seagents` and `$XDG_RUNTIME_DIR/seagents`.
+    /// This machine's: `~/.cache/seagents` and [`runtime_dir`].
     pub(crate) fn live() -> Dirs {
         Dirs {
             cache: cache_dir(),
@@ -94,7 +95,7 @@ impl Dirs {
     pub(crate) fn single(dir: &Path) -> Dirs {
         Dirs {
             cache: dir.to_path_buf(),
-            runtime: dir.to_path_buf(),
+            runtime: Ok(dir.to_path_buf()),
         }
     }
 
@@ -126,8 +127,9 @@ pub(crate) struct Files {
     pub(crate) agent: PathBuf,
     /// Guards every read-modify-write of `meta`, `state` and `agent`.
     lock: PathBuf,
-    /// The wrapper's control socket (`send`/`stop`), in the runtime dir.
-    pub(crate) sock: PathBuf,
+    /// The wrapper's control socket (`send`/`stop`), in the runtime dir; Err
+    /// says why there can be none.
+    pub(crate) sock: Result<PathBuf, String>,
 }
 
 impl Files {
@@ -145,7 +147,7 @@ impl Files {
             state: dir.join(format!("{wrapper_pid}.state")),
             agent: dir.join(format!("{wrapper_pid}.agent")),
             lock: dir.join(format!("{wrapper_pid}.lock")),
-            sock: dirs.runtime.join(format!("{wrapper_pid}.sock")),
+            sock: dirs.runtime.as_ref().map(|d| d.join(format!("{wrapper_pid}.sock"))).map_err(Clone::clone),
         }
     }
 
@@ -409,14 +411,17 @@ fn reap_in(dir: &Dirs) {
             }
         }
         let f = &s.files;
-        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock, &f.sock] {
+        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock] {
             let _ = fs::remove_file(path);
+        }
+        if let Ok(sock) = &f.sock {
+            let _ = fs::remove_file(sock);
         }
         remove_prompts(&s.meta);
     }
     prune_tombstones(dir, now);
     let owned: HashSet<u64> = live.iter().map(|s| s.meta.wrapper_pid).collect();
-    let Ok(entries) = fs::read_dir(&dir.runtime) else {
+    let Some(Ok(entries)) = dir.runtime.as_ref().ok().map(fs::read_dir) else {
         return;
     };
     for e in entries.flatten() {
@@ -1032,18 +1037,55 @@ fn check_caps(
 }
 
 /// Where per-session runtime files go — spawn's seed prompts and the
-/// wrappers' control sockets: `$XDG_RUNTIME_DIR/seagents` (tmpfs, private,
-/// gone at logout), created `0700`; the cache dir when there is no runtime
-/// dir.
-pub(crate) fn runtime_dir() -> PathBuf {
-    use std::os::unix::fs::DirBuilderExt;
-    if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+/// wrappers' control sockets — decided here alone, so the wrapper binding a
+/// socket and every client connecting to it agree:
+/// `$XDG_RUNTIME_DIR/seagents` (tmpfs, private, gone at logout), created
+/// `0700`; else `/tmp/seagents-<uid>`. Err when neither can be had, with why.
+pub(crate) fn runtime_dir() -> Result<PathBuf, String> {
+    runtime_dir_in(std::env::var_os("XDG_RUNTIME_DIR"), Path::new("/tmp"))
+}
+
+/// The longest socket name a runtime dir must leave room for: a pid is at
+/// most a `u32` (`pid_max` tops out at 2^22 today), plus `.sock`.
+const SOCK_NAME_MAX: usize = "4294967295.sock".len();
+
+/// A `sockaddr_un`'s `sun_path`: 108 bytes, the terminating NUL included.
+const SUN_PATH: usize = 108;
+
+fn runtime_dir_in(xdg: Option<std::ffi::OsString>, tmp: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // A socket path that does not fit `sun_path` cannot be bound at all, so
+    // an XDG_RUNTIME_DIR that deep (a nested test desktop, a container's
+    // bind mount) is as unusable as none.
+    let fits = |dir: &Path| dir.as_os_str().len() + 1 + SOCK_NAME_MAX < SUN_PATH;
+    if let Some(base) = xdg.filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(base).join("seagents");
-        if fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).is_ok() {
-            return dir;
+        if fits(&dir) && fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).is_ok() {
+            return Ok(dir);
         }
     }
-    cache_dir()
+    // `/tmp` is shared: anyone may have made this name first. Only a real
+    // directory of ours will do — a symlink or another user's directory
+    // would hand them our sockets and seed prompts.
+    let uid = unsafe { libc::getuid() };
+    let dir = tmp.join(format!("seagents-{uid}"));
+    let _ = fs::DirBuilder::new().mode(0o700).create(&dir);
+    let meta = fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!("{} is not a directory (a symlink?); refusing it", dir.display()));
+    }
+    if meta.uid() != uid {
+        return Err(format!("{} belongs to uid {}, not us; refusing it", dir.display(), meta.uid()));
+    }
+    // Ours, so a loosened mode (a umask, a hand chmod) is ours to tighten.
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if !fits(&dir) {
+        return Err(format!("{} is too long for a socket path", dir.display()));
+    }
+    Ok(dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,7 +1530,8 @@ mod tests {
         fs::write(dir.join("3.meta"), "{torn").unwrap();
         // Sockets: the live session's stays; the dead one's goes, and so does
         // one whose session left no `.meta` at all (a SIGKILLed wrapper).
-        for f in [&live.sock, &gone.sock] {
+        let (live_sock, gone_sock) = (live.sock.clone().unwrap(), gone.sock.clone().unwrap());
+        for f in [&live_sock, &gone_sock] {
             fs::write(f, b"").unwrap();
         }
         fs::write(dir.join("99.sock"), b"").unwrap();
@@ -1498,14 +1541,57 @@ mod tests {
         assert!(gone.meta.exists(), "list must not reap");
 
         reap_in(&dir);
-        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock, &gone.sock, &dir.join("99.sock")] {
+        for path in [&gone.meta, &gone.raw, &gone.state, &gone.lock, &gone_sock, &dir.join("99.sock")] {
             assert!(!path.exists(), "{} should be reaped", path.display());
         }
-        for path in [&live.meta, &live.raw, &live.state, &live.sock] {
+        for path in [&live.meta, &live.raw, &live.state, &live_sock] {
             assert!(path.exists(), "{} should survive", path.display());
         }
         assert!(dir.join("3.meta").exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_runtime_dir_falls_back_to_a_private_tmp_dir_when_sockets_would_not_fit() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("sg-rt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (xdg, tmp) = (base.join("xdg"), base.join("tmp"));
+        fs::create_dir_all(&xdg).unwrap();
+        fs::create_dir_all(&tmp).unwrap();
+        let ours = tmp.join(format!("seagents-{}", unsafe { libc::getuid() }));
+
+        // A short runtime dir is used as ever.
+        let got = runtime_dir_in(Some(xdg.clone().into()), &tmp).unwrap();
+        assert_eq!(got, xdg.join("seagents"));
+        assert_eq!(fs::metadata(&got).unwrap().mode() & 0o777, 0o700);
+
+        // One whose sockets would overflow `sun_path` is passed over, as is
+        // an unset or empty one.
+        let long = xdg.join("d".repeat(SUN_PATH));
+        for v in [Some(long.clone().into_os_string()), Some("".into()), None] {
+            assert_eq!(runtime_dir_in(v, &tmp).unwrap(), ours);
+        }
+        assert!(!long.exists(), "a too-long runtime dir is not even created");
+        let sock = ours.join("4294967295.sock");
+        assert!(sock.as_os_str().len() < SUN_PATH);
+        assert_eq!(fs::metadata(&ours).unwrap().mode() & 0o777, 0o700);
+
+        // A loosened mode on our own directory is tightened again.
+        fs::set_permissions(&ours, fs::Permissions::from_mode(0o755)).unwrap();
+        runtime_dir_in(None, &tmp).unwrap();
+        assert_eq!(fs::metadata(&ours).unwrap().mode() & 0o777, 0o700);
+
+        // A symlink planted in its place is refused, not followed.
+        fs::remove_dir(&ours).unwrap();
+        std::os::unix::fs::symlink(&xdg, &ours).unwrap();
+        assert!(runtime_dir_in(None, &tmp).unwrap_err().contains("refusing"));
+        fs::remove_file(&ours).unwrap();
+        // So is a plain file.
+        fs::write(&ours, b"").unwrap();
+        assert!(runtime_dir_in(None, &tmp).unwrap_err().contains("refusing"));
+
+        fs::remove_dir_all(&base).ok();
     }
 
     fn claim(dir: &Dirs, requested: Option<&str>, parent: Option<&str>) -> Result<TagClaim, String> {

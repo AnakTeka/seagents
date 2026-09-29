@@ -489,11 +489,20 @@ Per session, keyed by the wrapper's pid:
   subagent's transcript (not named by a uuid) is keyed by a hash of its
   path. `registry::sessions_dir()`.
 - **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
-  socket (§9; 0600 in a 0700 dir, the cache dir when there is no runtime
-  dir). Bound once the `.meta` exists; removed by the wrapper on exit and on
-  SIGHUP/SIGTERM, and by `reap()` when no live session owns it (a SIGKILLed
-  wrapper). A `sun_path` holds 108 bytes, so a very long `XDG_RUNTIME_DIR`
-  means no socket (and no `send`); the agent still runs.
+  socket (§9; 0600 in a 0700 dir). Bound once the `.meta` exists; removed
+  by the wrapper on exit and on SIGHUP/SIGTERM, and by `reap()` when no live
+  session owns it (a SIGKILLed wrapper). `registry::runtime_dir()` is the one
+  place the directory is decided (the wrapper binding, every client
+  connecting, `spawn`'s seed file): `$XDG_RUNTIME_DIR/seagents` unless that is
+  unset, can't be created, or is too long for a socket path (`sun_path` holds
+  108 bytes with its NUL; room is kept for a 10-digit pid) — then
+  `/tmp/seagents-<uid>`, made 0700 and used only if `lstat` says it is a real
+  directory owned by us (a loosened mode is tightened; a symlink or someone
+  else's directory is refused, and then there is no socket and no `send` —
+  the agent still runs, and `send` says why). Verified with a 119-byte
+  `XDG_RUNTIME_DIR`: the socket went to `/tmp/seagents-1000`, `send` and `stop`
+  worked. Note `reap()` sweeps every unowned `<pid>.sock` in that dir, so a
+  scratch-`HOME` test must also use a scratch runtime dir.
 
 **Tags.** Every agent has one: its name for every command (`focus reviewer`),
 the window handle `restore` swallows on (`seagents-<tag>`), and the lineage
@@ -920,7 +929,8 @@ something the caller can't casually change:
    folder-trust dialog blocks every never-trusted directory (any mode), and a
    subdirectory inherits its parent's trust.
 5. **The prompt** goes to `$XDG_RUNTIME_DIR/seagents/seed-<tag>` (0600;
-   `registry::runtime_dir()`, falling back to the cache dir). `run --seed-file`
+   `registry::runtime_dir()`, §2, so `/tmp/seagents-<uid>` when that can't
+   be used). `run --seed-file`
    reads and deletes it first thing and appends the adapter's `seed_prompt`
    (Claude: `-- <prompt>`, submitted as the first turn) to the **child's** argv
    only — never `.meta`'s, which `restore` replays. Adapters with no template,

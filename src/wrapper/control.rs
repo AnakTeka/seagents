@@ -111,7 +111,15 @@ pub(super) struct Control {
 /// `SEAGENTS_DEBUG`) when it cannot be bound: the agent still runs, it just
 /// cannot be driven.
 pub(super) fn spawn(wiring: Wiring) -> Option<Control> {
-    let sock = wiring.files.sock.clone();
+    let sock = match wiring.files.sock.clone() {
+        Ok(s) => s,
+        Err(e) => {
+            if std::env::var_os("SEAGENTS_DEBUG").is_some() {
+                eprintln!("seagents: no control socket: {e}");
+            }
+            return None;
+        }
+    };
     let listener = match bind(&sock) {
         Ok(l) => l,
         Err(e) => {
