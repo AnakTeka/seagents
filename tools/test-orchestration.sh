@@ -282,6 +282,8 @@ pass "Esc right after a send: wait said interrupted (rc 5), in_turn false — $h
 "$SEA" run --tag boss -- sh -c "
   cd '$WORK'
   seagents spawn --tag kid ${HAIKU[*]} -- 'Reply with exactly: KID' > '$ROOT/kid.json' 2> '$ROOT/kid.err'
+  seagents spawn --tag bad --arg --dangerously-skip-permissions -- 'never' > /dev/null 2> '$ROOT/bad.err'
+  echo \$? > '$ROOT/bad.rc'
   SEAGENTS_MAX_CHILDREN=1 seagents spawn --tag kid2 -- 'never' > /dev/null 2> '$ROOT/kid2.err'
   echo \$? > '$ROOT/kid2.rc'
   seagents wait kid --after 0 --timeout 90s > /dev/null
@@ -301,6 +303,10 @@ meta_of kid | jq_ "d['argv']" | grep -q "'--permission-mode', 'plan'" \
 [ "$(cat "$ROOT/kid2.rc")" = 1 ] && grep -q "kid" "$ROOT/kid2.err" && grep -q "SEAGENTS_MAX_CHILDREN" "$ROOT/kid2.err" \
   || fail "breadth cap: rc=$(cat "$ROOT/kid2.rc") $(cat "$ROOT/kid2.err")"
 pass "spawn under a wrapper records parent boss, depth 1, mode plan; a second child past the cap is refused: $(cat "$ROOT/kid2.err")"
+[ "$(cat "$ROOT/bad.rc")" = 1 ] && grep -q -- "--dangerously-skip-permissions" "$ROOT/bad.err" \
+  && [ ! -e "$CACHE/bad.pending" ] && ! "$SEA" status --json | grep -q '"tag": *"bad"' \
+  || fail "a privileged --arg from an agent: rc=$(cat "$ROOT/bad.rc") $(cat "$ROOT/bad.err")"
+pass "an agent's spawn --arg --dangerously-skip-permissions was refused before any window: $(cat "$ROOT/bad.err")"
 
 # 4b. The lineage rule in the wrapper: boss may send to and stop its child,
 #     not an agent it did not spawn.

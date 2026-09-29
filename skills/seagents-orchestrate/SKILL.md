@@ -100,6 +100,9 @@ without `--after` first to get your bearings.
   Exit 2 (`busy_timeout`): it stayed busy for all of `--timeout`; nothing was
   sent — wait for its turn, then send again. Exit 4: it exited.
 - A child's permission mode is yours by default and can never be higher.
+  Set it with `--permission-mode`; an `--arg` that touches permissions or
+  sandboxing (`--dangerously-skip-permissions`, `--settings`, `--allowedTools`,
+  Codex's `-a`/`-s`/`-c approval_policy=…`, …) is refused (exit 1, naming it).
 - **Never pass `--answer-permission`** (refused for agents anyway: gates are the
   human's) **or `--now`** (it breaks the pairing between your prompt and the
   turn `wait` returns) **without stating the reason** to the human.

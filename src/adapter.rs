@@ -159,6 +159,30 @@ pub(crate) struct Launch {
     /// such an agent. Names, or a prefix ending in `*`. Never the user's own
     /// configuration (Claude's `CLAUDE_CONFIG_DIR`).
     pub(crate) session_env: Vec<String>,
+    /// The flag's spellings that set one configuration key on the command
+    /// line, `key=value` (Codex's `-c` / `--config`); what
+    /// `privileged.config_keys` is checked against.
+    pub(crate) config_flags: Vec<String>,
+    /// What an agent calling `spawn` may not pass through `--arg`.
+    pub(crate) privileged: Privileged,
+}
+
+/// Arguments that would give a child more than the permission mode `spawn`
+/// chose for it — refused from an agent caller, whose child's mode is
+/// capped at its own ([`Launch::privileged_arg`]); a human may pass anything,
+/// as they could type it into a terminal themselves.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Privileged {
+    /// Flags refused whatever their value: `--flag`, `--flag=value`, and for
+    /// a one-letter `-f` also `-fVALUE` and a cluster holding it (`-cp`).
+    pub(crate) flags: Vec<String>,
+    /// Subcommands, refused as a bare word anywhere in the arguments.
+    pub(crate) commands: Vec<String>,
+    /// Configuration keys refused after one of `config_flags`: the key
+    /// itself, or anything under it (`sandbox_workspace_write` covers
+    /// `sandbox_workspace_write.network_access`).
+    pub(crate) config_keys: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -209,7 +233,68 @@ impl Send {
 /// pages), terminating NUL included.
 const MAX_ARG_STRLEN: usize = 128 * 1024;
 
+/// Whether `arg` is `flag` as a command line may spell it, and the value
+/// glued to it if any: `--flag` (None) or `--flag=v`; for a one-letter `-f`,
+/// `-f` or `-fv`.
+fn spelled<'a>(arg: &'a str, flag: &str) -> Option<Option<&'a str>> {
+    if !flag.starts_with("--") && arg.starts_with("--") {
+        return None;
+    }
+    let rest = arg.strip_prefix(flag)?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    if flag.starts_with("--") {
+        return rest.strip_prefix('=').map(Some);
+    }
+    (flag.len() == 2).then_some(Some(rest))
+}
+
+/// The key of a `key=value` configuration override, as the tool reads it:
+/// surrounding blanks and quotes dropped.
+fn config_key(kv: &str) -> &str {
+    kv.split('=').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'')
+}
+
 impl Launch {
+    /// The first of `args` an agent caller may not pass (`privileged`), as
+    /// written — with its value, for a configuration override. Matching errs
+    /// toward refusing: a one-letter flag is found inside any cluster of
+    /// letters (`-cp` holds `-p`), and a refused word is refused even where
+    /// it is some other flag's value.
+    pub(crate) fn privileged_arg(&self, args: &[String]) -> Option<String> {
+        let p = &self.privileged;
+        let short_in_cluster = |arg: &str, flag: &str| {
+            let letters = arg.strip_prefix('-').filter(|l| !l.starts_with('-') && l.len() > 1);
+            flag.len() == 2
+                && !flag.starts_with("--")
+                && letters.is_some_and(|l| l.chars().all(|c| c.is_ascii_alphabetic()) && l.contains(&flag[1..]))
+        };
+        let mut it = args.iter().peekable();
+        while let Some(arg) = it.next() {
+            for cf in &self.config_flags {
+                let Some(glued) = spelled(arg, cf) else { continue };
+                let kv = match glued {
+                    Some(kv) => kv.to_string(),
+                    None => it.peek().map(|v| v.to_string()).unwrap_or_default(),
+                };
+                let key = config_key(&kv);
+                if p.config_keys.iter().any(|k| key == k || key.strip_prefix(k.as_str()).is_some_and(|r| r.starts_with('.'))) {
+                    return Some(match glued {
+                        Some(_) => arg.clone(),
+                        None => format!("{arg} {kv}"),
+                    });
+                }
+            }
+            if p.flags.iter().any(|f| spelled(arg, f).is_some() || short_in_cluster(arg, f))
+                || p.commands.iter().any(|c| c == arg)
+            {
+                return Some(arg.clone());
+            }
+        }
+        None
+    }
+
     /// The argv a seed prompt adds to the agent's command line, per
     /// `seed_prompt`. Refused — the error is for the user — when the adapter
     /// seeds by pasting (an empty template) or the prompt cannot be one argv
@@ -268,6 +353,16 @@ fn parse(text: &str) -> Result<Adapter, String> {
     }
     if let Some((mode, _)) = launch.permission_argv.iter().find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-'))) {
         return Err(format!("launch.permission_argv.{mode} does not start with a flag"));
+    }
+    let privileged = &launch.privileged;
+    if let Some(bad) = launch.config_flags.iter().chain(&privileged.flags).find(|f| !f.starts_with('-') || f.contains('=')) {
+        return Err(format!("launch: {bad:?} is not a flag"));
+    }
+    if !privileged.config_keys.is_empty() && launch.config_flags.is_empty() {
+        return Err("launch.privileged.config_keys needs launch.config_flags".to_string());
+    }
+    if let Some(bad) = privileged.commands.iter().find(|c| c.is_empty() || c.starts_with('-')) {
+        return Err(format!("launch.privileged.commands: {bad:?} is not a word"));
     }
     if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
         return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
@@ -571,6 +666,10 @@ mod tests {
         assert!(parse(&format!("{hooks}events = [\"Interrupt\"]\n")).unwrap_err().contains("Interrupt"));
         assert!(parse("[hooks]\nflags = [\"c\"]\n").unwrap_err().contains("not a flag"));
         assert!(parse("[restore]\nresume = [\"--resume\"]\n").unwrap_err().contains("{session}"));
+        assert!(parse("[launch.privileged]\nflags = [\"x\"]\n").unwrap_err().contains("not a flag"));
+        assert!(parse("[launch.privileged]\ncommands = [\"-x\"]\n").unwrap_err().contains("not a word"));
+        assert!(parse("[launch.privileged]\nconfig_keys = [\"k\"]\n").unwrap_err().contains("config_flags"));
+        assert!(parse("[launch]\nconfig_flags = [\"-c\"]\n[launch.privileged]\nconfig_keys = [\"k\"]\n").is_ok());
     }
 
     #[test]

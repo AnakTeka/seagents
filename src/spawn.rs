@@ -85,6 +85,9 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
         },
     };
     let permission = permission_args(&adapter.launch, &who, args.permission_mode.as_deref())?;
+    if matches!(who, Caller::Agent { .. }) {
+        privileged_check(&adapter.launch, &args.args)?;
+    }
 
     let claim = registry::claim_spawn(
         args.tag.as_deref(),
@@ -206,6 +209,20 @@ fn permission_args(launch: &Launch, caller: &Caller, requested: Option<&str>) ->
     };
     // `parse` guarantees argv for every listed mode.
     Ok(launch.permission_argv.get(&chosen).cloned().unwrap_or_default())
+}
+
+/// An agent's `--arg`s may not reach past the mode [`permission_args`]
+/// capped: the adapter's `privileged` flags, subcommands and configuration
+/// keys are refused (a human's are not checked — they could type the same
+/// command into a terminal).
+fn privileged_check(launch: &Launch, args: &[String]) -> Result<(), String> {
+    match launch.privileged_arg(args) {
+        None => Ok(()),
+        Some(arg) => Err(format!(
+            "--arg {arg}: an agent may not pass arguments that set permissions or sandboxing; \
+             use --permission-mode (capped at your own)"
+        )),
+    }
 }
 
 /// Caps from `SEAGENTS_MAX_DEPTH` / `_MAX_CHILDREN` / `_MAX_SPAWNED`, else
@@ -369,6 +386,102 @@ mod tests {
         assert_eq!(args(&agent(Some("bypassPermissions")), Some("plan")).unwrap(), READ_ONLY);
         // A human who asks for nothing gets Codex's own configured default.
         assert_eq!(args(&Caller::Human, None).unwrap(), "");
+    }
+
+    fn refused(launch: &Launch, args: &[&str]) -> Option<String> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        privileged_check(launch, &args).err()
+    }
+
+    #[test]
+    fn an_agents_claude_child_takes_no_argument_that_sets_permissions() {
+        let l = claude();
+        for args in [
+            &["--permission-mode", "bypassPermissions"][..],
+            &["--permission-mode=bypassPermissions"],
+            &["--dangerously-skip-permissions"],
+            &["--allow-dangerously-skip-permissions"],
+            &["--settings", r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#],
+            &["--settings=/tmp/s.json"],
+            &["--allowedTools", "Bash"],
+            &["--allowed-tools=Bash(rm *)"],
+            &["--add-dir", "/"],
+            &["--mcp-config", "{}"],
+            &["--model", "haiku", "-p"],
+            &["-cp"],
+            &["mcp", "add"],
+        ] {
+            let e = refused(&l, args).unwrap_or_else(|| panic!("{args:?} should be refused"));
+            assert!(e.contains("--permission-mode"), "{e}");
+        }
+        // The message names the argument as written.
+        assert!(refused(&l, &["--model", "haiku", "--settings=x"]).unwrap().starts_with("--arg --settings=x:"));
+        // What only narrows, or touches no permission, passes.
+        for args in [
+            &["--model", "haiku"][..],
+            &["--disallowedTools", "Bash"],
+            &["--tools", "Read"],
+            &["--effort=low"],
+            &["-c"],
+            &["--name", "reviewer"],
+            &["--settingsx"],
+        ] {
+            assert_eq!(refused(&l, args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn an_agents_codex_child_takes_no_approval_sandbox_or_config_override_of_them() {
+        let l = {
+            let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::adapter::for_agent("codex").unwrap().launch
+        };
+        for args in [
+            &["-a", "never"][..],
+            &["-anever"],
+            &["--ask-for-approval=never"],
+            &["-s", "danger-full-access"],
+            &["-sdanger-full-access"],
+            &["--sandbox", "workspace-write"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["--yolo"],
+            &["--full-auto"],
+            &["--approve-for-me"],
+            &["-c", "approval_policy=never"],
+            &["-c", "approval_policy = \"never\""],
+            &["-capproval_policy=never"],
+            &["--config", "sandbox_mode=danger-full-access"],
+            &["--config=sandbox_mode=danger-full-access"],
+            &["-c", "sandbox_workspace_write.network_access=true"],
+            &["-c", "shell_environment_policy.inherit=all"],
+            &["-c", r#"'sandbox_permissions=["disk-full-read-access"]'"#],
+            &["-c", "\"approval_policy\"=never"],
+            &["-c", "hooks={}"],
+            &["-c", "features.guardian_approval=false"],
+            &["--disable", "hooks"],
+            &["-p", "yolo"],
+            &["--profile=yolo"],
+            &["-C", "/"],
+            &["exec"],
+        ] {
+            assert!(refused(&l, args).is_some(), "{args:?} should be refused");
+        }
+        assert_eq!(
+            refused(&l, &["-m", "o3", "-c", "approval_policy=never"]).unwrap().split(':').next().unwrap(),
+            "--arg -c approval_policy=never"
+        );
+        for args in [
+            &["-m", "gpt-5.6-luna"][..],
+            &["-c", "model_reasoning_effort=low"],
+            &["-c", "model=\"o3\""],
+            &["--config=model_provider=openai"],
+            &["-c", "approval_policy_x=1"],
+            &["--no-alt-screen"],
+        ] {
+            assert_eq!(refused(&l, args), None, "{args:?}");
+        }
     }
 
     #[test]

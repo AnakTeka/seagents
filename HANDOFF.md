@@ -333,8 +333,8 @@ Source layout under `src/`:
   the events, `hookless_flags`; and `identity`/`turns`) and to turn a
   seed into argv (`Launch::seed_args()`); `restore` reads `[restore]` (the
   argv that resumes a conversation, and the stale words it replaces);
-  `spawn` reads the mode order and
-  `permission_argv`; `capabilities()` is what `status --json` reports per agent
+  `spawn` reads the mode order,
+  `permission_argv` and, for an agent caller, `privileged`; `capabilities()` is what `status --json` reports per agent
   (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
   and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
   when a body goes by reference: `long_prompt`, `inline_max_chars`,
@@ -929,7 +929,24 @@ something the caller can't casually change:
    (Claude: `--permission-mode <m>`; Codex: an `-a`/`-s` pair, §11). Every
    bundled adapter names its modes in Claude's words, because every bundled
    tool's hooks report the parent's mode in them — so either tool bounds a
-   child of either tool.
+   child of either tool. The cap would mean nothing if `--arg` could say
+   otherwise, so an agent's `--arg`s are checked against the adapter's
+   `[launch.privileged]` (`Launch::privileged_arg`): `flags` (Claude's
+   `--permission-mode`, `--dangerously-skip-permissions`, `--settings`,
+   `--allowedTools`, `--add-dir`, `--mcp-config`, `-p`, …; Codex's `-a`,
+   `-s`, `--dangerously-bypass-approvals-and-sandbox`, `--profile`, `-C`,
+   `--enable`/`--disable`, …) in any spelling — `--flag`, `--flag=v`, and a
+   one-letter flag also glued to its value or inside a cluster (`-cp`);
+   `commands` (subcommands that change the user's config or act on other
+   sessions: `claude mcp`, `codex exec`, …) as bare words; and
+   `config_keys` behind the adapter's `config_flags` (Codex's `-c
+   approval_policy=…`, `sandbox_mode`, `shell_environment_policy`, `hooks`,
+   `mcp_servers`, … and anything under them). Each list entry carries its
+   one-line reason in the TOML, as do the flags judged harmless. Refused
+   before anything is claimed or opened, naming the argument and pointing
+   at `--permission-mode`; a human's `--arg`s are not checked (they could
+   type the same command into a terminal). Matching errs toward refusing (a
+   refused word is refused even as another flag's value).
 4. **`--worktree`**: `git worktree add <repo>/.seagents/worktrees/<tag> -b
    seagents/<tag>`, refusing an existing path or branch, with `.seagents/` in
    the repo's local `info/exclude`. Inside the repo because Claude's

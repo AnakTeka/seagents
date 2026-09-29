@@ -116,7 +116,10 @@ enum Command {
         worktree: bool,
 
         /// One extra argument for the agent, repeatable:
-        /// `--arg --model --arg haiku`
+        /// `--arg --model --arg haiku`. From an agent, none that sets
+        /// permissions or sandboxing (the adapter's `privileged` list, e.g.
+        /// --dangerously-skip-permissions, --settings, Codex's -a/-s/-c
+        /// approval_policy=…): use --permission-mode
         #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
         args: Vec<String>,
 

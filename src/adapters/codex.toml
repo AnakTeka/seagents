@@ -29,6 +29,9 @@ session_env      = [
   "CODEX_NETWORK_PROXY_ACTIVE",
   "CODEX_ESCALATE_SOCKET",
 ]
+# `-c key=value` overrides one configuration key (its value TOML);
+# checked against [launch.privileged] config_keys.
+config_flags     = ["-c", "--config"]
 
 # `-a` takes on-request | never (0.152 refuses untrusted/on-failure); `-s`
 # read-only | workspace-write | danger-full-access. What the hooks then
@@ -50,6 +53,50 @@ plan              = ["-a", "on-request", "-s", "read-only"]
 default           = ["-a", "on-request", "-s", "read-only"]
 acceptEdits       = ["-a", "on-request", "-s", "workspace-write"]
 bypassPermissions = ["-a", "never", "-s", "danger-full-access"]
+
+# What an agent calling `spawn` may not pass with `--arg`: its child's mode
+# comes from `spawn --permission-mode` (the -a/-s pair above), capped at its
+# own, and each of these reaches past that cap. A human may pass anything.
+# From `codex --help` (0.152.0) and the config keys its binary knows, one
+# reason each. Not listed, touching no permission: -m, -i, --oss,
+# --local-provider, --no-alt-screen, --strict-config, and `-c` keys such as
+# model / model_reasoning_effort.
+[launch.privileged]
+flags = [
+  "-a", "--ask-for-approval",                    # the approval half of the mode
+  "-s", "--sandbox",                             # the sandbox half of the mode
+  "--dangerously-bypass-approvals-and-sandbox",  # bypassPermissions
+  "--yolo",                                      # its alias
+  "--full-auto",                                 # older Codex: on-request + workspace-write in one flag
+  "--approve-for-me",                            # approvals answered by a reviewer model, not a human
+  "--dangerously-bypass-hook-trust",             # runs the user's unreviewed hooks
+  "--add-dir",                                   # more writable roots for the sandbox
+  "-C", "--cd",                                  # moves the workspace the sandbox lets it write (spawn --cwd is the way)
+  "-p", "--profile",                             # a profile carries its own approval_policy / sandbox_mode
+  "--enable", "--disable",                       # features: guardian_approval, exec_permission_approvals, hooks, …
+  "--remote",                                    # a remote app server runs under its own permissions
+]
+config_keys = [
+  "approval_policy", "approvals_reviewer",       # who approves, and whether anyone is asked
+  "sandbox_mode", "sandbox_workspace_write",     # the sandbox, its writable roots and network
+  "sandbox_permissions", "permissions", "default_permissions", "permission_profile",
+  "shell_environment_policy",                    # what environment commands inherit
+  "profile", "profiles",                         # a profile carries its own approval/sandbox
+  "features",                                    # as --enable/--disable
+  "hooks",                                       # a hook runs a command with no approval
+  "notify",                                      # a command run at every turn's end
+  "mcp_servers",                                 # an MCP server is a command started with no approval
+  "projects",                                    # trust_level: skips the folder-trust dialog
+  "network",                                     # proxy and socket allowances
+]
+# Subcommands that run something other than the interactive, approval-bound
+# agent (a command in the sandbox, a diff applied, a server), change the
+# user's configuration, or act on sessions that are not the child's.
+commands = [
+  "exec", "e", "review", "sandbox", "apply", "a", "mcp", "mcp-server", "app-server",
+  "exec-server", "remote-control", "plugin", "login", "logout", "cloud", "queue",
+  "archive", "delete", "unarchive", "migrate-rollouts", "update", "agents", "features",
+]
 
 [hooks]
 # Codex's hooks are Claude's (same events, same payload fields, and

@@ -38,6 +38,39 @@ default           = ["--permission-mode", "default"]
 acceptEdits       = ["--permission-mode", "acceptEdits"]
 bypassPermissions = ["--permission-mode", "bypassPermissions"]
 
+# What an agent calling `spawn` may not pass with `--arg`: its child's mode
+# comes from `spawn --permission-mode`, capped at its own, and each of these
+# reaches past that cap. A human may pass anything (they could type it into a
+# terminal). From `claude --help` (2.1.28x), one reason each. Not listed, as
+# they only narrow what the child may do or touch no permission:
+# --disallowedTools, --tools, --restricted, --strict-mcp-config, --model,
+# --effort, --name, --system-prompt, --append-system-prompt, --worktree,
+# --resume/--continue (an explicit mode still applies to a resumed session).
+[launch.privileged]
+flags = [
+  "--permission-mode",                     # the mode itself: spawn --permission-mode is the capped way
+  "--dangerously-skip-permissions",        # bypassPermissions
+  "--allow-dangerously-skip-permissions",  # puts bypass one Shift+Tab away
+  "--settings",                            # permissions.defaultMode / allow rules, hooks, sandbox settings
+  "--setting-sources",                     # can drop the user's settings, and their deny rules with them
+  "--allowedTools", "--allowed-tools",     # pre-approves tools
+  "--add-dir",                             # file tools beyond the working directory
+  "--mcp-config",                          # an MCP server is a command started with no approval
+  "--plugin-dir", "--plugin-url",          # a plugin brings hooks and MCP servers, run with no approval
+  "--agent", "--agents",                   # an agent definition carries its own tools and permissionMode
+  "--bare", "--safe-mode",                 # skip hooks: the user's PreToolUse guards, and seagents' own
+  "-p", "--print",                         # skips the folder-trust dialog
+  "--chrome",                              # drives the user's logged-in browser
+  "--remote-control",                      # hands the session to a remote driver
+  "--bg", "--background", "--cloud", "--teleport", "--environment",  # runs where no cap or lineage reaches
+]
+# Subcommands that change the user's configuration or act on sessions that
+# are not the child's (another's lineage): never an interactive child.
+commands = [
+  "mcp", "plugin", "plugins", "install", "update", "upgrade", "auth", "setup-token",
+  "auto-mode", "import", "project", "agents", "attach", "respawn", "rm", "stop", "kill", "logs",
+]
+
 [hooks]
 # One --settings JSON carrying the hooks. Repeated --settings flags replace
 # each other (verified 2026-09-28), so `run` merges a user's own into one.
