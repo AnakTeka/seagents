@@ -169,6 +169,10 @@ pub(crate) struct StateRecord {
     pub(crate) since: u64,
     #[serde(default = "seen_by_default")]
     pub(crate) seen: bool,
+    /// For `blocked`: the detection rule that matched, which says which gate
+    /// the agent waits at — what `wait` reports and `send` will refuse with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rule: Option<String>,
 }
 
 fn seen_by_default() -> bool {
@@ -717,9 +721,10 @@ fn check_caps(
         .collect();
     if children.len() >= caps.children {
         return Err(format!(
-            "{parent} already has {} live children ({}), the cap is {} (SEAGENTS_MAX_CHILDREN); \
+            "{parent} already has {} live {} ({}), the cap is {} (SEAGENTS_MAX_CHILDREN); \
              wait on one of them first",
             children.len(),
+            if children.len() == 1 { "child" } else { "children" },
             children.join(", "),
             caps.children
         ));
@@ -1011,6 +1016,7 @@ mod tests {
                 state: "idle".into(),
                 since: 1,
                 seen: true,
+                rule: None,
             })
         });
         let mut names: Vec<String> = fs::read_dir(&dir)
@@ -1048,6 +1054,7 @@ mod tests {
                     state: "idle".into(),
                     since: 1,
                     seen: true,
+                    rule: None,
                 })
             });
         }

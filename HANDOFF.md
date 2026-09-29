@@ -122,12 +122,17 @@ seagents spawn [--cwd DIR] [--tag T] [--agent claude] [--permission-mode M]
                            open a new terminal running an agent on a prompt;
                            prints {"tag","child_pid","wrapper_pid","cwd",
                            "parent","depth","stops"} (§7)
+seagents wait <target> [--after N] [--for turn|exit] [--timeout DUR]
+                           block until the turn after N ends, the agent is
+                           blocked, interrupted or gone; prints the outcome
+                           JSON incl. the turn's last_message (§8)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
                             incl. each agent's conversation `title`, `tag`,
                             `parent`, `depth`, and from its hooks `stops`,
-                            `in_turn`, `transcript_path`, `session_id`;
+                            `in_turn`, `transcript_path`, `session_id`, and
+                            `capabilities` derived from its adapter;
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
 seagents focus <target>    focus that agent's i3 window (target: `tag`,
@@ -235,6 +240,9 @@ Source layout under `src/`:
   window's PATH doesn't matter; `Run::keep_shell` is the one difference
   between its two callers — `restore` leaves the window at a shell when the
   agent exits (`; exec "$SHELL"`), `spawn` closes it with the agent.
+- **`src/wait.rs`** — `seagents wait` (§8): `decide()`, the whole reason
+  logic as a pure function over one look at the ledger, `.state` and
+  liveness; `parse_duration()`.
 - **`src/spawn.rs`** — `seagents spawn` (§7): prompt checks, permission-mode
   resolution (`permission_args()`), caps from the environment, the seed file,
   `--worktree`, the launch, and the wait for the child's `.meta`.
@@ -249,7 +257,9 @@ Source layout under `src/`:
   `notify` hook is verified. `run` reads it to decide on hook injection
   (`settings_flag`, `hookless_flags`, `identity`/`turns`) and to turn a
   seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
-  and mode order; send/stop (Phase 2) will read the rest.
+  and mode order; `capabilities()` is what `status --json` reports per agent
+  (`state`, `wait`, `turns`, `spawn` as applicable); send/stop (Phase 2) will
+  read the rest.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -308,7 +318,9 @@ Per session, keyed by the wrapper's pid:
   rotated down to its last ~1 MB once it passes 16 MB (via a
   `<wrapper_pid>.raw.tmp` renamed over it).
 - **`<wrapper_pid>.state`** — last observed state transition
-  (`{"state": "idle", "since": <unix>, "seen": bool}`); powers the
+  (`{"state": "idle", "since": <unix>, "seen": bool}`, plus `"rule"` — the
+  matched detection rule's id, e.g. `live_blocked_form` — while `blocked`,
+  which names the gate for `wait`); powers the
   "idle for / waiting for" column and the **done** state: the wrapper marks a
   working→idle completion `seen: false` (shown as 🔵 done, ranked just under
   blocked) until acknowledged — by a HUD preview/jump of that agent, or by the
@@ -751,6 +763,30 @@ something the caller can't casually change:
    hook fires, which the detector calls `blocked` — `wait` reports it.
 
 Errors exit 1 with the reason on stderr; stdout carries only the JSON.
+
+### 8. `seagents wait` — the turn a caller is waiting on
+
+`wait` blocks on the turn ledger, not the screen: polling `.state` for idle
+returns at once right after `spawn` (the agent paints an idle input box before
+it takes the seed) or right after a prompt (the detector ticks every 2 s), and
+never sees a sub-tick turn as working at all. The caller holds a baseline N —
+0 from `spawn` (Phase 2's `send` will return one) — and polls every 250 ms:
+
+| reason | exit | when |
+|---|---|---|
+| `turn` | 0 | `stops > N`: the turn after N ended; `last_message` is its final text (wins even if the agent has since exited) |
+| `idle` | 0 | no `--after` and not in a turn: nothing to wait for, the last result at once |
+| `timeout` | 2 | `--timeout` (default 5m; `30s`/`5m`/`1h`/seconds) passed — call again with the same N; nothing is consumed |
+| `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
+| `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) |
+| `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
+
+1 is an error (unknown target; an N ahead of the ledger — a restored agent's
+ledger restarts at 0, so wait without `--after`). `--for exit` waits for exit
+only. Without `--after`, a running turn is waited on (N = current `stops`).
+The reported `state` follows the ledger for hook agents (`.state` lags a turn's
+end by up to one monitor tick). `wait` only reads: it never acknowledges
+`done` and never writes `.state`.
 
 ---
 

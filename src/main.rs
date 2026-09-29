@@ -22,6 +22,7 @@ mod status;
 mod transcript;
 mod turn;
 mod vendor;
+mod wait;
 mod window;
 mod wrapper;
 
@@ -122,6 +123,33 @@ enum Command {
         /// The prompt (one argument; `--` before it if it starts with `-`)
         #[arg(value_name = "PROMPT", required_unless_present = "prompt_file")]
         prompt: Option<String>,
+    },
+
+    /// Block until an agent ends a turn, is blocked, or exits; prints the outcome
+    ///
+    /// Prints `{"tag","reason","stops","state","rule","last_message","transcript_path"}`.
+    /// `reason` and the exit code: `turn` 0 (stops passed N; `last_message` is
+    /// that turn's final text), `idle` 0 (no --after and not in a turn: the last
+    /// result, at once), `timeout` 2 (call again with the same N), `blocked` 3
+    /// (waiting on a human; `rule` names the gate), `exit` 4, `interrupted` 5
+    /// (the turn after N was cut short, with no final message); 1 is an error.
+    /// Never marks the agent's result as seen.
+    Wait {
+        /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
+        target: String,
+
+        /// Wait for the turn after this `stops` count (0 after `spawn`).
+        /// Without it: the running turn, or return at once when idle
+        #[arg(long, value_name = "N")]
+        after: Option<u64>,
+
+        /// `exit` waits for the agent to exit, and nothing else
+        #[arg(long = "for", value_enum, default_value_t = wait::For::Turn)]
+        what: wait::For,
+
+        /// Give up after this long: 30s, 5m, 1h, or seconds
+        #[arg(long, value_name = "DUR", default_value = "5m", value_parser = wait::parse_duration)]
+        timeout: std::time::Duration,
     },
 
     /// The in-PTY job-control anchor `run` wraps around the agent (internal)
@@ -251,6 +279,12 @@ fn dispatch(command: Command) -> i32 {
             prompt_file,
             prompt,
         }),
+        Command::Wait {
+            target,
+            after,
+            what,
+            timeout,
+        } => wait::run(&target, after, what, timeout),
         Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
@@ -365,6 +399,25 @@ mod tests {
             &["seagents", "spawn", "--prompt-file", "p", "hi"][..],
             &["seagents", "spawn", "two", "words"][..],
         ] {
+            assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn wait_defaults_to_the_running_turn_for_five_minutes() {
+        let Command::Wait { target, after, what, timeout } = parse(&["seagents", "wait", "@it-a"]) else {
+            panic!("not wait");
+        };
+        assert_eq!((target.as_str(), after, what), ("@it-a", None, wait::For::Turn));
+        assert_eq!(timeout, std::time::Duration::from_secs(300));
+        let Command::Wait { after, what, timeout, .. } =
+            parse(&["seagents", "wait", "it-a", "--after", "0", "--for=exit", "--timeout", "90s"])
+        else {
+            panic!("not wait");
+        };
+        assert_eq!((after, what, timeout.as_secs()), (Some(0), wait::For::Exit, 90));
+        for bad in [&["seagents", "wait"][..], &["seagents", "wait", "x", "--timeout", "soon"][..],
+                    &["seagents", "wait", "x", "--for", "done"][..]] {
             assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
         }
     }

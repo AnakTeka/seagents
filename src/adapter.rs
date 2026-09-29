@@ -178,6 +178,30 @@ pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
     }
 }
 
+/// What seagents can do with an agent started as `argv0`, as `status --json`
+/// reports it so a caller driving a mixed fleet knows — derived from the
+/// adapter, never stored: `state` (the detector knows the agent), `wait`
+/// (always: exit and gates need nothing from the agent), `turns` (an exact
+/// turn ledger, from hooks), `spawn` (a seed prompt can go on its command
+/// line). `send`/`stop` join in Phase 2, `read` in Phase 3.
+pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
+    let Ok(adapter) = for_command(argv0) else {
+        return vec!["wait"];
+    };
+    let mut caps = Vec::new();
+    if agent_id(argv0).is_some() {
+        caps.push("state");
+    }
+    caps.push("wait");
+    if adapter.launch.turns == Turns::Hook && !adapter.launch.settings_flag.is_empty() {
+        caps.push("turns");
+    }
+    if !adapter.launch.seed_prompt.is_empty() {
+        caps.push("spawn");
+    }
+    caps
+}
+
 /// The agent id for the command whose first word is `argv0` — the key of its
 /// adapter, detection manifest and transcript parser. None for a command no
 /// detection manifest knows.
@@ -227,6 +251,17 @@ mod tests {
         assert_eq!(codex.launch.seed_prompt, ["{prompt}"]);
         assert_eq!(codex.launch.settings_flag, "");
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
+    }
+
+    #[test]
+    fn capabilities_follow_the_adapter() {
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn"]);
+        assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "spawn"]);
+        assert_eq!(capabilities("gemini"), ["state", "wait"]);
+        assert_eq!(capabilities("sleep"), ["wait"]);
     }
 
     #[test]

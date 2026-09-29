@@ -94,6 +94,7 @@ mod tests {
             state: word.into(),
             since,
             seen: true,
+            rule: None,
         }
     }
 
