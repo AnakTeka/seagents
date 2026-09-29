@@ -907,15 +907,25 @@ python3 tools/test-jobctl.py
 # Debug the HUD post-mortem (its terminal vanishes with it):
 SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud
 # appends every crossterm input event + the exit reason
-# Regression-test snapshot/restore. Restore rearranges workspaces and opens
-# windows, so it runs inside a nested, isolated desktop (headless weston +
-# rootful Xwayland on :9 + its own i3, with HOME pointed at a scratch dir);
-# agents are `sleep`, so nothing real is launched. Fails with a tree diff, and
-# refuses to pass if the pre-restore kill left anything alive (a restore that
-# does nothing would otherwise compare equal). Run it for each terminal recipe.
+# Tests that open windows run inside a nested, isolated desktop — headless
+# weston + rootful Xwayland on :9 + its own i3, with HOME and XDG_RUNTIME_DIR
+# pointed at a scratch dir — set up by tools/lib-nested-desktop.sh, which each
+# sources (nd_init <terminal>; nd_start; cleanup on exit kills every window in
+# it, then the desktop).
+#
+# Regression-test snapshot/restore. Agents are `sleep`, so nothing real is
+# launched. Fails with a tree diff, and refuses to pass if the pre-restore
+# kill left anything alive (a restore that does nothing would otherwise
+# compare equal). Run it for each terminal recipe.
 tools/test-restore.sh terminator
 tools/test-restore.sh alacritty
 tools/test-restore.sh alacritty-daemon
+
+# Integration-test spawn → wait → status → lineage/caps → focus → exit, with a
+# real Claude (`--model haiku`, one-line prompts: a few cents a run) in
+# target/sg-it/orchestration, whose folder trust it inherits from the repo.
+# Keeps the real CLAUDE_CONFIG_DIR for auth. PASS/FAIL per step.
+tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon]
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a

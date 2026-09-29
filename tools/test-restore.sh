@@ -3,10 +3,9 @@
 #
 # Restore rearranges i3 workspaces and opens terminal windows, so it cannot be
 # exercised against the session you are working in. This runs the whole cycle
-# inside a **nested, isolated desktop**: a headless weston providing a Wayland
-# socket, a rootful Xwayland on :9 as the X server, and its own i3 on its own
-# IPC socket, with HOME pointed at a scratch directory so the real cache and
-# snapshot are never touched.
+# inside a **nested, isolated desktop** (tools/lib-nested-desktop.sh: headless
+# weston, rootful Xwayland on :9, its own i3, HOME at a scratch directory), so
+# the real cache and snapshot are never touched.
 #
 #   tools/test-restore.sh [terminator|alacritty|alacritty-daemon]
 #
@@ -14,89 +13,16 @@
 # swallow criterion is chosen at restore time (window_role for Terminator, a
 # WM_CLASS instance for alacritty), so both paths need exercising.
 #
-# Requires: weston + Xwayland (both ship with a typical desktop install), i3,
-# and the terminal under test. Agents are `sleep`, so nothing here launches a
-# real agent.
+# Requires what the nested desktop does, and the terminal under test. Agents
+# are `sleep`, so nothing here launches a real agent.
 #
 # Exits non-zero and prints a diff if the restored tree differs from the
 # captured one.
 set -u
 
-SEA="$(cd "$(dirname "$0")/.." && pwd)/target/release/seagents"
-[ -x "$SEA" ] || { echo "build first: cargo build --release"; exit 1; }
-TERM_UNDER_TEST=${1:-terminator}
-TERM_BIN=${TERM_UNDER_TEST%-daemon}
-command -v "$TERM_BIN" >/dev/null || { echo "$TERM_BIN not installed"; exit 1; }
-ASOCK=/tmp/sg-alacritty-test.sock
-export SEAGENTS_TERMINAL=$TERM_UNDER_TEST
-
-DISP=:9
-WL=wl-seagents-test
-SOCK=/tmp/sg-i3-test.sock          # short: UNIX socket paths cap at ~108 bytes
-ROOT=$(mktemp -d /tmp/seagents-restore-test.XXXXXX)
-WESTON= XWAYLAND= I3= DAEMON=
-
-# Terminals differ in which property carries the handle, so ask i3 on both.
-# Deliberately no `pkill -f`: its pattern matches this script's own command
-# line too, and it will happily kill the shell running the test.
-AGENT_PIDS=""
-kill_agents() {
-  for crit in 'window_role="^seagents-t"' 'instance="^seagents-t"'; do
-    DISPLAY=$DISP I3SOCK=$SOCK i3-msg "[$crit] kill" >/dev/null 2>&1
-  done
-  for p in $AGENT_PIDS; do kill "$p" 2>/dev/null; done
-}
-
-cleanup() {
-  kill_agents
-  for pid in $DAEMON $I3 $XWAYLAND $WESTON; do kill "$pid" 2>/dev/null; done
-  sleep 1
-  for pid in $DAEMON $I3 $XWAYLAND $WESTON; do kill -9 "$pid" 2>/dev/null; done
-  rm -rf "$ROOT" "$SOCK" "$ASOCK"
-}
-trap cleanup EXIT
-
-export HOME="$ROOT/home"
-# seagents derives its config and state dirs from these when set; they would
-# point the run (and its layout.json) back at the real ones.
-unset XDG_STATE_HOME XDG_CONFIG_HOME
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-export SEAGENTS_NO_NOTIFY=1
-mkdir -p "$HOME" "$ROOT/bin"
-# The launches below run a bare `seagents` (restore itself uses its own
-# absolute path); make sure it finds the build under test.
-ln -sf "$SEA" "$ROOT/bin/seagents"
-export PATH="$ROOT/bin:$PATH"
-
-echo "starting nested desktop on $DISP (terminal: $TERM_UNDER_TEST)"
-weston --backend=headless --xwayland --socket=$WL --width=1920 --height=1080 \
-  > "$ROOT/weston.log" 2>&1 &
-WESTON=$!
-sleep 3
-# Rootful, unlike weston's own rootless xwayland module: a rootless X server
-# has no root window for i3 to manage, and weston already owns the WM slot.
-WAYLAND_DISPLAY=$WL Xwayland $DISP -geometry 1920x1080 > "$ROOT/xwayland.log" 2>&1 &
-XWAYLAND=$!
-sleep 3
-export DISPLAY=$DISP I3SOCK=$SOCK
-printf 'font pango:monospace 8\nnew_window pixel 1\nipc-socket %s\n' "$SOCK" > "$ROOT/i3.conf"
-rm -f "$SOCK"
-i3 -c "$ROOT/i3.conf" > "$ROOT/i3.log" 2>&1 &
-I3=$!
-sleep 3
-i3-msg -t get_workspaces >/dev/null 2>&1 || {
-  echo "nested i3 did not start:"; cat "$ROOT/i3.log"; exit 1; }
-
-if [ "$TERM_UNDER_TEST" = alacritty-daemon ]; then
-  rm -f "$ASOCK"
-  alacritty --daemon --socket "$ASOCK" > "$ROOT/daemon.log" 2>&1 &
-  DAEMON=$!
-  sleep 3
-  [ -S "$ASOCK" ] || { echo "alacritty daemon did not start"; cat "$ROOT/daemon.log"; exit 1; }
-  # `restore` spawns a bare `alacritty msg`, which finds the daemon through
-  # this variable.
-  export ALACRITTY_SOCKET="$ASOCK"
-fi
+. "$(dirname "$0")/lib-nested-desktop.sh"
+nd_init "${1:-terminator}"
+nd_start
 
 dump() {  # the shape of workspace 7: nesting, layouts, percentages
   i3-msg -t get_tree | python3 -c "
@@ -115,13 +41,13 @@ launch() {  # handle, cwd, tag [, parent] — the handle is what `restore` mints
   case $TERM_UNDER_TEST in
     terminator) terminator -u --role "$1" --working-directory="$2" \
                   -x /bin/sh -c "$inner" >/dev/null 2>&1 &
-                AGENT_PIDS="$AGENT_PIDS $!" ;;
+                ND_PIDS="$ND_PIDS $!" ;;
     alacritty)  alacritty --class "Alacritty,$1" --working-directory "$2" \
                   -e /bin/sh -c "$inner" >/dev/null 2>&1 &
-                AGENT_PIDS="$AGENT_PIDS $!" ;;
+                ND_PIDS="$ND_PIDS $!" ;;
     # A daemon client runs in the foreground and exits immediately; there is no
     # process of ours to record. Recording $! here would capture the last
-    # background job — the daemon — and kill_agents would shoot it.
+    # background job — the daemon — and nd_kill_windows would shoot it.
     alacritty-daemon)
                 alacritty msg --socket "$ASOCK" create-window \
                   --class "Alacritty,$1" --working-directory "$2" \
@@ -144,7 +70,7 @@ if [ "$TERM_UNDER_TEST" != terminator ]; then
   case $TERM_UNDER_TEST in
     alacritty) alacritty --class "Alacritty,seagents-t9" --working-directory /tmp \
                  -e /bin/sh -c "seagents run -- sleep 3600" >/dev/null 2>&1 &
-               AGENT_PIDS="$AGENT_PIDS $!" ;;
+               ND_PIDS="$ND_PIDS $!" ;;
     alacritty-daemon)
                alacritty msg --socket "$ASOCK" create-window \
                  --class "Alacritty,seagents-t9" --working-directory /tmp \
@@ -174,8 +100,7 @@ for f in glob.glob(os.environ['HOME']+'/.cache/seagents/*.meta'):
   else
     echo "FAIL: identity got '$got', window is '$want'"; exit 1
   fi
-  kill_agents; sleep 2
-  AGENT_PIDS=""
+  nd_kill_windows; sleep 2
 fi
 
 i3-msg 'workspace --no-auto-back-and-forth "7"' >/dev/null
@@ -191,7 +116,7 @@ echo "=== captured layout ==="; echo "$before"
 "$SEA" snapshot >/dev/null || { echo "snapshot failed"; exit 1; }
 
 # Kill every agent: this is the post-reboot state.
-kill_agents
+nd_kill_windows
 sleep 3
 # Guard: if anything survived, a "restore" that does nothing would compare
 # equal and pass for the wrong reason.
