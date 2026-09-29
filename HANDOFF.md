@@ -157,7 +157,8 @@ seagents status [--json] [--sort=urgency|dir|recent]
                            (--json: machine-readable, for eww/widget frontends,
                             incl. each agent's conversation `title`, `tag`,
                             `parent`, `depth`, and from its hooks `stops`,
-                            `in_turn`, `transcript_path`, `session_id`, and
+                            `in_turn`, `transcript_path`, `session_id`,
+                            `hooks_ok` (null: no hooks; false: silent), and
                             `capabilities` derived from its adapter;
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
@@ -436,7 +437,9 @@ Per session, keyed by the wrapper's pid:
     "window_id": 30728026,          // X11 id (survives an i3 restart)
     "tag": "homelab-3f9a",          // the agent's name (see Tags, below)
     "parent": null,                 // spawner's tag; depth = its depth + 1
-    "depth": 0
+    "depth": 0,
+    "hooks": true,                  // run handed the agent our hooks (absent: false)
+    "engaged_at": 1783468320        // first prompt given (seed past any gate, or a send)
   }
   ```
   `argv` is the user's command line — never what `run` injected (§6) —
@@ -932,6 +935,7 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 | `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
 | `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) — also for a reaped agent, from its tombstone (§2), for a day |
 | `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
+| `no_hooks` | 6 | the agent was handed hooks and given a prompt ≥ 20 s ago, and none has reported (`.agent` has no `session_id`): no turn will ever be seen to end. `message` names the adapter and `hook.log` |
 
 1 is an error (unknown target; an N ahead of the ledger — a restored agent's
 ledger restarts at 0, so wait without `--after`). `--for exit` waits for exit
@@ -947,6 +951,21 @@ in hand when a reap came reads the tombstone), so a turn past N is still
 The reported `state` follows the ledger for hook agents (`.state` lags a turn's
 end by up to one monitor tick). `wait` only reads: it never acknowledges
 `done` and never writes `.state`.
+
+**Hook health** (`hook::health`, the `no_hooks` row): a hook agent whose
+hooks never fire — a future Codex hashing hook trust differently from the
+copy seagents reproduces, a Claude changing what `--settings` means, a user's
+`disableAllHooks` — keeps an empty ledger, and a `wait` would block to its
+timeout with no clue. So `run` records in `.meta` that it injected hooks
+(`hooks`), and when the agent was first given a prompt (`engaged_at`: the
+monitor, once a seeded agent is past any gate — idle or working; the control
+thread, on a submitted `send`); ≥ 20 s after that with no `session_id` —
+which every hook event carries — the hooks are silent. "Given a prompt", not
+"seen working": Codex's screen reads `working` while it boots an MCP server,
+before any prompt, and its first hook fires only at the first prompt
+(measured). `status --json` reports it as `hooks_ok`. Verified live with
+`claude --settings '{"disableAllHooks":true}'` seeded: `wait --after 0` →
+`no_hooks`, rc 6.
 
 The gate verdict has one source: `.state`, written by the wrapper's monitor
 (the one process that sees every byte the agent prints), read by `wait`,

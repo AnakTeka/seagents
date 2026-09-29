@@ -55,7 +55,7 @@ pub(crate) fn run(
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let argv = match child_argv(&cmd, &exe, &cwd, seed.as_deref()) {
+    let (argv, hooked) = match child_argv(&cmd, &exe, &cwd, seed.as_deref()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("seagents: {e}");
@@ -140,7 +140,7 @@ pub(crate) fn run(
     // Open the tee target and write the identity sidecar. Both best-effort.
     let files = Files::of(u64::from(std::process::id()));
     let tee = File::create(&files.raw).ok();
-    write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
+    write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, (con_id, window_id), hooked);
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
         eprintln!("seagents: teeing to {}", files.raw.display());
     }
@@ -161,7 +161,7 @@ pub(crate) fn run(
     // observers disagree — better no monitor than a flapping one. The
     // control socket needs it too, to signal the agent on `stop`.)
     let control = child.process_id().map(u64::from).and_then(|anchor_pid| {
-        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd, Arc::clone(&wake));
+        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd, seed.is_some(), Arc::clone(&wake));
         // After the `.meta`: `reap` sweeps a socket no live session owns.
         control::spawn(control::Wiring {
             files: files.clone(),
@@ -197,11 +197,11 @@ fn take_seed(path: &Path) -> Result<String, String> {
 
 /// What the agent is actually started with: the user's `cmd`, plus our hooks
 /// when its adapter takes them, plus the seed prompt per the adapter's
-/// `seed_prompt`. Only the child sees this; `.meta` records `cmd` itself,
+/// `seed_prompt` — and whether the hooks went in. Only the child sees this; `.meta` records `cmd` itself,
 /// because `restore` relaunches from the recorded argv — it would otherwise
 /// stack a second `--settings`, and re-submit the seed into the resumed
 /// conversation, on every restore (and the prompt stays out of `.meta`).
-fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Result<Vec<String>, String> {
+fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Result<(Vec<String>, bool), String> {
     let adapter = match crate::adapter::for_command(&cmd[0]) {
         Ok(a) => a,
         // The agent still starts — a broken override must not take every
@@ -210,17 +210,20 @@ fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Res
         Err(e) if seed.is_some() => return Err(format!("agent adapter: {e}; cannot seed the prompt")),
         Err(e) => {
             eprintln!("seagents: agent adapter: {e}; launching without hooks");
-            return Ok(cmd.to_vec());
+            return Ok((cmd.to_vec(), false));
         }
     };
     let (mut argv, warning) = crate::hook::inject(cmd, &adapter, exe, cwd);
     if let Some(w) = warning {
         eprintln!("seagents: {w}");
     }
+    // `inject` hands back the user's argv untouched exactly when it added
+    // nothing (no hook support, a hookless flag, settings that won't merge).
+    let hooked = argv != cmd;
     if let Some(prompt) = seed {
         argv.extend(adapter.launch.seed_args(prompt)?);
     }
-    Ok(argv)
+    Ok((argv, hooked))
 }
 
 /// Capture the i3 window this agent lives in, as (con_id, X window id).
@@ -371,8 +374,8 @@ fn write_meta(
     cwd: &Path,
     argv: &[String],
     size: &PtySize,
-    con_id: Option<u64>,
-    window_id: Option<u64>,
+    (con_id, window_id): (Option<u64>, Option<u64>),
+    hooks: bool,
 ) {
     let meta = registry::Meta {
         wrapper_pid: u64::from(std::process::id()),
@@ -386,6 +389,7 @@ fn write_meta(
         // The i3 window this agent runs in, captured at launch.
         con_id,
         window_id,
+        hooks,
         ..registry::Meta::default()
     };
     claim.create_meta(files, meta);
@@ -405,7 +409,8 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let before = cmd.clone();
-        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), None).unwrap();
+        let (child, hooked) = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), None).unwrap();
+        assert!(hooked);
         assert_eq!(child[1], "--settings");
         assert!(child[2].contains("'/x/seagents' __hook"));
         assert_eq!(&child[3..], &cmd[1..]);
@@ -414,7 +419,10 @@ mod tests {
         assert_eq!(cmd, before);
         // A tool with no hook support is started exactly as typed.
         let bash = vec!["bash".to_string()];
-        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), bash);
+        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), (bash, false));
+        // Nor is one run under a flag that skips its hooks.
+        let bare: Vec<String> = ["claude", "--bare"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(child_argv(&bare, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), (bare, false));
     }
 
     #[test]
@@ -426,7 +434,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), Some("-v: do it")).unwrap();
+        let (child, _) = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), Some("-v: do it")).unwrap();
         assert_eq!((child[1].as_str(), child.len()), ("--settings", 9));
         assert_eq!(&child[3..], ["--permission-mode", "plan", "--model", "haiku", "--", "-v: do it"]);
         // A command with no way to take one is refused, not launched unseeded.

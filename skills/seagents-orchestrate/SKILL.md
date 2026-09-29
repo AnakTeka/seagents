@@ -82,6 +82,7 @@ seagents wait review-auth --after 0 --timeout 100s
 | `blocked` | 3 | **stop and tell the human**: which child (tag), and the gate (`rule`, e.g. a permission prompt or the folder-trust dialog). Never answer it yourself. Then wait again with the same N |
 | `exit` | 4 | the child is gone (crashed, stopped, or someone closed it); `last_message` is its last turn's result. `wait` and `read` keep answering for an exited child for a day (until its tag is reused); `send`/`stop` exit 1 |
 | `interrupted` | 5 | a human pressed Esc on that turn; it has no report. Ask the human, or `send` again |
+| `no_hooks` | 6 | seagents cannot see that child's turns (its hooks never reported); `message` says why. Tell the human; waiting again will not help |
 
 A restored agent (after a reboot) starts again at `stops: 0`: call `wait`
 without `--after` first to get your bearings.

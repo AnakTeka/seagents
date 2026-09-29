@@ -32,6 +32,46 @@ use crate::registry::{self, AgentRecord, Files};
 /// The events [`record`] folds into the ledger — what an adapter may hook.
 pub(crate) const KNOWN_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "Stop"];
 
+/// How long an agent that has been given a prompt has for its hooks to
+/// report before they count as silent. Claude fires `SessionStart` at launch
+/// and Codex at its first prompt, each within a second of it; 20 s leaves a
+/// slow start and a busy machine far behind.
+const HOOK_GRACE: u64 = 20;
+
+/// Are the agent's hooks reporting? None when `run` handed it none (an
+/// adapter without them, `--bare`, a user `--settings` that would not merge):
+/// nothing to expect. Otherwise false exactly when the agent was given a
+/// prompt ([`registry::note_engaged`]) at least [`HOOK_GRACE`] ago and its
+/// `.agent` still has no `session_id` — which every hook event carries, so
+/// one firing is enough to fill it.
+///
+/// The failure this names is silent otherwise: identity and the turn ledger
+/// stay empty, and `wait` would block to its timeout on a turn nothing will
+/// ever report — say, a Codex that changes how it hashes a hook's trust
+/// (which seagents reproduces), or a Claude that changes what `--settings`
+/// means. "Given a prompt" rather than "seen working" because Codex's screen
+/// reads `working` while it boots an MCP server, before any prompt, and its
+/// first hook only fires at the first prompt (measured 2026-09-29).
+pub(crate) fn health(meta: &registry::Meta, agent: &AgentRecord, now: u64) -> Option<bool> {
+    if !meta.hooks {
+        return None;
+    }
+    let silent = agent.session_id.is_none() && meta.engaged_at.is_some_and(|t| now >= t + HOOK_GRACE);
+    Some(!silent)
+}
+
+/// What to tell a caller whose agent's hooks are silent ([`health`]).
+pub(crate) fn silence(meta: &registry::Meta) -> String {
+    format!(
+        "{}'s {} hooks have not reported in the {HOOK_GRACE}s since it was given a prompt, so seagents \
+         cannot see its turns; rerun it with SEAGENTS_DEBUG=1 set and check {} (a hook that ran and \
+         failed logs there; nothing there means the agent never ran them)",
+        meta.tag,
+        meta.agent(),
+        registry::cache_dir().join("hook.log").display()
+    )
+}
+
 /// `seagents __hook`: read one event from stdin, record it. Always 0.
 pub(crate) fn run() -> i32 {
     // A panic would exit 101, and a nonzero Stop hook is shown to the user
@@ -419,6 +459,23 @@ mod tests {
 
     fn feed(files: &Files, payload: Value, now: u64) {
         record(files, &payload, now).unwrap();
+    }
+
+    #[test]
+    fn hooks_are_silent_only_when_a_prompt_went_unreported_for_the_grace() {
+        let meta = |hooks, engaged_at| registry::Meta { hooks, engaged_at, started: 100, ..Default::default() };
+        let quiet = AgentRecord::default();
+        let heard = AgentRecord { session_id: Some("s".into()), ..AgentRecord::default() };
+        // No hooks handed over: nothing to expect.
+        assert_eq!(health(&meta(false, Some(100)), &quiet, 1000), None);
+        // Never prompted: an agent left at its input box owes no report
+        // (Codex's first hook is its first prompt), however long it idles.
+        assert_eq!(health(&meta(true, None), &quiet, 10_000), Some(true));
+        // Prompted: HOOK_GRACE seconds to hear from it.
+        assert_eq!(health(&meta(true, Some(150)), &quiet, 150 + HOOK_GRACE - 1), Some(true));
+        assert_eq!(health(&meta(true, Some(150)), &quiet, 150 + HOOK_GRACE), Some(false));
+        // One event is enough.
+        assert_eq!(health(&meta(true, Some(150)), &heard, 10_000), Some(true));
     }
 
     #[test]

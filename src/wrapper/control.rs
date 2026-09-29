@@ -481,6 +481,10 @@ fn send(
                 // gate that was just answered.
                 w.wake.input();
                 let gated = state.as_ref().is_some_and(|s| s.state == "blocked");
+                if submit && !gated {
+                    // A prompt: from here its hooks owe a report (`hook::health`).
+                    registry::note_engaged(&w.files);
+                }
                 if gated {
                     w.wake.wait_unblocked(ANSWER_SETTLE);
                 } else if submit && shared.ledger.turns == Turns::Hook {

@@ -200,6 +200,15 @@ pub(crate) struct Meta {
     /// Spawn generation: 0 without a parent, the parent's depth + 1 with one.
     #[serde(default)]
     pub(crate) depth: u32,
+    /// `run` handed the agent our lifecycle hooks, so its `.agent` should
+    /// fill in once it is prompted ([`crate::hook::health`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) hooks: bool,
+    /// When the agent was first given a prompt (Unix s): its seed, once it
+    /// got past any gate to take one, or a `send`. Set once
+    /// ([`note_engaged`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) engaged_at: Option<u64>,
     /// Fields written by another version of seagents, preserved verbatim.
     #[serde(flatten)]
     pub(crate) extra: Map<String, Value>,
@@ -1214,6 +1223,19 @@ pub(crate) fn update_meta(files: &Files, f: impl FnOnce(&mut Meta)) {
             write_atomic(&files.meta, text.as_bytes());
         }
     }
+}
+
+/// Record that the agent has been given a prompt, if nothing has yet: the
+/// start of the window in which its hooks must have reported
+/// ([`crate::hook::health`]).
+pub(crate) fn note_engaged(files: &Files) {
+    if read_meta(files).is_some_and(|m| m.engaged_at.is_some()) {
+        return;
+    }
+    let now = crate::clock::unix_now();
+    update_meta(files, |m| {
+        m.engaged_at.get_or_insert(now);
+    });
 }
 
 /// Locked read-modify-write of a session's `.agent`, creating it on the first

@@ -93,7 +93,10 @@ impl Wake {
 /// guaranteed to live exactly as long as the agent, so this keeps
 /// "idle for / waiting for" truthful even when no HUD or status poll is
 /// watching — opening the HUD hours later shows the real durations.
-pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: Arc<Wake>) {
+/// `seeded`: the agent was launched with a prompt, which it is given once it
+/// is past any gate (a trust dialog comes first) — the monitor records that
+/// moment for the hook health check (`hook::health`).
+pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, seeded: bool, wake: Arc<Wake>) {
     let cmd0 = Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -117,6 +120,7 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: 
         // must always be made from this wrapper's own observations.
         let mut prev: Option<status::State> = None;
         let mut quick_until: Option<Instant> = None;
+        let mut seed_pending = seeded;
         loop {
             let seen = Inputs::of(&files);
             if seen.raw.is_none() || Some(&seen) != last_seen.as_ref() {
@@ -130,6 +134,10 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: 
                         notify_transition(prev, state, &dir0, &cmd0, con_id);
                     }
                     prev = Some(state);
+                    if seed_pending && matches!(state, status::State::Idle | status::State::Working) {
+                        registry::note_engaged(&files);
+                        seed_pending = false;
+                    }
                     // After `.state` is written: whoever waits on this reads
                     // it next.
                     wake.set_blocked(state == status::State::Blocked);

@@ -102,6 +102,9 @@ pub(crate) struct Session {
     pub(crate) agent: crate::registry::AgentRecord,
     /// [`crate::turn::Ledger::in_turn`], as of this read.
     pub(crate) in_turn: bool,
+    /// [`crate::hook::health`]: None when the agent was given no hooks,
+    /// false when they have gone silent.
+    pub(crate) hooks_ok: Option<bool>,
 }
 
 /// The three questions the list can be ordered to answer. Also the value of
@@ -221,6 +224,7 @@ pub fn print_json(sort: Sort) -> i32 {
                 "depth": s.depth,
                 "stops": s.agent.stops,
                 "in_turn": s.in_turn,
+                "hooks_ok": s.hooks_ok,
                 "transcript_path": s.agent.transcript_path,
                 "session_id": s.agent.session_id,
                 "capabilities": crate::adapter::capabilities(&s.cmd),
@@ -268,6 +272,7 @@ fn read_session(live: &crate::registry::Session) -> Session {
         tag: meta.tag.clone(),
         parent: meta.parent.clone(),
         depth: meta.depth,
+        hooks_ok: crate::hook::health(meta, &agent, now),
         agent,
         in_turn,
     }

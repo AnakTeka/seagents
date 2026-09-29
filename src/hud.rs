@@ -1143,6 +1143,7 @@ mod tests {
             depth: 0,
             agent: Default::default(),
             in_turn: false,
+            hooks_ok: None,
         }
     }
 

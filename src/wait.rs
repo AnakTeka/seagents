@@ -51,6 +51,10 @@ enum Reason {
     /// there is no final message for it. Exit 5, its own code, so a caller
     /// chaining on success doesn't read an abandoned turn as a finished one.
     Interrupted,
+    /// The agent was given a prompt long enough ago, and its hooks have
+    /// still not reported (`hook::health`): no turn will ever be seen to
+    /// end, so waiting would only time out. Exit 6.
+    NoHooks,
 }
 
 impl Reason {
@@ -62,6 +66,7 @@ impl Reason {
             Reason::Exit => "exit",
             Reason::Timeout => "timeout",
             Reason::Interrupted => "interrupted",
+            Reason::NoHooks => "no_hooks",
         }
     }
 
@@ -72,6 +77,7 @@ impl Reason {
             Reason::Blocked => 3,
             Reason::Exit => 4,
             Reason::Interrupted => 5,
+            Reason::NoHooks => 6,
         }
     }
 }
@@ -82,6 +88,8 @@ struct Seen<'a> {
     state: Option<&'a StateRecord>,
     alive: bool,
     in_turn: bool,
+    /// `hook::health`: false when the agent's hooks are silent.
+    hooks_ok: bool,
 }
 
 /// The whole decision, given one look: Some(reason) to return now.
@@ -93,7 +101,8 @@ struct Seen<'a> {
 /// Order matters. A finished turn wins over everything (its result is what
 /// was asked for, even if the agent has since exited or hit a gate); then
 /// exit (a dead agent's last `.state` may still say blocked); then a gate;
-/// then, with nothing to wait for, idle; then an interrupt — a turn opened
+/// then silent hooks (the ledger below is empty, so nothing past here can
+/// be told); then, with nothing to wait for, idle; then an interrupt — a turn opened
 /// since the last `Stop` (so the one after N, as `stops` is still N) that is
 /// no longer running.
 fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
@@ -108,6 +117,9 @@ fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
     }
     if seen.state.is_some_and(|s| s.state == "blocked") {
         return Some(Reason::Blocked);
+    }
+    if !seen.hooks_ok {
+        return Some(Reason::NoHooks);
     }
     if after.is_none() {
         return Some(Reason::Idle);
@@ -180,13 +192,17 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
             let agent = registry::read_agent(&s.files);
             let state = registry::read_state(&s.files);
             let in_turn = ledger.in_turn(&agent, state.as_ref());
-            (agent, state, true, in_turn)
+            // Read again: the monitor and the control thread record when the
+            // agent was first prompted.
+            let meta = registry::read_meta(&s.files).unwrap_or_else(|| s.meta.clone());
+            let hooks_ok = crate::hook::health(&meta, &agent, crate::clock::unix_now()) != Some(false);
+            (agent, state, true, in_turn, hooks_ok)
         }
-        Found::Session(s) => (registry::final_agent(s), None, false, false),
-        Found::Exited(t) => (t.ledger(), None, false, false),
+        Found::Session(s) => (registry::final_agent(s), None, false, false, true),
+        Found::Exited(t) => (t.ledger(), None, false, false, true),
     };
 
-    let (agent, state, alive, in_turn) = look();
+    let (agent, state, alive, in_turn, hooks_ok) = look();
     let after = match (what, after) {
         (For::Turn, Some(n)) if n > agent.stops => {
             eprintln!(
@@ -201,19 +217,24 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
     };
 
     let deadline = Instant::now() + timeout;
-    let mut seen = (agent, state, alive, in_turn);
+    let mut seen = (agent, state, alive, in_turn, hooks_ok);
     loop {
-        let (agent, state, alive, in_turn) = &seen;
+        let (agent, state, alive, in_turn, hooks_ok) = &seen;
         let now = Seen {
             agent,
             state: state.as_ref(),
             alive: *alive,
             in_turn: *in_turn,
+            hooks_ok: *hooks_ok,
         };
         let reason = decide(what, after, &now)
             .or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
         if let Some(reason) = reason {
-            return report(&tag, reason, &ledger, agent, state.as_ref(), *in_turn);
+            let message = match (&found, reason) {
+                (Found::Session(s), Reason::NoHooks) => Some(crate::hook::silence(&s.meta)),
+                _ => None,
+            };
+            return report(&tag, reason, &ledger, agent, state.as_ref(), *in_turn, message);
         }
         std::thread::sleep(POLL);
         seen = look();
@@ -227,8 +248,14 @@ fn report(
     agent: &AgentRecord,
     state: Option<&StateRecord>,
     in_turn: bool,
+    message: Option<String>,
 ) -> i32 {
-    let out = serde_json::json!({
+    // Why, in words, where the reason alone doesn't say what to do (also on
+    // stderr, for a human).
+    if let Some(m) = &message {
+        eprintln!("seagents wait: {m}");
+    }
+    let mut out = serde_json::json!({
         "tag": tag,
         "reason": reason.word(),
         "stops": agent.stops,
@@ -237,6 +264,9 @@ fn report(
         "last_message": agent.last_message,
         "transcript_path": agent.transcript_path,
     });
+    if let Some(m) = message {
+        out["message"] = m.into();
+    }
     println!("{out}");
     reason.code()
 }
@@ -264,8 +294,21 @@ mod tests {
     }
 
     fn decide_on(what: For, after: Option<u64>, a: &AgentRecord, s: Option<&str>, alive: bool, in_turn: bool) -> Option<Reason> {
+        decide_hooks(what, after, a, s, alive, in_turn, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide_hooks(
+        what: For,
+        after: Option<u64>,
+        a: &AgentRecord,
+        s: Option<&str>,
+        alive: bool,
+        in_turn: bool,
+        hooks_ok: bool,
+    ) -> Option<Reason> {
         let st = s.map(state);
-        decide(what, after, &Seen { agent: a, state: st.as_ref(), alive, in_turn })
+        decide(what, after, &Seen { agent: a, state: st.as_ref(), alive, in_turn, hooks_ok })
     }
 
     /// Every reason path, one row each: (what, after, ledger, .state, alive,
@@ -315,6 +358,20 @@ mod tests {
         for (i, &(what, after, a, s, alive, in_turn, want)) in table.iter().enumerate() {
             assert_eq!(decide_on(what, after, a, s, alive, in_turn), want, "row {i}");
         }
+
+        // Silent hooks: the ledger can't move, so a wait for a turn says so
+        // rather than time out — after a gate (the human's first) and exit.
+        #[rustfmt::skip]
+        let silent: &[(For, Option<u64>, Option<&str>, bool, Option<Reason>)] = &[
+            (For::Turn, Some(0), Some("working"), true, Some(NoHooks)),
+            (For::Turn, None, Some("idle"), true, Some(NoHooks)),
+            (For::Turn, Some(0), Some("blocked"), true, Some(Blocked)),
+            (For::Turn, Some(0), Some("idle"), false, Some(Exit)),
+            (For::Exit, None, Some("idle"), true, None),
+        ];
+        for (i, &(what, after, s, alive, want)) in silent.iter().enumerate() {
+            assert_eq!(decide_hooks(what, after, &fresh, s, alive, false, false), want, "silent row {i}");
+        }
     }
 
     #[test]
@@ -338,13 +395,14 @@ mod tests {
             Reason::Blocked,
             Reason::Exit,
             Reason::Interrupted,
+            Reason::NoHooks,
         ]
         .iter()
         .map(|r| (r.word(), r.code()))
         .collect();
         assert_eq!(
             codes,
-            [("turn", 0), ("idle", 0), ("timeout", 2), ("blocked", 3), ("exit", 4), ("interrupted", 5)]
+            [("turn", 0), ("idle", 0), ("timeout", 2), ("blocked", 3), ("exit", 4), ("interrupted", 5), ("no_hooks", 6)]
         );
     }
 
