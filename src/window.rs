@@ -1,4 +1,7 @@
-//! Milestone 3: focus the i3 window running a given agent.
+//! Window identity: which i3 window an agent lives in, and focusing it.
+//!
+//! (Milestone 3.) The `seagents focus` command and the HUD's preview/jump live
+//! here, next to the identity-capture strategies they depend on.
 //!
 //! X11 offers no query for "the window hosting this pty" (Terminator shares
 //! one process across all its windows, so `_NET_WM_PID` is useless). The only
@@ -12,6 +15,7 @@
 use std::process::Command;
 
 use crate::i3;
+use crate::launch::WindowMatch;
 use crate::registry::Files;
 
 /// `seagents focus <child_pid>` — bring the agent's terminal window to the
@@ -202,12 +206,8 @@ pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
     None
 }
 
-/// Every X11 property a terminal might use to carry a handle we minted.
-/// Terminator has `--role` and no `--class`; most others are the reverse.
-pub(crate) const HANDLE_PROPS: [&str; 3] = ["window_role", "instance", "class"];
-
 /// The (con_id, X window id) of the window carrying `value` in any of
-/// [`HANDLE_PROPS`] — the handle-based identity capture, for windows seagents
+/// [`WindowMatch::ALL`] — the handle-based identity capture, for windows seagents
 /// launched itself on a terminal where [`window_ids_by_pid`] cannot help.
 ///
 /// All three properties are searched rather than the one this terminal is
@@ -241,9 +241,9 @@ pub(crate) fn window_ids_for_handle(value: &str) -> Option<(Option<u64>, Option<
 }
 
 fn collect_handle(node: &serde_json::Value, value: &str, out: &mut Vec<(u64, Option<u64>)>) {
-    let carries = HANDLE_PROPS
+    let carries = WindowMatch::ALL
         .iter()
-        .any(|p| node["window_properties"][*p].as_str() == Some(value));
+        .any(|m| node["window_properties"][m.key()].as_str() == Some(value));
     if carries {
         if let Some(con_id) = node["id"].as_u64() {
             out.push((con_id, node["window"].as_u64()));

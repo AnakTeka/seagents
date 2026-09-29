@@ -430,7 +430,7 @@ fn preview_selected(app: &mut App) {
     // Capture the HUD's window the first time — right now it's focused, since
     // the user is driving the HUD.
     if app.hud_con_id.is_none() {
-        app.hud_con_id = crate::focus::focused_con_id();
+        app.hud_con_id = crate::window::focused_con_id();
     }
     let Some(i) = app.list.selected() else {
         return;
@@ -441,7 +441,7 @@ fn preview_selected(app: &mut App) {
     // Looking at it counts as seeing it: done → idle.
     status::ack_session(s.id);
     let name = label_of(s, app.labels).to_string();
-    match crate::focus::preview_window(s.pid, app.hud_con_id) {
+    match crate::window::preview_window(s.pid, app.hud_con_id) {
         Ok(()) => app.message = format!("previewing {name} · enter to jump"),
         Err(e) => app.message = e,
     }
@@ -456,7 +456,7 @@ fn focus_selected(app: &mut App) {
     };
     status::ack_session(s.id);
     let name = label_of(s, app.labels).to_string();
-    match crate::focus::focus_window(s.pid) {
+    match crate::window::focus_window(s.pid) {
         Ok(()) => app.message = format!("focused {name} ({})", s.cmd),
         Err(e) => app.message = e,
     }

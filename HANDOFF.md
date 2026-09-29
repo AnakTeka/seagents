@@ -173,18 +173,25 @@ Source layout under `src/`:
   hand-written `is_blocked()` rules entirely. Where herdr's answer to a rule
   differs from what seagents needs, `manifest/patches.rs` re-weights that one
   rule by id as the manifest loads, so the rest keeps updating upstream.
-- **`src/focus.rs`** — `focus_window()` (exact handles: con_id, then X window
-  id, with healing), `preview_window()`, `record_window()` (identity capture),
-  `focused_con_id()`/`focused_terminal_ids()`, `window_ids_by_pid()`,
-  `window_ids_for_handle()`.
+- **`src/window.rs`** — window identity and focus (§4): `focus()` (the
+  `focus` command), `focus_window()` (exact handles: con_id, then X window id,
+  with healing), `preview_window()`, `record_window()` (identity capture),
+  `focused_con_id()`/`focused_terminal_ids()`, `window_ids_from_env()`,
+  `window_ids_by_pid()`, `window_ids_for_handle()`.
+- **`src/launch.rs`** — opening a terminal window seagents can recognize
+  afterwards: `handle_for()` (the minted `seagents-<tag>` handle),
+  `WindowMatch` (which X11 property carries it), the per-terminal recipes
+  (`terminal()`, `recipe_for_class()`, `matcher_for()`), `spawn_terminal()`,
+  `shell_quote()`. Used by `restore`; `spawn` will share it.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
   `parent_pid()`, `ancestors()`, `live_pty_size()`.
 - **`src/clock.rs`** — `unix_now()`, the unit of every stored timestamp.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
-- **`src/snapshot.rs`** — the reboot snapshot: `capture()`, layout emission
-  with i3 swallow criteria, `resolve_session_ids()`, `restore_cmd()`.
+- **`src/snapshot.rs`** — the reboot snapshot, layout capture/restore only:
+  `capture()`, layout emission with i3 swallow criteria,
+  `resolve_session_ids()`, `restore_cmd()` (which launches through `launch`).
 
 ### 1. `seagents run` — the transparent pty-tee launcher
 
@@ -425,7 +432,7 @@ alone.
 *Which* X11 property carries the handle is the terminal's business — Terminator
 has `--role` and no `--class`; alacritty (and most others) are the reverse — so
 the **stored layout is terminal-agnostic**: leaves keep a `tag`, and the swallow
-criterion is built at restore time from `WindowMatch`. The terminal is chosen **per agent**, from the
+criterion is built at restore time from `launch::WindowMatch`. The terminal is chosen **per agent**, from the
 WM_CLASS captured with it — so a restore puts each window back in the terminal
 it was actually running in, and a half-migrated setup (some agents in
 Terminator, some in alacritty, swallowing on different properties) comes back

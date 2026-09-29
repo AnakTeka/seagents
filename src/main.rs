@@ -15,14 +15,15 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 mod clock;
 mod detect;
-mod focus;
 mod hud;
 mod i3;
+mod launch;
 mod procfs;
 mod registry;
 mod snapshot;
 mod status;
 mod vendor;
+mod window;
 
 fn main() {
     let mut args = std::env::args();
@@ -102,7 +103,7 @@ fn main() {
         Some("focus") => {
             let pid = args.next().and_then(|s| s.parse::<u64>().ok());
             match pid {
-                Some(p) => std::process::exit(focus::focus(p)),
+                Some(p) => std::process::exit(window::focus(p)),
                 None => {
                     eprintln!("usage: seagents focus <child_pid>");
                     std::process::exit(2);
@@ -377,7 +378,7 @@ fn notify_transition(
         ),
         _ => return,
     };
-    if con_id.is_some() && focus::focused_con_id() == con_id {
+    if con_id.is_some() && window::focused_con_id() == con_id {
         return;
     }
     // Reap in a detached thread: a dropped Child is never wait()ed, so each
@@ -587,11 +588,11 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     //   3. the handle `restore` minted and passed as --window;
     //   4. the focused terminal, which is right when a human just typed the
     //      command into it and wrong for anything spawned programmatically.
-    let (con_id, window_id) = focus::window_ids_from_env()
-        .or_else(focus::window_ids_by_pid)
+    let (con_id, window_id) = window::window_ids_from_env()
+        .or_else(window::window_ids_by_pid)
         .map(|(con, xid)| (Some(con), xid))
-        .or_else(|| window.as_ref().and_then(|h| focus::window_ids_for_handle(h)))
-        .or_else(|| focus::focused_terminal_ids().map(|(con, xid)| (Some(con), xid)))
+        .or_else(|| window.as_ref().and_then(|h| window::window_ids_for_handle(h)))
+        .or_else(|| window::focused_terminal_ids().map(|(con, xid)| (Some(con), xid)))
         .unwrap_or((None, None));
 
     let size = terminal_size();
@@ -729,8 +730,8 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
                             .map_or(true, |t| t.elapsed().as_secs() >= 60);
                         if due && input_capture_eligible(&buf[..n]) {
                             last_capture = Some(std::time::Instant::now());
-                            if let Some((con_id, xid)) = focus::focused_terminal_ids() {
-                                focus::record_window(&files, con_id, xid);
+                            if let Some((con_id, xid)) = window::focused_terminal_ids() {
+                                window::record_window(&files, con_id, xid);
                             }
                         }
                     }
@@ -814,7 +815,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
                         if state == status::State::Idle
                             && !acked
                             && con_id.is_some()
-                            && focus::focused_con_id() == con_id
+                            && window::focused_con_id() == con_id
                         {
                             status::ack_session_files(&files);
                         }
