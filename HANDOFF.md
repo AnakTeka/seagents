@@ -482,6 +482,25 @@ whose wrappers were started before this existed and so never call it themselves.
 An unplanned reboot loses at most 30 s of layout change, and there is no command
 to remember.
 
+Continuous capture has one enemy: the *next* boot. Nothing is running after a
+reboot, so the first HUD open, `status` or new agent would overwrite the old
+boot's layout with an empty one before `restore` could read it. So the write
+(`write_layout`, serialized on `layout.lock`) first compares the file's
+`captured` with this boot's start — `btime` from `/proc/stat`
+(`procfs::boot_time`) — and a layout from a previous boot that still holds
+agents is moved to **`layout.prev-boot.json`** (replacing any older one); then
+capture carries on as normal in the new boot. (A previous boot's *empty* layout
+is just overwritten — setting it aside would bury an unrestored one from the
+boot before.) `restore` reads `layout.prev-boot.json` when it exists, else
+`layout.json` — the same-boot case (terminals closed or crashed, no reboot).
+A full restore from the previous boot's file renames it to
+`layout.restored.json` (kept, not deleted: it is the record of what the restore
+worked from; `mv` it back to retry); `--dry-run` and `--workspace` leave it
+pending. Its tags stay reserved against newly minted ones until then. `snapshot`
+notes when a pending previous-boot layout, not the one it just wrote, is what
+`restore` will use. `tools/test-restore.sh` plays the reboot with
+`SEAGENTS_TEST_BTIME`, a test-only stand-in for btime.
+
 **A window must be re-fillable.** i3's `append_layout` matches placeholders by
 *swallow criteria*, and an ordinary terminal window offers nothing stable:
 Terminator windows all share one class, carry no role, and show a title Claude
@@ -624,6 +643,15 @@ and restore) once; after that every agent is tagged at launch.
   `SEAGENTS_TERMINAL_CMD` *and* `SEAGENTS_TERMINAL_MATCH` — seagents errors
   rather than guessing, because guessing wrong shows up as placeholders that
   never fill and no error at all.
+- **A previous boot's layout waits for the first restore.** Until a full
+  `restore` consumes `layout.prev-boot.json`, every `restore` reads it rather
+  than the live `layout.json` — so if you skip restoring after a reboot and
+  then lose terminals in the new boot, `restore` brings back the *old* boot
+  (dedup by tag keeps it from duplicating anything live). Delete or rename the
+  file to fall back to the live layout. Boot identity is `btime`, which a large
+  wall-clock step after boot shifts; a capture made before such a step can be
+  mistaken for a previous boot's (harmless: it is set aside and restore
+  dedups by tag).
 - **Floating agents restore tiled** — placeholder matching is per-container, and
   an agent that comes back tiled is a smaller surprise than one that doesn't.
 - **Restored windows land on whichever workspace is focused when they spawn**,

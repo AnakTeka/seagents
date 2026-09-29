@@ -195,10 +195,28 @@ sleep 3
 alive=$(i3-msg -t get_tree | grep -o 'seagents-t[0-9]' | wc -l)
 [ "$alive" -eq 0 ] || { echo "FAIL: $alive agent windows survived the kill"; exit 1; }
 
+# Play the reboot: the machine "booted" after that capture, and the new boot's
+# first capture (a `status`, the HUD, a new agent) finds nothing running. It
+# must set the old layout aside rather than bury it under an empty one.
+# SEAGENTS_TEST_BTIME is a test-only stand-in for /proc/stat's btime.
+sleep 1
+export SEAGENTS_TEST_BTIME=$(date +%s)
+STATE="$HOME/.local/state/seagents"
+"$SEA" snapshot >/dev/null || { echo "post-reboot snapshot failed"; exit 1; }
+[ -f "$STATE/layout.prev-boot.json" ] || {
+  echo "FAIL: the new boot's capture did not set the old layout aside"; exit 1; }
+out=$("$SEA" restore --dry-run) || { echo "dry-run restore failed"; exit 1; }
+echo "$out" | grep -q 'would restore 3 windows' && [ -f "$STATE/layout.prev-boot.json" ] || {
+  echo "FAIL: dry run did not plan 3 windows from the previous boot, or consumed it:"
+  echo "$out"; exit 1; }
+echo "PASS: the new boot's first capture set the previous boot's layout aside"
+
 out=$("$SEA" restore --stagger=0) || { echo "restore failed"; exit 1; }
 echo "$out"
 echo "$out" | grep -qE 'restored 3 windows' || {
   echo "FAIL: restore did not launch 3 windows"; exit 1; }
+[ ! -e "$STATE/layout.prev-boot.json" ] && [ -f "$STATE/layout.restored.json" ] || {
+  echo "FAIL: restoring from the previous boot's layout did not consume it"; exit 1; }
 sleep 4
 after=$(dump)
 echo "=== restored layout ==="; echo "$after"
@@ -219,6 +237,9 @@ want="t1:None:0 t2:None:0 t3:t1:1"
 echo "PASS: restored agents carry their captured tags and lineage ($tags)"
 
 # Idempotent by tag: everything captured is live, so a second restore is a no-op.
+# It reads the live layout now; capture it (the restored wrappers' own offers
+# are throttled behind the post-reboot one).
+"$SEA" snapshot >/dev/null || { echo "snapshot failed"; exit 1; }
 out=$("$SEA" restore --stagger=0) || { echo "second restore failed"; exit 1; }
 echo "$out" | grep -qE 'restored 0 windows' && echo "$out" | grep -q '3 already running' || {
   echo "FAIL: second restore was not a no-op:"; echo "$out"; exit 1; }

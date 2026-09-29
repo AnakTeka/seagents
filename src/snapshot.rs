@@ -12,7 +12,10 @@
 //!    lives in `state_dir()/layout.json`, written *continuously* (each
 //!    wrapper's monitor thread offers a capture every tick, globally throttled
 //!    to one write per [`SNAPSHOT_INTERVAL_SECS`]). An unplanned reboot loses
-//!    at most that interval, and there is no command to remember.
+//!    at most that interval, and there is no command to remember. The first
+//!    capture of the next boot sets the old boot's layout aside before
+//!    overwriting it, and `restore` reads that one first ([`write_layout`],
+//!    [`restore_source`]).
 //!
 //! 2. **A window must be re-fillable.** i3's `append_layout` matches
 //!    placeholders against *swallow criteria*, and an ordinary terminal window
@@ -62,10 +65,96 @@ const SNAPSHOT_INTERVAL_SECS: u64 = 30;
 /// still finishing its own boot.
 pub(crate) const DEFAULT_STAGGER_SECS: u64 = 2;
 
-pub(crate) fn snapshot_path() -> PathBuf {
+/// The live snapshot: rewritten every [`SNAPSHOT_INTERVAL_SECS`] by whoever
+/// offers first.
+const LAYOUT: &str = "layout.json";
+/// The last layout of a previous boot, set aside by the first capture of this
+/// one so that capture can carry on overwriting [`LAYOUT`]. A reboot leaves
+/// nothing running, so without this the first `status`, HUD open or new agent
+/// of the new boot would replace the layout `restore` exists to bring back
+/// with an empty one.
+const PREV_BOOT: &str = "layout.prev-boot.json";
+/// [`PREV_BOOT`] once a restore has used it. Renamed rather than deleted: it
+/// costs nothing, and it is the only record of what a botched restore was
+/// working from (`mv` it back to retry).
+const RESTORED: &str = "layout.restored.json";
+
+fn layout_dir() -> PathBuf {
     let dir = crate::vendor::herdr_detect::config::state_dir();
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("layout.json")
+    dir
+}
+
+/// When this boot began. `SEAGENTS_TEST_BTIME` is **test-only**: it stands in
+/// for `/proc/stat`'s btime so `tools/test-restore.sh` can play a reboot
+/// without one. Nothing else should set it.
+fn current_boot() -> u64 {
+    std::env::var("SEAGENTS_TEST_BTIME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(crate::procfs::boot_time)
+        .unwrap_or(0)
+}
+
+fn read_layout(path: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Does this snapshot record anything a restore could launch?
+fn has_agents(snapshot: &Value) -> bool {
+    snapshot["workspaces"].as_array().is_some_and(|ws| {
+        ws.iter()
+            .any(|w| w["agents"].as_array().is_some_and(|a| !a.is_empty()))
+    })
+}
+
+/// Write `snapshot` as `dir`'s live layout, first setting aside a live layout
+/// captured before `boot` began (a previous boot's) as [`PREV_BOOT`].
+///
+/// Serialized on `layout.lock`: after a reboot several callers can offer the
+/// first capture at once, and the decision has to be re-made under the lock
+/// against what is on disk *now* — otherwise a second capturer that read the
+/// old file too would set aside the first one's fresh, near-empty layout over
+/// the one worth keeping.
+///
+/// A previous boot's layout that holds no agents is not set aside, just
+/// overwritten: it can restore nothing, and setting it aside would replace a
+/// still-unrestored one from the boot before (reboot, a brief boot that
+/// captures an empty layout, reboot again).
+fn write_layout(dir: &Path, snapshot: &Value, boot: u64) -> Result<(), String> {
+    let _lock = crate::registry::Lock::acquire(&dir.join("layout.lock"));
+    let path = dir.join(LAYOUT);
+    if let Some(old) = read_layout(&path) {
+        let previous_boot = old["captured"].as_u64().is_some_and(|t| t < boot);
+        if previous_boot && has_agents(&old) {
+            std::fs::rename(&path, dir.join(PREV_BOOT))
+                .map_err(|e| format!("setting aside {}: {e}", path.display()))?;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// The layout `restore` works from: a previous boot's that no restore has used
+/// yet, else the live one — the same-boot case, where terminals closed or
+/// crashed without a reboot. `true` when it is the previous boot's.
+fn restore_source(dir: &Path) -> (PathBuf, bool) {
+    let prev = dir.join(PREV_BOOT);
+    if prev.exists() {
+        (prev, true)
+    } else {
+        (dir.join(LAYOUT), false)
+    }
+}
+
+/// Mark the previous boot's layout used, so the next restore goes back to the
+/// live one.
+fn consume_prev_boot(dir: &Path) -> Result<(), String> {
+    let _lock = crate::registry::Lock::acquire(&dir.join("layout.lock"));
+    let prev = dir.join(PREV_BOOT);
+    std::fs::rename(&prev, dir.join(RESTORED)).map_err(|e| format!("{}: {e}", prev.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -580,28 +669,33 @@ fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<
 // Capture
 // ---------------------------------------------------------------------------
 
-/// Every agent tag the snapshot on disk records — the names a pending
-/// restore will relaunch under, which a newly minted tag must not take.
+/// Every agent tag the snapshots on disk record — the live one and a previous
+/// boot's still awaiting restore: the names a pending restore will relaunch
+/// under, which a newly minted tag must not take.
 pub(crate) fn captured_tags() -> HashSet<String> {
-    let Some(snapshot) = std::fs::read_to_string(snapshot_path())
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-    else {
-        return HashSet::new();
-    };
-    snapshot["workspaces"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|ws| ws["agents"].as_array())
-        .flatten()
-        .filter_map(|a| a["tag"].as_str().map(str::to_string))
+    captured_tags_in(&layout_dir())
+}
+
+fn captured_tags_in(dir: &Path) -> HashSet<String> {
+    [LAYOUT, PREV_BOOT]
+        .iter()
+        .filter_map(|name| read_layout(&dir.join(name)))
+        .flat_map(|snapshot| {
+            snapshot["workspaces"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|ws| ws["agents"].as_array())
+                .flatten()
+                .filter_map(|a| a["tag"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
 /// True when the snapshot on disk has gone stale.
 fn capture_due() -> bool {
-    !std::fs::metadata(snapshot_path())
+    !std::fs::metadata(layout_dir().join(LAYOUT))
         .and_then(|m| m.modified())
         .map(|t| {
             t.elapsed()
@@ -754,11 +848,7 @@ fn capture(refresh: bool) -> Result<Value, String> {
         "unplaced": unplaced,
     });
 
-    let path = snapshot_path();
-    let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    write_layout(&layout_dir(), &snapshot, current_boot())?;
     Ok(snapshot)
 }
 
@@ -780,15 +870,33 @@ fn workspace_sort_key(name: &str) -> (u8, u64, String) {
 pub fn snapshot_cmd(refresh: bool, print_json: bool) -> i32 {
     match capture(refresh) {
         Ok(snapshot) => {
+            let dir = layout_dir();
+            // The capture just made is not what the next `restore` reads while
+            // a previous boot's layout is pending; say so (on stderr under
+            // `--print`, which keeps stdout the JSON alone).
+            let (source, prev_boot) = restore_source(&dir);
+            let pending = prev_boot.then(|| {
+                format!(
+                    "note: the previous boot's layout is still unrestored at {} — \
+                     `restore` will use that, not this one",
+                    source.display()
+                )
+            });
             if print_json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default()
                 );
+                if let Some(note) = pending {
+                    eprintln!("{note}");
+                }
                 return 0;
             }
             summarize(&snapshot);
-            println!("\nsaved to {}", snapshot_path().display());
+            println!("\nsaved to {}", dir.join(LAYOUT).display());
+            if let Some(note) = pending {
+                println!("{note}");
+            }
             0
         }
         Err(e) => {
@@ -848,7 +956,11 @@ fn summarize(snapshot: &Value) {
 
 /// `seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]`
 pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
-    let path = snapshot_path();
+    restore_in(&layout_dir(), dry_run, stagger, only)
+}
+
+fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
+    let (path, prev_boot) = restore_source(dir);
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "seagents: no snapshot at {} — none is written until an agent has run \
@@ -861,6 +973,10 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
         eprintln!("seagents: {} is not readable as a snapshot", path.display());
         return 1;
     };
+
+    if prev_boot {
+        println!("from the previous boot's layout ({})", path.display());
+    }
 
     // Never restore something that is already on screen: `restore` has to be
     // safe to run twice, and safe to run when only half the agents died. Every
@@ -992,6 +1108,15 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
                 "workspace --no-auto-back-and-forth {}",
                 i3::quote(ws)
             ));
+        }
+        // Used up once a whole restore has run from it, failed launches
+        // included — otherwise it would shadow the live layout for good, and a
+        // later same-boot crash would bring back the old boot instead. A
+        // `--workspace` restore leaves it pending for the rest.
+        if prev_boot && only.is_none() {
+            if let Err(e) = consume_prev_boot(dir) {
+                eprintln!("seagents: {e}");
+            }
         }
     }
 
@@ -1274,6 +1399,108 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(leaf_tag(&kept[0]).as_deref(), Some("b"));
         assert_eq!(kept[0]["percent"].as_f64(), Some(1.0));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("seagents-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A one-agent snapshot as `capture` writes it, stamped `captured`.
+    fn layout(captured: u64, tag: &str) -> Value {
+        json!({
+            "version": 1,
+            "captured": captured,
+            "focused_workspace": "1",
+            "workspaces": [{
+                "name": "1",
+                "output": "",
+                "agents": [{"tag": tag, "cwd": "/tmp", "dir": "tmp", "argv": ["sleep", "1"],
+                            "session_id": null, "terminal_class": "Alacritty"}],
+                "layout": [],
+            }],
+            "unplaced": [],
+        })
+    }
+
+    fn tag_of(path: &Path) -> String {
+        read_layout(path).unwrap()["workspaces"][0]["agents"][0]["tag"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn capture_over_a_previous_boots_layout_sets_it_aside() {
+        let dir = scratch("prevboot");
+        let boot = 1000;
+        write_layout(&dir, &layout(900, "old"), 500).unwrap();
+        assert!(
+            !dir.join(PREV_BOOT).exists(),
+            "a same-boot rewrite sets nothing aside"
+        );
+
+        // First capture of the new boot: the old boot's layout moves aside.
+        write_layout(&dir, &layout(1010, "new"), boot).unwrap();
+        assert_eq!(tag_of(&dir.join(PREV_BOOT)), "old");
+        assert_eq!(tag_of(&dir.join(LAYOUT)), "new");
+
+        // Later captures in the same boot leave it alone.
+        write_layout(&dir, &layout(1040, "newer"), boot).unwrap();
+        assert_eq!(tag_of(&dir.join(PREV_BOOT)), "old");
+        assert_eq!(tag_of(&dir.join(LAYOUT)), "newer");
+
+        // Both boots' tags stay reserved while the old one awaits restore.
+        let tags = captured_tags_in(&dir);
+        assert!(tags.contains("old") && tags.contains("newer"));
+
+        // A newer boot's layout replaces an older pending one.
+        write_layout(&dir, &layout(2010, "third"), 2000).unwrap();
+        assert_eq!(tag_of(&dir.join(PREV_BOOT)), "newer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_previous_boot_layout_is_overwritten_not_set_aside() {
+        let dir = scratch("prevboot-empty");
+        write_layout(&dir, &layout(900, "old"), 500).unwrap();
+        write_layout(&dir, &json!({"captured": 1010, "workspaces": []}), 1000).unwrap();
+        // Reboot again before restoring: the brief boot's empty layout must not
+        // bury the one that still has agents in it.
+        write_layout(&dir, &layout(2010, "new"), 2000).unwrap();
+        assert_eq!(tag_of(&dir.join(PREV_BOOT)), "old");
+        assert_eq!(tag_of(&dir.join(LAYOUT)), "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_prefers_an_unrestored_previous_boot_then_falls_back_to_live() {
+        let dir = scratch("restore-source");
+        assert_eq!(restore_source(&dir), (dir.join(LAYOUT), false));
+        write_layout(&dir, &layout(900, "old"), 500).unwrap();
+        assert_eq!(restore_source(&dir), (dir.join(LAYOUT), false));
+        write_layout(&dir, &layout(1010, "new"), 1000).unwrap();
+        assert_eq!(restore_source(&dir), (dir.join(PREV_BOOT), true));
+
+        consume_prev_boot(&dir).unwrap();
+        assert_eq!(restore_source(&dir), (dir.join(LAYOUT), false));
+        assert_eq!(tag_of(&dir.join(RESTORED)), "old");
+        assert!(!captured_tags_in(&dir).contains("old"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dry_run_restore_does_not_consume_the_previous_boot() {
+        let dir = scratch("restore-dry");
+        // Tags no live agent carries, so the plan is to launch it.
+        write_layout(&dir, &layout(900, "sg-unit-old"), 500).unwrap();
+        write_layout(&dir, &layout(1010, "sg-unit-new"), 1000).unwrap();
+        assert_eq!(restore_in(&dir, true, 0, None), 0);
+        assert_eq!(restore_source(&dir), (dir.join(PREV_BOOT), true));
+        assert!(!dir.join(RESTORED).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -551,14 +551,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
 /// An exclusive `flock` on a session's `.lock` file, released on drop (closing
 /// the descriptor releases it, which also covers a crash mid-update). `flock`
 /// locks belong to the open file description, so two threads of one process
-/// exclude each other just as two processes do.
+/// exclude each other just as two processes do. Also what serializes the
+/// snapshot's writers (`snapshot::write_layout`).
 #[derive(Debug)]
-struct Lock {
+pub(crate) struct Lock {
     _held: File,
 }
 
 impl Lock {
-    fn acquire(path: &Path) -> Option<Lock> {
+    pub(crate) fn acquire(path: &Path) -> Option<Lock> {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
