@@ -108,6 +108,19 @@ launched as fresh instances — lets `seagents run` identify its own window
 exactly, from `/proc` ancestry, with no focus race and no unidentifiable
 windows.
 
+**The orchestration skill.** `skills/seagents-orchestrate/SKILL.md` teaches an
+agent the spawn → wait → send → read → stop loop (§7–§10) from the CLI as
+built. Claude Code loads skills from `~/.claude/skills/<name>/SKILL.md` (or
+`$CLAUDE_CONFIG_DIR/skills/` when that is set, as on the dev machine), so link
+the directory rather than copying it, and the skill follows the repo:
+
+```bash
+ln -s "$PWD/skills/seagents-orchestrate" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/seagents-orchestrate"
+```
+
+It states flags, JSON shapes and exit codes, so a change to any of those
+changes the skill in the same commit.
+
 ---
 
 ## Commands
