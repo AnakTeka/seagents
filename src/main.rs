@@ -19,6 +19,7 @@ mod focus;
 mod hud;
 mod i3;
 mod procfs;
+mod registry;
 mod snapshot;
 mod status;
 mod vendor;
@@ -346,14 +347,6 @@ fn input_capture_eligible(chunk: &[u8]) -> bool {
     has_user_bytes
 }
 
-/// The session's current window handle, read fresh from its meta (the input
-/// pump and focus paths heal it over time; launch-time copies go stale).
-fn meta_con_id(meta_path: &std::path::Path) -> Option<u64> {
-    let text = fs::read_to_string(meta_path).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&text).ok()?;
-    meta["con_id"].as_u64()
-}
-
 /// Desktop notification for a state transition worth interrupting the user
 /// for: the agent finished (working → idle) or is waiting on input
 /// (→ blocked). Suppressed while the agent's own window is focused — the
@@ -493,31 +486,11 @@ fn terminal_size() -> PtySize {
     }
 }
 
-/// Directory holding this machine's seagents session files.
-fn cache_dir() -> std::path::PathBuf {
-    let base = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cache/seagents"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/seagents"));
-    let _ = fs::create_dir_all(&base);
-    base
-}
-
-/// A session is keyed by the wrapper's pid; `.raw` holds the teed output and
-/// `.meta` holds the identity the daemon needs (cwd, argv, child pid).
-fn session_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let base = cache_dir();
-    let id = std::process::id();
-    (
-        base.join(format!("{id}.raw")),
-        base.join(format!("{id}.meta")),
-    )
-}
-
 /// Record who this agent is so the daemon can label it and locate its process /
 /// i3 window. cwd here is the launch cwd; the daemon can also read the live cwd
 /// from /proc/<child_pid>/cwd.
 fn write_meta(
-    path: &std::path::Path,
+    files: &registry::Files,
     child_pid: Option<u32>,
     cwd: &std::path::Path,
     argv: &[String],
@@ -525,25 +498,21 @@ fn write_meta(
     con_id: Option<u64>,
     window_id: Option<u64>,
 ) {
-    let meta = serde_json::json!({
-        "wrapper_pid": std::process::id(),
-        "child_pid": child_pid,
-        "cwd": cwd.to_string_lossy(),
-        "argv": argv,
-        "started": clock::unix_now(),
+    let meta = registry::Meta {
+        wrapper_pid: u64::from(std::process::id()),
+        child_pid: child_pid.map(u64::from),
+        cwd: cwd.to_string_lossy().into_owned(),
+        argv: argv.to_vec(),
+        started: clock::unix_now(),
         // Geometry so the daemon can re-render the raw stream at the right size.
-        "cols": size.cols,
-        "rows": size.rows,
-        // The i3 window this agent runs in, captured at launch — the reliable
-        // handle for focus (titles can collide between idle agents). con_id is
-        // the fast handle but dies on an i3 restart; window_id is the X11 id,
-        // which survives one.
-        "con_id": con_id,
-        "window_id": window_id,
-    });
-    if let Ok(s) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(path, s);
-    }
+        cols: Some(size.cols),
+        rows: Some(size.rows),
+        // The i3 window this agent runs in, captured at launch.
+        con_id,
+        window_id,
+        ..registry::Meta::default()
+    };
+    registry::create_meta(files, &meta);
 }
 
 /// Shrink an oversized tee file to its last ~1 MB (all detection ever reads),
@@ -679,12 +648,12 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
     // Open the tee target and write the identity sidecar. Both best-effort.
-    let (raw_path, meta_path) = session_paths();
-    let tee = File::create(&raw_path).ok();
+    let files = registry::Files::of(u64::from(std::process::id()));
+    let tee = File::create(&files.raw).ok();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    write_meta(&meta_path, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
+    write_meta(&files, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
-        eprintln!("seagents: teeing to {}", raw_path.display());
+        eprintln!("seagents: teeing to {}", files.raw.display());
     }
 
     // Put the outer terminal into raw mode so keystrokes and control bytes flow
@@ -692,7 +661,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
 
     // Output pump: master -> stdout (+ tee). This owns the "T-junction".
-    let tee_path = raw_path.clone();
+    let tee_path = files.raw.clone();
     let reader_handle = thread::spawn(move || {
         let mut out = std::io::stdout();
         let mut tee = tee;
@@ -743,7 +712,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     // meta's con_id/window_id correct through i3 restarts and launch-time
     // capture misses — this is what lets focus use exact handles only.
     {
-        let meta_path = meta_path.clone();
+        let files = files.clone();
         thread::spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 8192];
@@ -761,7 +730,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
                         if due && input_capture_eligible(&buf[..n]) {
                             last_capture = Some(std::time::Instant::now());
                             if let Some((con_id, xid)) = focus::focused_terminal_ids() {
-                                focus::record_window(&meta_path, con_id, xid);
+                                focus::record_window(&files, con_id, xid);
                             }
                         }
                     }
@@ -799,9 +768,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     // forever and the monitor would misclassify at 80x24 while other
     // observers disagree — better no monitor than a flapping one.)
     if let Some(anchor_pid) = child.process_id().map(u64::from) {
-        let raw_path = raw_path.clone();
-        let state_path = raw_path.with_extension("state");
-        let mon_meta_path = meta_path.clone();
+        let files = files.clone();
         let cmd0 = std::path::Path::new(&cmd[0])
             .file_name()
             .and_then(|s| s.to_str())
@@ -824,18 +791,18 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
             // must always be made from this wrapper's own observations.
             let mut prev: Option<status::State> = None;
             loop {
-                let seen = fs::metadata(&raw_path)
+                let seen = fs::metadata(&files.raw)
                     .ok()
                     .and_then(|m| m.modified().ok().map(|t| (m.len(), t)));
                 if seen.is_none() || seen != last_seen {
                     last_seen = seen;
                     if let Some((state, acked)) =
-                        status::track_session(&raw_path, &state_path, &cmd0, anchor_pid)
+                        status::track_session(&files, &cmd0, anchor_pid)
                     {
                         // Read the con_id fresh: the input pump and focus
                         // fallback heal it in the meta over time, and a stale
                         // copy here would break focused-window suppression.
-                        let con_id = meta_con_id(&mon_meta_path);
+                        let con_id = registry::read_meta(&files).and_then(|m| m.con_id);
                         if let Some(prev) = prev {
                             notify_transition(prev, state, &dir0, &cmd0, con_id);
                         }
@@ -849,7 +816,7 @@ fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
                             && con_id.is_some()
                             && focus::focused_con_id() == con_id
                         {
-                            status::ack_session_path(&state_path);
+                            status::ack_session_files(&files);
                         }
                     }
                 }

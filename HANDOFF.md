@@ -154,10 +154,16 @@ says `▼ n more` — otherwise `q / esc` would silently fall off the end.
 
 Source layout under `src/`:
 
-- **`src/main.rs`** — CLI dispatch; the `run()` pty-tee wrapper; `cache_dir()`,
-  `session_paths()`, `write_meta()`, `terminal_size()`; manifest-update helpers.
-- **`src/status.rs`** — `State` enum, `Session`, `collect()`, `print()`,
-  `read_session()` (detection + reaping), OSC-title parsing (`all_titles`,
+- **`src/main.rs`** — CLI dispatch; the `run()` pty-tee wrapper;
+  `write_meta()`, `terminal_size()`; manifest-update helpers.
+- **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
+  sidecar paths (`Files`), the typed `Meta` / `StateRecord`, `list()` (live,
+  never deletes) / `reap()` (deletes the dead) / `by_child_pid()`, and the
+  locked `update_meta()` / `update_state()`. No other module builds a
+  `<pid>.*` path or parses one.
+- **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then
+  detects), `print()`, `read_session()` (detection), `observe_state()` (the
+  `.state` transition rules), OSC-title parsing (`all_titles`,
   `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
   vendored engine's verdicts on live-capture scenarios.
@@ -233,8 +239,8 @@ Per session, keyed by the wrapper's pid:
   its own agent every 2s, skipping the pass while the tee is unchanged), so
   durations stay truthful with no HUD open. HUD/status polls also write it
   whenever their own detection disagrees — the writers race benignly on
-  transitions (both stamp since≈now; writes are atomic tmp+rename, and a
-  transient Unknown never overwrites a known state).
+  transitions (both stamp since≈now; each read-decide-write is one locked
+  update, and a transient Unknown never overwrites a known state).
   Transition-based on purpose: output age can't work because a
   focused Claude repaints on the terminal's focus-in report, which would
   reset the clock every time the HUD previews a window.
@@ -254,11 +260,28 @@ Per session, keyed by the wrapper's pid:
   }
   ```
   `session_id` is filled in lazily by the snapshot capture (see §6), not by
-  `run` — nothing at launch time knows it yet.
+  `run` — nothing at launch time knows it yet. Parsed as a typed record with
+  every field but `wrapper_pid` optional, and fields this binary doesn't know
+  carried through untouched — live wrappers outlast a reinstall, so a `.meta`
+  may come from an older or newer seagents than the one reading it.
+- **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`
+  or `.state`.
 
-Sessions self-reap: `read_session()` deletes both files when the child process is
+**Every sidecar goes through `registry.rs`**, because `.meta` and `.state` have
+writers in several processes (`.meta`: the wrapper at launch, window healing
+from its input pump *and* from `focus`/the HUD, conversation ids from whichever
+process runs a snapshot capture). Each change is `flock` on `.lock` → read →
+mutate the typed record → write a pid-suffixed tmp file → rename over → unlock;
+readers take no lock. tmp+rename is what stops a reader seeing torn JSON (a row
+vanishing for a tick); only the lock stops two writers dropping each other's
+update (a healed con_id or a resolved session id silently lost).
+
+Sessions self-reap: `status::collect()` (so `status` and the HUD) calls
+`registry::reap()`, which deletes every file of a session whose child process is
 gone (`/proc/<child_pid>` missing). So the HUD/status only ever show live agents;
-there is no `ended` state.
+there is no `ended` state. `registry::list()` applies the same liveness rule but
+never deletes — the snapshot capture uses it, from inside wrappers' monitor
+threads, which have no business deleting other sessions.
 
 ### 3. `seagents status` — detection
 

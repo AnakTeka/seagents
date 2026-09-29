@@ -49,6 +49,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use crate::i3;
+use crate::registry::{Files, Session};
 
 /// One layout write per this many seconds, across all wrappers. Short enough
 /// that moving a window between workspaces is captured before you walk away,
@@ -65,116 +66,6 @@ pub(crate) fn snapshot_path() -> PathBuf {
     let dir = crate::vendor::herdr_detect::config::state_dir();
     let _ = std::fs::create_dir_all(&dir);
     dir.join("layout.json")
-}
-
-// ---------------------------------------------------------------------------
-// Live sessions
-// ---------------------------------------------------------------------------
-
-/// A tracked agent that is still running, as read from its `.meta`.
-struct Live {
-    wrapper_pid: u64,
-    child_pid: u64,
-    cwd: String,
-    argv: Vec<String>,
-    con_id: Option<u64>,
-    window_id: Option<u64>,
-    started: u64,
-    meta_path: PathBuf,
-    /// The agent's own conversation id, once resolved (Claude only).
-    session_id: Option<String>,
-}
-
-impl Live {
-    /// The agent binary's basename — `claude`, `codex`, … Session-id
-    /// resolution is Claude-shaped and only runs for `claude`.
-    fn agent(&self) -> &str {
-        self.argv
-            .first()
-            .map(|a| {
-                Path::new(a)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(a.as_str())
-            })
-            .unwrap_or("")
-    }
-
-    fn dir(&self) -> String {
-        Path::new(&self.cwd)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&self.cwd)
-            .to_string()
-    }
-}
-
-/// Every `.meta` whose child process is still alive. (Unlike `status::collect`
-/// this deliberately does *not* reap the dead ones: a capture runs from inside
-/// a wrapper's monitor thread and has no business deleting other sessions.)
-fn live_sessions() -> Vec<Live> {
-    let dir = crate::cache_dir();
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-            continue;
-        }
-        let Some(v) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        else {
-            continue;
-        };
-        let Some(child_pid) = v["child_pid"].as_u64() else {
-            continue;
-        };
-        if !crate::procfs::alive(child_pid) {
-            continue;
-        }
-        out.push(Live {
-            wrapper_pid: v["wrapper_pid"].as_u64().unwrap_or(0),
-            child_pid,
-            cwd: v["cwd"].as_str().unwrap_or_default().to_string(),
-            argv: v["argv"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            con_id: v["con_id"].as_u64(),
-            window_id: v["window_id"].as_u64(),
-            started: v["started"].as_u64().unwrap_or(0),
-            session_id: v["session_id"].as_str().map(str::to_string),
-            meta_path: path,
-        });
-    }
-    out.sort_by_key(|s| s.wrapper_pid);
-    out
-}
-
-/// Persist a resolved conversation id into the session's `.meta`, so later
-/// captures skip the (comparatively expensive) resolution entirely.
-fn record_session_id(meta_path: &Path, session_id: &str, source: &str) {
-    let Some(mut meta) = std::fs::read_to_string(meta_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-    else {
-        return;
-    };
-    if meta["session_id"].as_str() == Some(session_id) {
-        return;
-    }
-    meta["session_id"] = json!(session_id);
-    meta["session_id_source"] = json!(source);
-    if let Ok(text) = serde_json::to_string_pretty(&meta) {
-        let _ = std::fs::write(meta_path, text);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +168,17 @@ fn transcript_titles(path: &Path) -> Vec<String> {
     out
 }
 
+/// Persist a resolved conversation id into the session's `.meta`, so later
+/// captures skip the (comparatively expensive) resolution entirely.
+fn record_session_id(files: &Files, session_id: &str, source: &str) {
+    crate::registry::update_meta(files, |meta| {
+        if meta.session_id.as_deref() != Some(session_id) {
+            meta.session_id = Some(session_id.to_string());
+            meta.session_id_source = Some(source.to_string());
+        }
+    });
+}
+
 /// Work out which conversation each live Claude window is running.
 ///
 /// Two sources, strongest first — and the result is cached into the `.meta`,
@@ -310,13 +212,13 @@ fn transcript_titles(path: &Path) -> Vec<String> {
 /// which reports the id — including after `/clear` — for sessions launched
 /// once that lands. `--refresh` re-resolves everything in the meantime.
 fn resolve_session_ids(
-    sessions: &mut [Live],
+    sessions: &mut [Session],
     titles: &HashMap<u64, String>,
     refresh: bool,
 ) {
     if refresh {
         for s in sessions.iter_mut() {
-            s.session_id = None;
+            s.meta.session_id = None;
         }
     }
 
@@ -325,39 +227,39 @@ fn resolve_session_ids(
     let mut claimed: HashSet<String> = HashSet::new();
     let mut project: HashMap<u64, PathBuf> = HashMap::new();
     for s in sessions.iter() {
-        if let Some(p) = claude_project_dir(&s.cwd) {
-            project.insert(s.wrapper_pid, p);
+        if let Some(p) = claude_project_dir(&s.meta.cwd) {
+            project.insert(s.meta.wrapper_pid, p);
         }
-        if let Some(id) = &s.session_id {
+        if let Some(id) = &s.meta.session_id {
             claimed.insert(id.clone());
         }
     }
 
     // Pass 1: exact, from /proc.
     for s in sessions.iter_mut() {
-        if s.session_id.is_some() || s.agent() != "claude" {
+        if s.meta.session_id.is_some() || s.meta.agent() != "claude" {
             continue;
         }
-        let Some(dir) = project.get(&s.wrapper_pid) else {
+        let Some(dir) = project.get(&s.meta.wrapper_pid) else {
             continue;
         };
-        if let Some(id) = session_id_from_proc(s.child_pid, dir) {
+        if let Some(id) = session_id_from_proc(s.child_pid(), dir) {
             if claimed.insert(id.clone()) {
-                record_session_id(&s.meta_path, &id, "proc");
-                s.session_id = Some(id);
+                record_session_id(&s.files, &id, "proc");
+                s.meta.session_id = Some(id);
             }
         }
     }
 
     // Pass 2: title match, over what pass 1 left unclaimed.
     for s in sessions.iter_mut() {
-        if s.session_id.is_some() || s.agent() != "claude" {
+        if s.meta.session_id.is_some() || s.meta.agent() != "claude" {
             continue;
         }
-        let Some(dir) = project.get(&s.wrapper_pid) else {
+        let Some(dir) = project.get(&s.meta.wrapper_pid) else {
             continue;
         };
-        let Some(title) = titles.get(&s.wrapper_pid) else {
+        let Some(title) = titles.get(&s.meta.wrapper_pid) else {
             continue;
         };
         let title = crate::status::strip_title_glyph(title).to_string();
@@ -385,7 +287,7 @@ fn resolve_session_ids(
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() >= s.started)
+                .map(|d| d.as_secs() >= s.meta.started)
                 .unwrap_or(false);
             if !recent {
                 continue;
@@ -397,8 +299,8 @@ fn resolve_session_ids(
         if hits.len() == 1 {
             let id = hits.pop().unwrap();
             claimed.insert(id.clone());
-            record_session_id(&s.meta_path, &id, "title");
-            s.session_id = Some(id);
+            record_session_id(&s.files, &id, "title");
+            s.meta.session_id = Some(id);
         }
     }
 }
@@ -695,10 +597,10 @@ fn matcher_for(class: &str) -> WindowMatch {
 /// Mint a stable tag for an agent: the head of its conversation id when we
 /// know it (stable across the reboot we are preparing for), else its wrapper
 /// pid (unique among live sessions, which is all a single restore needs).
-fn tag_for(s: &Live) -> String {
-    match &s.session_id {
+fn tag_for(s: &Session) -> String {
+    match &s.meta.session_id {
         Some(id) => id.chars().take(8).collect(),
-        None => format!("p{}", s.wrapper_pid),
+        None => format!("p{}", s.meta.wrapper_pid),
     }
 }
 
@@ -889,7 +791,7 @@ pub(crate) fn maybe_capture_async() {
 /// Build the snapshot and write it atomically. Returns it for callers that
 /// want to report on what was captured.
 fn capture(refresh: bool) -> Result<Value, String> {
-    let mut sessions = live_sessions();
+    let mut sessions = crate::registry::list();
     let tree = i3::tree().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
     let (places, by_xid) = index_tree(&tree);
 
@@ -908,14 +810,15 @@ fn capture(refresh: bool) -> Result<Value, String> {
         // Recorded con_id first; the X window id survives an i3 restart and
         // heals it, which is the same order `focus` resolves in.
         let Some(con_id) = s
+            .meta
             .con_id
             .filter(|id| places.contains_key(id))
-            .or_else(|| s.window_id.and_then(|x| by_xid.get(&x).copied()))
+            .or_else(|| s.meta.window_id.and_then(|x| by_xid.get(&x).copied()))
         else {
             continue;
         };
         match owner.get(&con_id) {
-            Some((started, prev)) if *started <= s.started => {
+            Some((started, prev)) if *started <= s.meta.started => {
                 let _ = prev;
                 continue;
             }
@@ -924,8 +827,8 @@ fn capture(refresh: bool) -> Result<Value, String> {
             }
             None => {}
         }
-        owner.insert(con_id, (s.started, s.wrapper_pid));
-        located.insert(s.wrapper_pid, con_id);
+        owner.insert(con_id, (s.meta.started, s.meta.wrapper_pid));
+        located.insert(s.meta.wrapper_pid, con_id);
     }
     let titles: HashMap<u64, String> = located
         .iter()
@@ -936,17 +839,17 @@ fn capture(refresh: bool) -> Result<Value, String> {
 
     // con_id → tag, for the agents we can actually locate on screen.
     let mut tags: HashMap<u64, String> = HashMap::new();
-    let mut placed: HashMap<String, Vec<&Live>> = HashMap::new();
+    let mut placed: HashMap<String, Vec<&Session>> = HashMap::new();
     let mut outputs: HashMap<String, String> = HashMap::new();
     let mut unplaced: Vec<Value> = Vec::new();
 
     for s in &sessions {
-        let Some(con_id) = located.get(&s.wrapper_pid).copied() else {
+        let Some(con_id) = located.get(&s.meta.wrapper_pid).copied() else {
             unplaced.push(json!({
-                "cwd": s.cwd,
-                "dir": s.dir(),
-                "argv": s.argv,
-                "session_id": s.session_id,
+                "cwd": s.meta.cwd,
+                "dir": s.meta.dir(),
+                "argv": s.meta.argv,
+                "session_id": s.meta.session_id,
             }));
             continue;
         };
@@ -972,12 +875,12 @@ fn capture(refresh: bool) -> Result<Value, String> {
             .map(|s| {
                 json!({
                     "tag": tag_for(s),
-                    "cwd": s.cwd,
-                    "dir": s.dir(),
-                    "argv": s.argv,
-                    "session_id": s.session_id,
+                    "cwd": s.meta.cwd,
+                    "dir": s.meta.dir(),
+                    "argv": s.meta.argv,
+                    "session_id": s.meta.session_id,
                     "terminal_class": located
-                        .get(&s.wrapper_pid)
+                        .get(&s.meta.wrapper_pid)
                         .map(|c| places[c].class.clone()),
                 })
             })
@@ -1150,8 +1053,8 @@ pub fn restore_cmd(args: &[String]) -> i32 {
     // should come back. Signatures ignore `--resume`, so an agent restored
     // earlier still counts against its own captured slot before its id is
     // known.
-    let live = live_sessions();
-    let live_ids: HashSet<String> = live.iter().filter_map(|s| s.session_id.clone()).collect();
+    let live = crate::registry::list();
+    let live_ids: HashSet<String> = live.iter().filter_map(|s| s.meta.session_id.clone()).collect();
     let captured_ids: HashSet<String> = snapshot["workspaces"]
         .as_array()
         .map(|wss| {
@@ -1166,7 +1069,7 @@ pub fn restore_cmd(args: &[String]) -> i32 {
     for s in &live {
         // Sessions already accounted for by the id match must not also
         // consume a by-signature slot.
-        if s.session_id
+        if s.meta.session_id
             .as_ref()
             .map(|id| captured_ids.contains(id))
             .unwrap_or(false)
@@ -1174,7 +1077,7 @@ pub fn restore_cmd(args: &[String]) -> i32 {
             continue;
         }
         *live_counts
-            .entry(launch_signature(&s.cwd, &s.argv))
+            .entry(launch_signature(&s.meta.cwd, &s.meta.argv))
             .or_insert(0) += 1;
     }
 

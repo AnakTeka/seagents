@@ -9,10 +9,10 @@
 //! then uses exact handles only: con_id first (fast, dies on i3 restart),
 //! X window id second (survives restarts), healing the con_id when used.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use crate::i3;
+use crate::registry::Files;
 
 /// `seagents focus <child_pid>` — bring the agent's terminal window to the
 /// front. CLI wrapper: prints any error and maps to an exit code.
@@ -37,22 +37,22 @@ pub fn focus(child_pid: u64) -> i32 {
 /// terminal is focused), so a session the user has ever typed into has
 /// accurate handles.
 pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
-    let (meta, meta_path) = session_for_child(child_pid)
+    let session = crate::registry::by_child_pid(child_pid)
         .ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
 
-    if let Some(con_id) = meta["con_id"].as_u64() {
+    if let Some(con_id) = session.meta.con_id {
         if i3::focus(con_id) {
             return Ok(());
         }
         // Recorded con_id is gone — likely an i3 restart. Fall through.
     }
 
-    if let Some(xid) = meta["window_id"].as_u64() {
+    if let Some(xid) = session.meta.window_id {
         let windows =
             i3::windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
         if let Some(win) = windows.iter().find(|w| w.xid == Some(xid)) {
             if i3::focus(win.con_id) {
-                record_window(&meta_path, win.con_id, Some(xid));
+                record_window(&session.files, win.con_id, Some(xid));
                 return Ok(());
             }
         }
@@ -68,25 +68,13 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
 /// the input pump whenever the user types (focused terminal = agent's window),
 /// and from the X-id focus path to heal a post-restart con_id. Skips the write
 /// when nothing changed, so the once-a-minute input capture is usually free.
-pub(crate) fn record_window(meta_path: &std::path::Path, con_id: u64, xid: Option<u64>) {
-    let Some(mut meta) = std::fs::read_to_string(meta_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-    else {
-        return;
-    };
-    let unchanged = meta["con_id"].as_u64() == Some(con_id)
-        && (xid.is_none() || meta["window_id"].as_u64() == xid);
-    if unchanged {
-        return;
-    }
-    meta["con_id"] = serde_json::json!(con_id);
-    if let Some(xid) = xid {
-        meta["window_id"] = serde_json::json!(xid);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&meta) {
-        let _ = std::fs::write(meta_path, text);
-    }
+pub(crate) fn record_window(files: &Files, con_id: u64, xid: Option<u64>) {
+    crate::registry::update_meta(files, |meta| {
+        meta.con_id = Some(con_id);
+        if xid.is_some() {
+            meta.window_id = xid;
+        }
+    });
 }
 
 /// Reveal the agent's window on its monitor, then hand focus straight back to
@@ -270,27 +258,6 @@ fn collect_handle(node: &serde_json::Value, value: &str, out: &mut Vec<(u64, Opt
     }
 }
 
-/// Look up a session's meta (and its path) by child pid.
-fn session_for_child(child_pid: u64) -> Option<(serde_json::Value, PathBuf)> {
-    let dir = crate::cache_dir();
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if v["child_pid"].as_u64() == Some(child_pid) {
-            return Some((v, path));
-        }
-    }
-    None
-}
-
 fn looks_like_terminal(class: &str) -> bool {
     let c = class.to_lowercase();
     c.contains("term") || c.contains("kitty") || c.contains("alacritty") || c.contains("ghostty")
@@ -304,27 +271,25 @@ mod tests {
     fn record_window_updates_ids_and_skips_when_unchanged() {
         let dir = std::env::temp_dir().join(format!("seagents-record-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("1.meta");
-        std::fs::write(&path, r#"{"wrapper_pid":1,"con_id":10,"window_id":100}"#).unwrap();
+        let files = Files::in_dir(&dir, 1);
+        std::fs::write(&files.meta, r#"{"wrapper_pid":1,"con_id":10,"window_id":100}"#).unwrap();
+        let ids = || {
+            let meta = crate::registry::read_meta(&files).unwrap();
+            (meta.con_id, meta.window_id)
+        };
 
         // Changed con_id: rewritten, xid preserved when not supplied.
-        record_window(&path, 20, None);
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["con_id"].as_u64(), Some(20));
-        assert_eq!(v["window_id"].as_u64(), Some(100));
+        record_window(&files, 20, None);
+        assert_eq!(ids(), (Some(20), Some(100)));
 
         // Unchanged: file untouched (mtime-free check via content identity).
-        let before = std::fs::read_to_string(&path).unwrap();
-        record_window(&path, 20, Some(100));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let before = std::fs::read_to_string(&files.meta).unwrap();
+        record_window(&files, 20, Some(100));
+        assert_eq!(std::fs::read_to_string(&files.meta).unwrap(), before);
 
         // New window entirely (agent moved / restarted terminal).
-        record_window(&path, 30, Some(300));
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["con_id"].as_u64(), Some(30));
-        assert_eq!(v["window_id"].as_u64(), Some(300));
+        record_window(&files, 30, Some(300));
+        assert_eq!(ids(), (Some(30), Some(300)));
 
         std::fs::remove_dir_all(&dir).ok();
     }

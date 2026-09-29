@@ -9,6 +9,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::registry::{Files, StateRecord};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
     Blocked,
@@ -134,19 +136,11 @@ impl Sort {
 /// Gather every tracked session in the given order. Shared by the `status`
 /// table and the HUD.
 pub(crate) fn collect(sort: Sort) -> Vec<Session> {
-    let dir = crate::cache_dir();
-    let mut sessions: Vec<Session> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-                continue;
-            }
-            if let Some(session) = read_session(&dir, &path) {
-                sessions.push(session);
-            }
-        }
-    }
+    // Sessions whose agent has exited are dropped entirely — their files
+    // reaped — rather than shown as corpses.
+    crate::registry::reap();
+    let mut sessions: Vec<Session> =
+        crate::registry::list().iter().map(read_session).collect();
     match sort {
         // Within a rank, longest-in-state first: the blocked agent you've
         // kept waiting longest tops the list.
@@ -222,40 +216,20 @@ pub fn print_json(sort: Sort) -> i32 {
     0
 }
 
-/// Build a Session from one `.meta` file (and its sibling `.raw`).
-fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
-    let text = std::fs::read_to_string(meta_path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-
-    let wrapper_pid = v["wrapper_pid"].as_u64()?;
-    let child_pid = v["child_pid"].as_u64();
-    let cwd = v["cwd"].as_str().unwrap_or("?");
-    let cmd = v["argv"]
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|s| s.as_str())
-        .map(basename)
-        .unwrap_or_else(|| "?".to_string());
-
-    // Liveness: is the child process still around? If not, the session has
-    // ended — reap its files and drop it entirely rather than showing a corpse.
-    let raw = dir.join(format!("{wrapper_pid}.raw"));
-    let alive = child_pid.is_some_and(crate::procfs::alive);
-    if !alive {
-        let _ = std::fs::remove_file(meta_path);
-        let _ = std::fs::remove_file(&raw);
-        let _ = std::fs::remove_file(dir.join(format!("{wrapper_pid}.state")));
-        return None;
-    }
+/// Build a Session from one live session's `.meta` (and its sibling `.raw`).
+fn read_session(live: &crate::registry::Session) -> Session {
+    let meta = &live.meta;
+    let child_pid = live.child_pid();
+    let cwd = or_unknown(&meta.cwd);
+    let cmd = or_unknown(meta.agent());
 
     // 1 MB tail: big enough to contain a full screen repaint for rendering.
-    let (state, title) = match read_tail(&raw, 1024 * 1024) {
+    let (state, title) = match read_tail(&live.files.raw, 1024 * 1024) {
         Some(buf) => {
             // Prefer the child's *live* pty size (accurate, survives resize and
             // missing meta); fall back to meta, then a sane default.
-            let (rows, cols) = child_pid
-                .and_then(crate::procfs::live_pty_size)
-                .or_else(|| Some((v["rows"].as_u64()? as u16, v["cols"].as_u64()? as u16)))
+            let (rows, cols) = crate::procfs::live_pty_size(child_pid)
+                .or_else(|| Some((meta.rows?, meta.cols?)))
                 .unwrap_or((24, 80));
             let screen = crate::detect::render(&buf, rows, cols);
             let title = current_title(&buf).unwrap_or_default();
@@ -271,12 +245,7 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
     };
 
     let now = crate::clock::unix_now();
-    let record = observe_state(
-        &dir.join(format!("{wrapper_pid}.state")),
-        state,
-        now,
-        false,
-    );
+    let record = observe_state(&live.files, state, now, false);
     // Present unacknowledged completions as their own state.
     let state = if state == State::Idle && !record.seen {
         State::Done
@@ -284,115 +253,75 @@ fn read_session(dir: &Path, meta_path: &Path) -> Option<Session> {
         state
     };
 
-    Some(Session {
-        id: wrapper_pid,
+    Session {
+        id: meta.wrapper_pid,
         state,
-        dir: basename(cwd),
-        cwd: cwd.to_string(),
+        dir: or_unknown(meta.dir()),
+        cwd,
         cmd,
-        pid: child_pid.unwrap_or(wrapper_pid),
+        pid: child_pid,
         state_secs: now.saturating_sub(record.since),
         title,
-    })
+    }
 }
 
-/// What the `.state` sidecar knows about a session: the last observed engine
-/// state, when it started, and whether the user has seen it since finishing
-/// (the "done vs idle" distinction).
-struct StateRecord {
-    since: u64,
-    seen: bool,
+/// A `.meta` field for display, `?` when an older wrapper didn't record it.
+fn or_unknown(s: &str) -> String {
+    if s.is_empty() { "?" } else { s }.to_string()
 }
 
 /// Record `state` into the sidecar if it differs from what's there; returns
 /// the record for the current state. Multiple observers (wrapper monitor + an
 /// open HUD) may race on a transition — both write since≈now, so the
-/// divergence is bounded by one poll interval. Harmless.
+/// divergence is bounded by one poll interval. Harmless. (Each observer's
+/// read-decide-write is one locked registry update, so a race can only ever
+/// order two whole decisions, never interleave them.)
 ///
 /// `mark_unseen`: true only for the wrapper's own monitor — a working→idle
 /// transition it observes is stamped `seen: false` (the agent finished and
 /// nobody has looked yet). Readers (HUD/status fallback writes for
 /// pre-monitor sessions) always write `seen: true`, so unmonitored sessions
 /// simply never show "done" rather than showing it forever.
-fn observe_state(path: &Path, state: State, now: u64, mark_unseen: bool) -> StateRecord {
-    let prev: Option<serde_json::Value> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok());
-    if let Some(p) = &prev {
-        let prev_state = p["state"].as_str();
-        let keep = prev_state == Some(state.word())
-            // A transient Unknown sample (a render caught mid-repaint, e.g.
-            // the focus-in repaint a HUD preview triggers) must not reset a
-            // known state's clock. Only a definite state replaces one.
-            || (state == State::Unknown && prev_state.is_some_and(|s| s != "unknown"));
-        if keep {
-            return StateRecord {
-                since: p["since"].as_u64().unwrap_or(now),
-                seen: p["seen"].as_bool().unwrap_or(true),
-            };
+fn observe_state(files: &Files, state: State, now: u64, mark_unseen: bool) -> StateRecord {
+    crate::registry::update_state(files, |current| {
+        if let Some(p) = current {
+            let keep = p.state == state.word()
+                // A transient Unknown sample (a render caught mid-repaint, e.g.
+                // the focus-in repaint a HUD preview triggers) must not reset a
+                // known state's clock. Only a definite state replaces one.
+                || (state == State::Unknown && p.state != "unknown");
+            if keep {
+                return p.clone();
+            }
         }
-    }
-    let finished_unwatched = mark_unseen
-        && state == State::Idle
-        && prev
-            .as_ref()
-            .and_then(|p| p["state"].as_str())
-            .is_some_and(|s| s == "working");
-    let record = StateRecord {
-        since: now,
-        seen: !finished_unwatched,
-    };
-    write_state_record(path, state, &record);
-    record
-}
-
-fn write_state_record(path: &Path, state: State, record: &StateRecord) {
-    let json = serde_json::json!({
-        "state": state.word(),
-        "since": record.since,
-        "seen": record.seen,
+        let finished_unwatched = mark_unseen
+            && state == State::Idle
+            && current.as_ref().is_some_and(|p| p.state == "working");
+        let record = StateRecord {
+            state: state.word().to_string(),
+            since: now,
+            seen: !finished_unwatched,
+        };
+        *current = Some(record.clone());
+        record
     })
-    .to_string();
-    // Atomic tmp+rename so a concurrent reader never sees a half-written
-    // record; pid-suffixed so the wrapper monitor and a HUD poll can't
-    // stomp each other's tmp file.
-    let tmp = path.with_extension(format!("state.tmp{}", std::process::id()));
-    if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
 }
 
 /// Mark a finished session as seen (done → idle). Called from the HUD when
 /// the user previews or jumps to the agent, and from the wrapper's monitor
-/// when the agent's own window gains focus.
-pub(crate) fn ack_session_path(path: &Path) {
-    let Some(p) = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-    else {
-        return;
-    };
-    if p["seen"].as_bool() == Some(false) {
-        if let Some(state_word) = p["state"].as_str() {
-            let record = StateRecord {
-                since: p["since"].as_u64().unwrap_or(crate::clock::unix_now()),
-                seen: true,
-            };
-            // State word passes through unchanged; only the seen bit flips.
-            let state = match state_word {
-                "blocked" => State::Blocked,
-                "working" => State::Working,
-                "idle" => State::Idle,
-                _ => State::Unknown,
-            };
-            write_state_record(path, state, &record);
+/// when the agent's own window gains focus. The state word and the clock pass
+/// through unchanged; only the seen bit flips.
+pub(crate) fn ack_session_files(files: &Files) {
+    crate::registry::update_state(files, |current| {
+        if let Some(p) = current {
+            p.seen = true;
         }
-    }
+    });
 }
 
 /// Ack by session id (the HUD's handle).
 pub(crate) fn ack_session(id: u64) {
-    ack_session_path(&crate::cache_dir().join(format!("{id}.state")));
+    ack_session_files(&Files::of(id));
 }
 
 /// One detection pass over our *own* session, for the wrapper's monitor
@@ -401,13 +330,8 @@ pub(crate) fn ack_session(id: u64) {
 /// state). This is what keeps "idle for" truthful while no HUD or status
 /// invocation is watching. Returns the detected engine state plus whether
 /// the completion has been seen, so the caller can notify and acknowledge.
-pub(crate) fn track_session(
-    raw: &Path,
-    state_path: &Path,
-    cmd: &str,
-    child_pid: u64,
-) -> Option<(State, bool)> {
-    let buf = read_tail(raw, 1024 * 1024)?;
+pub(crate) fn track_session(files: &Files, cmd: &str, child_pid: u64) -> Option<(State, bool)> {
+    let buf = read_tail(&files.raw, 1024 * 1024)?;
     let (rows, cols) = crate::procfs::live_pty_size(child_pid).unwrap_or((24, 80));
     let screen = crate::detect::render(&buf, rows, cols);
     let title = current_title(&buf).unwrap_or_default();
@@ -415,7 +339,7 @@ pub(crate) fn track_session(
     let state = State::from(
         crate::vendor::herdr_detect::detect_agent_with_osc(agent, &screen, &title, "").state,
     );
-    let record = observe_state(state_path, state, crate::clock::unix_now(), true);
+    let record = observe_state(files, state, crate::clock::unix_now(), true);
     Some((state, record.seen))
 }
 
@@ -434,14 +358,6 @@ pub(crate) fn humanize_secs(secs: u64) -> String {
         }
         _ => format!("{}d", secs / 86_400),
     }
-}
-
-fn basename(p: &str) -> String {
-    Path::new(p)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(p)
-        .to_string()
 }
 
 /// Read at most `max` bytes from the end of a file — enough to hold the most
@@ -591,15 +507,15 @@ mod tests {
     fn observe_state_keeps_clock_through_transient_unknown() {
         let dir = std::env::temp_dir().join(format!("seagents-observe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("1.state");
+        let files = Files::in_dir(&dir, 1);
 
-        assert_eq!(observe_state(&path, State::Idle, 100, false).since, 100);
+        assert_eq!(observe_state(&files, State::Idle, 100, false).since, 100);
         // A mid-repaint Unknown sample must not reset the idle clock…
-        assert_eq!(observe_state(&path, State::Unknown, 150, false).since, 100);
-        assert_eq!(observe_state(&path, State::Idle, 200, false).since, 100);
+        assert_eq!(observe_state(&files, State::Unknown, 150, false).since, 100);
+        assert_eq!(observe_state(&files, State::Idle, 200, false).since, 100);
         // …but a real transition does.
-        assert_eq!(observe_state(&path, State::Blocked, 250, false).since, 250);
-        assert_eq!(observe_state(&path, State::Blocked, 300, false).since, 250);
+        assert_eq!(observe_state(&files, State::Blocked, 250, false).since, 250);
+        assert_eq!(observe_state(&files, State::Blocked, 300, false).since, 250);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -608,28 +524,28 @@ mod tests {
     fn done_lifecycle_marks_unwatched_completion_and_acks() {
         let dir = std::env::temp_dir().join(format!("seagents-done-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("1.state");
+        let files = Files::in_dir(&dir, 1);
 
         // Wrapper monitor observes: working, then idle → unseen completion.
-        assert!(observe_state(&path, State::Working, 100, true).seen);
-        let rec = observe_state(&path, State::Idle, 200, true);
+        assert!(observe_state(&files, State::Working, 100, true).seen);
+        let rec = observe_state(&files, State::Idle, 200, true);
         assert!(!rec.seen, "working→idle by the wrapper should be unseen");
         assert_eq!(rec.since, 200);
 
         // A reader polling the same state keeps the unseen bit and the clock.
-        let rec = observe_state(&path, State::Idle, 260, false);
+        let rec = observe_state(&files, State::Idle, 260, false);
         assert!(!rec.seen);
         assert_eq!(rec.since, 200);
 
         // Acknowledgment flips seen without touching the clock.
-        ack_session_path(&path);
-        let rec = observe_state(&path, State::Idle, 300, true);
+        ack_session_files(&files);
+        let rec = observe_state(&files, State::Idle, 300, true);
         assert!(rec.seen);
         assert_eq!(rec.since, 200);
 
         // A reader-written transition (pre-monitor session) is never unseen.
-        assert!(observe_state(&path, State::Working, 400, false).seen);
-        assert!(observe_state(&path, State::Idle, 500, false).seen);
+        assert!(observe_state(&files, State::Working, 400, false).seen);
+        assert!(observe_state(&files, State::Idle, 500, false).seen);
 
         std::fs::remove_dir_all(&dir).ok();
     }
