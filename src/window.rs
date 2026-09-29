@@ -18,10 +18,13 @@ use crate::i3;
 use crate::launch::WindowMatch;
 use crate::registry::Files;
 
-/// `seagents focus <child_pid>` — bring the agent's terminal window to the
-/// front. CLI wrapper: prints any error and maps to an exit code.
-pub fn focus(child_pid: u64) -> i32 {
-    match focus_window(child_pid) {
+/// `seagents focus <target>` — bring the agent's terminal window to the
+/// front. `target` is anything [`crate::registry::resolve_target`] takes. CLI
+/// wrapper: prints any error and maps to an exit code.
+pub fn focus(target: &str) -> i32 {
+    let result = crate::registry::resolve_target(target)
+        .and_then(|s| focus_window(s.child_pid()));
+    match result {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("seagents: {e}");
@@ -62,8 +65,12 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
         }
     }
 
+    let name = match session.meta.tag.as_str() {
+        "" => format!("session {child_pid}"),
+        tag => format!("{tag} (pid {child_pid})"),
+    };
     Err(format!(
-        "session {child_pid}: window not identified (focus was elsewhere at launch, \
+        "{name}: window not identified (focus was elsewhere at launch, \
          or the window is gone); type into the agent once and retry"
     ))
 }

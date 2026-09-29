@@ -25,8 +25,16 @@
 //! Liveness is one rule, [`procfs::alive`] on the child pid, and two
 //! operations: [`list`] returns live sessions and never deletes anything;
 //! [`reap`] deletes the files of dead ones. Only `status`/the HUD reap.
+//!
+//! Every session has a **tag** — its one name, the address every command
+//! resolves ([`resolve_target`]), the window handle `restore` swallows on, the
+//! lineage key. Tags are claimed under a cache-wide lock ([`claim_tag`]) held
+//! from the uniqueness check through the `.meta`'s creation, which is the only
+//! way to create one; two `run`s racing for a name cannot both get it.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -109,6 +117,17 @@ pub(crate) struct Meta {
     pub(crate) con_id: Option<u64>,
     #[serde(default)]
     pub(crate) window_id: Option<u64>,
+    /// The agent's name ([`claim_tag`]). Empty only in a `.meta` written by a
+    /// binary from before tags, until a snapshot capture backfills one.
+    #[serde(default)]
+    pub(crate) tag: String,
+    /// The spawner's tag; None when not started under another agent (or when
+    /// a restore could not bring the lineage back).
+    #[serde(default)]
+    pub(crate) parent: Option<String>,
+    /// Spawn generation: 0 without a parent, the parent's depth + 1 with one.
+    #[serde(default)]
+    pub(crate) depth: u32,
     /// The agent's own conversation id, filled in lazily by the snapshot
     /// capture, and how it was learned (`proc` | `title`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,13 +264,232 @@ pub(crate) fn by_child_pid(child_pid: u64) -> Option<Session> {
         .find(|s| s.meta.child_pid == Some(child_pid))
 }
 
+/// The live session named by `target`, as every command that addresses an
+/// agent takes it: `@tag`, a bare `tag`, or an all-digits `child_pid` (the
+/// handle `status --json` has always reported as `pid`). Tags are never all
+/// digits, so the bare forms cannot be confused. The error is the message to
+/// show the user.
+pub(crate) fn resolve_target(target: &str) -> Result<Session, String> {
+    resolve_target_in(&cache_dir(), target)
+}
+
+fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
+    if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+        let pid: u64 = target
+            .parse()
+            .map_err(|_| format!("{target} is not a pid"))?;
+        return all_in(dir)
+            .into_iter()
+            .find(|s| s.meta.child_pid == Some(pid))
+            .ok_or_else(|| format!("no tracked agent with pid {pid}"));
+    }
+    let tag = target.strip_prefix('@').unwrap_or(target);
+    if !valid_tag(tag) {
+        return Err(format!(
+            "{target:?} is neither a tag ([a-z0-9][a-z0-9-]{{0,31}}, not all digits) nor a pid"
+        ));
+    }
+    live_by_tag(dir, tag).ok_or_else(|| format!("no live agent tagged {tag}"))
+}
+
+fn live_by_tag(dir: &Path, tag: &str) -> Option<Session> {
+    list_in(dir).into_iter().find(|s| s.meta.tag == tag)
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/// Longest tag. It lands in an X11 property, a branch name and a filename.
+const TAG_MAX: usize = 32;
+
+/// `[a-z0-9][a-z0-9-]{0,31}`, and not all digits — so a bare target is never
+/// ambiguous against a `child_pid`.
+pub(crate) fn valid_tag(tag: &str) -> bool {
+    let b = tag.as_bytes();
+    !b.is_empty()
+        && b.len() <= TAG_MAX
+        && b[0] != b'-'
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && !b.iter().all(|c| c.is_ascii_digit())
+}
+
+/// The name part of a minted tag: the cwd's basename folded into the tag
+/// charset (runs of anything else become one `-`), short enough to leave room
+/// for the `-xxxx` suffix. Never empty, never starts with `-`.
+fn tag_base(cwd: &Path) -> String {
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut base = String::new();
+    for c in name.chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            base.push(c);
+        } else if !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    base.truncate(TAG_MAX - 5);
+    let base = base.trim_end_matches('-');
+    if base.is_empty() { "agent" } else { base }.to_string()
+}
+
+/// Four hex digits of noise. /dev/urandom when it reads, else the clock mixed
+/// with our pid — uniqueness is enforced by the caller's retry, not by this.
+fn tag_suffix() -> String {
+    let mut buf = [0u8; 2];
+    let n = File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map(|_| u16::from_le_bytes(buf))
+        .unwrap_or_else(|_| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            (nanos ^ (std::process::id() << 7)) as u16
+        });
+    format!("{n:04x}")
+}
+
+/// A tag nobody holds: `<cwd basename>-<4 hex>`, avoiding every live tag and
+/// every tag in `reserved` (the snapshot's — a pending restore will want those
+/// back). Only called under the tags lock.
+fn mint_tag(cwd: &Path, taken: &HashSet<String>, reserved: &HashSet<String>) -> String {
+    let base = tag_base(cwd);
+    loop {
+        let tag = format!("{base}-{}", tag_suffix());
+        if !taken.contains(&tag) && !reserved.contains(&tag) {
+            return tag;
+        }
+    }
+}
+
+/// The name a new session will be created under, with the cache-wide tags lock
+/// still held. Only [`TagClaim::create_meta`] turns it into a session, and it
+/// releases the lock when it has — so from the uniqueness check to the `.meta`
+/// that makes the tag visible to the next claimant, nobody else can claim.
+#[derive(Debug)]
+pub(crate) struct TagClaim {
+    pub(crate) tag: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) depth: u32,
+    _lock: Lock,
+}
+
+impl TagClaim {
+    /// Write the new session's `.meta` under the claimed tag and lineage, and
+    /// release the claim. Atomic but not per-session locked: until this file
+    /// exists nobody else can find the session, so there is nothing to race.
+    pub(crate) fn create_meta(self, files: &Files, mut meta: Meta) {
+        meta.tag = self.tag;
+        meta.parent = self.parent;
+        meta.depth = self.depth;
+        write_new_meta(files, &meta);
+    }
+}
+
+/// Claim a tag for a session about to be created: `requested` (validated, and
+/// refused while a live session holds it), or a freshly minted one. `parent`,
+/// when given, must be a live session's tag; the child sits one generation
+/// below it. The error is the message for the user.
+///
+/// A requested tag may be one the snapshot recorded (`reserved`): that is
+/// precisely how `restore` relaunches an agent under its old name. Minting
+/// avoids them, so a new agent never takes a placeholder a pending restore
+/// will want back.
+pub(crate) fn claim_tag(
+    requested: Option<&str>,
+    parent: Option<&str>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+) -> Result<TagClaim, String> {
+    claim_tag_in(&cache_dir(), requested, parent, cwd, reserved)
+}
+
+fn claim_tag_in(
+    dir: &Path,
+    requested: Option<&str>,
+    parent: Option<&str>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+) -> Result<TagClaim, String> {
+    if let Some(tag) = requested.filter(|t| !valid_tag(t)) {
+        return Err(format!(
+            "invalid tag {tag:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits"
+        ));
+    }
+    // Unlike a session lock, this one must hold: without it two runs can both
+    // pass the check. Failing to take it is failing to claim.
+    let lock = Lock::acquire(&dir.join("tags.lock"))
+        .ok_or("could not lock the tag registry")?;
+    let live = list_in(dir);
+
+    let (parent, depth) = match parent {
+        None => (None, 0),
+        Some(p) => {
+            let p = p.strip_prefix('@').unwrap_or(p);
+            let Some(ps) = live.iter().find(|s| s.meta.tag == p) else {
+                return Err(format!("parent {p}: no live agent has that tag"));
+            };
+            (Some(p.to_string()), ps.meta.depth + 1)
+        }
+    };
+
+    let taken: HashSet<String> = live.into_iter().map(|s| s.meta.tag).collect();
+    let tag = match requested {
+        Some(t) if taken.contains(t) => {
+            return Err(format!("tag {t} is already held by a live agent"));
+        }
+        Some(t) => t.to_string(),
+        None => mint_tag(cwd, &taken, reserved),
+    };
+    Ok(TagClaim {
+        tag,
+        parent,
+        depth,
+        _lock: lock,
+    })
+}
+
+/// Give every live session that has no tag one — sessions whose wrapper
+/// predates tags. Called by the snapshot capture, which cannot record an
+/// agent without a name for its placeholder; the tag lands in the `.meta`, so
+/// the agent is also addressable and a later restore sees it as running.
+pub(crate) fn backfill_tags(sessions: &mut [Session], reserved: &HashSet<String>) {
+    if sessions.iter().all(|s| !s.meta.tag.is_empty()) {
+        return;
+    }
+    backfill_tags_in(&cache_dir(), sessions, reserved)
+}
+
+fn backfill_tags_in(dir: &Path, sessions: &mut [Session], reserved: &HashSet<String>) {
+    let Some(_lock) = Lock::acquire(&dir.join("tags.lock")) else {
+        return;
+    };
+    let mut taken: HashSet<String> = list_in(dir).into_iter().map(|s| s.meta.tag).collect();
+    for s in sessions.iter_mut().filter(|s| s.meta.tag.is_empty()) {
+        let tag = mint_tag(Path::new(&s.meta.cwd), &taken, reserved);
+        let mut kept = None;
+        update_meta(&s.files, |m| {
+            // Another capture may have got here first; its tag stands.
+            if m.tag.is_empty() {
+                m.tag = tag.clone();
+            }
+            kept = Some(m.tag.clone());
+        });
+        if let Some(tag) = kept {
+            taken.insert(tag.clone());
+            s.meta.tag = tag;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------
 
-/// Write a brand-new session's `.meta`. Atomic but unlocked: until this file
-/// exists nobody else can find the session, so there is nothing to race.
-pub(crate) fn create_meta(files: &Files, meta: &Meta) {
+fn write_new_meta(files: &Files, meta: &Meta) {
     if let Ok(text) = serde_json::to_string_pretty(meta) {
         write_atomic(&files.meta, text.as_bytes());
     }
@@ -314,6 +552,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) {
 /// the descriptor releases it, which also covers a crash mid-update). `flock`
 /// locks belong to the open file description, so two threads of one process
 /// exclude each other just as two processes do.
+#[derive(Debug)]
 struct Lock {
     _held: File,
 }
@@ -365,7 +604,7 @@ mod tests {
     fn concurrent_updates_lose_nothing() {
         let dir = scratch("concurrent");
         let files = Files::in_dir(&dir, 1);
-        create_meta(&files, &sample(1, Some(2)));
+        write_new_meta(&files, &sample(1, Some(2)));
 
         const THREADS: u64 = 16;
         const ROUNDS: u64 = 25;
@@ -399,12 +638,12 @@ mod tests {
     fn an_older_meta_parses_and_keeps_fields_this_binary_does_not_know() {
         let dir = scratch("oldmeta");
         let files = Files::in_dir(&dir, 7);
-        // No geometry, no window ids, no session id — and a field from some
-        // other version of seagents.
+        // No geometry, no window ids, no session id, no tag (a pre-tag
+        // wrapper) — and a field from some other version of seagents.
         fs::write(
             &files.meta,
             r#"{"wrapper_pid":7,"child_pid":8,"cwd":"/p","argv":["claude"],"started":5,
-                "tag":"reviewer","depth":1}"#,
+                "stops":3}"#,
         )
         .unwrap();
 
@@ -413,12 +652,12 @@ mod tests {
             (meta.child_pid, meta.cols, meta.con_id),
             (Some(8), None, None)
         );
+        assert_eq!((meta.tag.as_str(), meta.parent.as_deref(), meta.depth), ("", None, 0));
 
         update_meta(&files, |m| m.con_id = Some(42));
         let v: Value = serde_json::from_str(&fs::read_to_string(&files.meta).unwrap()).unwrap();
         assert_eq!(v["con_id"].as_u64(), Some(42));
-        assert_eq!(v["tag"].as_str(), Some("reviewer"));
-        assert_eq!(v["depth"].as_u64(), Some(1));
+        assert_eq!(v["stops"].as_u64(), Some(3));
         assert!(
             v.get("session_id").is_none(),
             "absent optional fields stay absent"
@@ -435,7 +674,10 @@ mod tests {
         meta.window_id = Some(4);
         meta.session_id = Some("abc".into());
         meta.session_id_source = Some("proc".into());
-        create_meta(&files, &meta);
+        meta.tag = "reviewer".into();
+        meta.parent = Some("planner".into());
+        meta.depth = 1;
+        write_new_meta(&files, &meta);
         assert_eq!(read_meta(&files), Some(meta));
         fs::remove_dir_all(&dir).ok();
     }
@@ -444,7 +686,7 @@ mod tests {
     fn writes_leave_no_tmp_files_behind() {
         let dir = scratch("notmp");
         let files = Files::in_dir(&dir, 1);
-        create_meta(&files, &sample(1, Some(2)));
+        write_new_meta(&files, &sample(1, Some(2)));
         update_meta(&files, |m| m.con_id = Some(9));
         update_state(&files, |r| {
             *r = Some(StateRecord {
@@ -479,8 +721,8 @@ mod tests {
         let dead = u32::MAX as u64; // no such pid
         let live = Files::in_dir(&dir, 1);
         let gone = Files::in_dir(&dir, 2);
-        create_meta(&live, &sample(1, Some(me)));
-        create_meta(&gone, &sample(2, Some(dead)));
+        write_new_meta(&live, &sample(1, Some(me)));
+        write_new_meta(&gone, &sample(2, Some(dead)));
         for f in [&live, &gone] {
             fs::write(&f.raw, b"x").unwrap();
             update_state(f, |r| {
@@ -506,6 +748,149 @@ mod tests {
             assert!(path.exists(), "{} should survive", path.display());
         }
         assert!(dir.join("3.meta").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn claim(dir: &Path, requested: Option<&str>, parent: Option<&str>) -> Result<TagClaim, String> {
+        claim_tag_in(dir, requested, parent, Path::new("/home/u/My Project!"), &HashSet::new())
+    }
+
+    /// Claim and create a live session (child = this test process).
+    fn create(dir: &Path, wrapper_pid: u64, requested: Option<&str>, parent: Option<&str>) -> Result<Meta, String> {
+        let c = claim(dir, requested, parent)?;
+        let files = Files::in_dir(dir, wrapper_pid);
+        c.create_meta(&files, sample(wrapper_pid, Some(std::process::id() as u64)));
+        Ok(read_meta(&files).unwrap())
+    }
+
+    #[test]
+    fn tag_validation() {
+        for ok in ["a", "reviewer", "x-1", "0a", "1-2", "seagents-9f3c", &"a".repeat(32)] {
+            assert!(valid_tag(ok), "{ok}");
+        }
+        for bad in ["", "-a", "A", "a_b", "a b", "123", "0", "é", "@a", &"a".repeat(33)] {
+            assert!(!valid_tag(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn minted_tags_are_the_cwd_basename_plus_four_hex_and_always_valid() {
+        assert_eq!(tag_base(Path::new("/home/u/My Project!")), "my-project");
+        assert_eq!(tag_base(Path::new("/srv/__x__y")), "x-y");
+        assert_eq!(tag_base(Path::new("/")), "agent");
+        assert_eq!(tag_base(Path::new("/p/日本")), "agent");
+        assert_eq!(tag_base(Path::new("/p/2024")), "2024");
+        assert_eq!(tag_base(Path::new(&format!("/p/{}", "a".repeat(40)))).len(), 27);
+        for cwd in ["/home/u/seagents", "/", "/p/2024", "/p/-x-", &format!("/p/{}", "b-".repeat(30))] {
+            let tag = mint_tag(Path::new(cwd), &HashSet::new(), &HashSet::new());
+            assert!(valid_tag(&tag), "{cwd} -> {tag}");
+            let (_, hex) = tag.rsplit_once('-').unwrap();
+            assert!(hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()), "{tag}");
+        }
+    }
+
+    #[test]
+    fn claims_refuse_bad_and_live_tags_and_derive_depth_from_the_parent() {
+        let dir = scratch("claim");
+        let a = create(&dir, 1, Some("planner"), None).unwrap();
+        assert_eq!((a.tag.as_str(), a.parent, a.depth), ("planner", None, 0));
+
+        assert!(claim(&dir, Some("planner"), None).unwrap_err().contains("already held"));
+        assert!(claim(&dir, Some("123"), None).unwrap_err().contains("invalid tag"));
+        assert!(claim(&dir, None, Some("nobody")).unwrap_err().contains("no live agent"));
+
+        let b = create(&dir, 2, Some("reviewer"), Some("@planner")).unwrap();
+        assert_eq!((b.parent.as_deref(), b.depth), (Some("planner"), 1));
+        let c = create(&dir, 3, None, Some("reviewer")).unwrap();
+        assert_eq!((c.parent.as_deref(), c.depth), (Some("reviewer"), 2));
+        assert!(c.tag.starts_with("my-project-"), "{}", c.tag);
+
+        // A dead session's tag is free again.
+        let dead = Files::in_dir(&dir, 4);
+        let mut m = sample(4, Some(u32::MAX as u64));
+        m.tag = "gone".into();
+        write_new_meta(&dead, &m);
+        assert!(create(&dir, 5, Some("gone"), None).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn minting_avoids_snapshot_tags_but_a_restore_may_claim_one() {
+        let dir = scratch("reserved");
+        let reserved: HashSet<String> = (0..=0xffffu32)
+            .filter(|n| *n != 0x2a)
+            .map(|n| format!("p-{n:04x}"))
+            .collect();
+        let c = claim_tag_in(&dir, None, None, Path::new("/p"), &reserved).unwrap();
+        assert_eq!(c.tag, "p-002a");
+        drop(c);
+        assert!(claim_tag_in(&dir, Some("p-0001"), None, Path::new("/p"), &reserved).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_claims_of_one_tag_never_both_succeed() {
+        let dir = scratch("claimrace");
+        const THREADS: u64 = 16;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let one = create(&dir, 100 + t, Some("same"), None).is_ok();
+                    let minted = create(&dir, 200 + t, None, None).unwrap().tag;
+                    (one, minted)
+                })
+            })
+            .collect();
+        let results: Vec<(bool, String)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(ok, _)| *ok).count(), 1);
+        let minted: HashSet<&String> = results.iter().map(|(_, t)| t).collect();
+        assert_eq!(minted.len(), THREADS as usize);
+        let tags: Vec<String> = list_in(&dir).into_iter().map(|s| s.meta.tag).collect();
+        assert_eq!(tags.iter().filter(|t| *t == "same").count(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backfill_names_only_the_untagged_and_keeps_names_unique() {
+        let dir = scratch("backfill");
+        let me = std::process::id() as u64;
+        let mut old = sample(1, Some(me));
+        old.cwd = "/p/proj".into();
+        write_new_meta(&Files::in_dir(&dir, 1), &old);
+        create(&dir, 2, Some("kept"), None).unwrap();
+        let mut sessions = list_in(&dir);
+        backfill_tags_in(&dir, &mut sessions, &HashSet::new());
+        assert!(sessions[0].meta.tag.starts_with("proj-"), "{}", sessions[0].meta.tag);
+        assert_eq!(sessions[1].meta.tag, "kept");
+        let on_disk = read_meta(&Files::in_dir(&dir, 1)).unwrap().tag;
+        assert_eq!(on_disk, sessions[0].meta.tag);
+        // Idempotent: a second pass leaves the name alone.
+        let mut again = list_in(&dir);
+        backfill_tags_in(&dir, &mut again, &HashSet::new());
+        assert_eq!(again[0].meta.tag, on_disk);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn targets_resolve_by_tag_at_tag_or_child_pid() {
+        let dir = scratch("resolve");
+        let me = std::process::id() as u64;
+        create(&dir, 1, Some("reviewer"), None).unwrap();
+        let mut dead = sample(2, Some(u32::MAX as u64));
+        dead.tag = "ghost".into();
+        write_new_meta(&Files::in_dir(&dir, 2), &dead);
+
+        for t in ["reviewer", "@reviewer", &me.to_string()] {
+            let s = resolve_target_in(&dir, t).unwrap_or_else(|e| panic!("{t}: {e}"));
+            assert_eq!(s.meta.wrapper_pid, 1, "{t}");
+        }
+        // Tags resolve over live sessions only.
+        assert!(resolve_target_in(&dir, "ghost").unwrap_err().contains("no live agent"));
+        assert!(resolve_target_in(&dir, "nobody").unwrap_err().contains("no live agent"));
+        assert!(resolve_target_in(&dir, "999999999").unwrap_err().contains("pid"));
+        assert!(resolve_target_in(&dir, "Bad Tag").unwrap_err().contains("neither"));
+        assert!(resolve_target_in(&dir, "@").is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

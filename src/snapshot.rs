@@ -427,16 +427,6 @@ fn focused_workspace(tree: &Value) -> Option<String> {
 // Layout emission
 // ---------------------------------------------------------------------------
 
-/// Mint a stable tag for an agent: the head of its conversation id when we
-/// know it (stable across the reboot we are preparing for), else its wrapper
-/// pid (unique among live sessions, which is all a single restore needs).
-fn tag_for(s: &Session) -> String {
-    match &s.meta.session_id {
-        Some(id) => id.chars().take(8).collect(),
-        None => format!("p{}", s.meta.wrapper_pid),
-    }
-}
-
 /// Reduce a workspace's subtree to just the agent windows, keeping the split
 /// structure that connects them.
 ///
@@ -590,6 +580,25 @@ fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<
 // Capture
 // ---------------------------------------------------------------------------
 
+/// Every agent tag the snapshot on disk records — the names a pending
+/// restore will relaunch under, which a newly minted tag must not take.
+pub(crate) fn captured_tags() -> HashSet<String> {
+    let Some(snapshot) = std::fs::read_to_string(snapshot_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return HashSet::new();
+    };
+    snapshot["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|ws| ws["agents"].as_array())
+        .flatten()
+        .filter_map(|a| a["tag"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// True when the snapshot on disk has gone stale.
 fn capture_due() -> bool {
     !std::fs::metadata(snapshot_path())
@@ -669,6 +678,9 @@ fn capture(refresh: bool) -> Result<Value, String> {
         .collect();
 
     resolve_session_ids(&mut sessions, &titles, refresh);
+    // A placeholder needs a name; sessions from a pre-tag wrapper get theirs
+    // now, in their `.meta`, so the restore that reads it back knows them.
+    crate::registry::backfill_tags(&mut sessions, &captured_tags());
 
     // con_id → tag, for the agents we can actually locate on screen.
     let mut tags: HashMap<u64, String> = HashMap::new();
@@ -677,8 +689,14 @@ fn capture(refresh: bool) -> Result<Value, String> {
     let mut unplaced: Vec<Value> = Vec::new();
 
     for s in &sessions {
-        let Some(con_id) = located.get(&s.meta.wrapper_pid).copied() else {
+        // (An untagged session is one whose `.meta` vanished mid-backfill.)
+        let Some(con_id) = located
+            .get(&s.meta.wrapper_pid)
+            .copied()
+            .filter(|_| !s.meta.tag.is_empty())
+        else {
             unplaced.push(json!({
+                "tag": s.meta.tag,
                 "cwd": s.meta.cwd,
                 "dir": s.meta.dir(),
                 "argv": s.meta.argv,
@@ -687,7 +705,7 @@ fn capture(refresh: bool) -> Result<Value, String> {
             continue;
         };
         let place = &places[&con_id];
-        tags.insert(con_id, tag_for(s));
+        tags.insert(con_id, s.meta.tag.clone());
         outputs.insert(place.workspace.clone(), place.output.clone());
         placed.entry(place.workspace.clone()).or_default().push(s);
     }
@@ -707,7 +725,9 @@ fn capture(refresh: bool) -> Result<Value, String> {
             .iter()
             .map(|s| {
                 json!({
-                    "tag": tag_for(s),
+                    "tag": s.meta.tag,
+                    "parent": s.meta.parent,
+                    "depth": s.meta.depth,
                     "cwd": s.meta.cwd,
                     "dir": s.meta.dir(),
                     "argv": s.meta.argv,
@@ -843,78 +863,56 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
     };
 
     // Never restore something that is already on screen: `restore` has to be
-    // safe to run twice, and safe to run when only half the agents died.
-    //
-    // A conversation id settles it outright. Agents without one (a
-    // non-Claude tool, or a session whose id we could not pin down) are
-    // matched *by count* per launch signature instead: four identical
-    // `claude` windows in one project are indistinguishable, so if three are
-    // running and four were captured, exactly one is missing and exactly one
-    // should come back. Signatures ignore `--resume`, so an agent restored
-    // earlier still counts against its own captured slot before its id is
-    // known.
-    let live = crate::registry::list();
-    let live_ids: HashSet<String> = live.iter().filter_map(|s| s.meta.session_id.clone()).collect();
-    let captured_ids: HashSet<String> = snapshot["workspaces"]
-        .as_array()
-        .map(|wss| {
-            wss.iter()
-                .filter_map(|ws| ws["agents"].as_array())
-                .flatten()
-                .filter_map(|a| a["session_id"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut live_counts: HashMap<String, usize> = HashMap::new();
-    for s in &live {
-        // Sessions already accounted for by the id match must not also
-        // consume a by-signature slot.
-        if s.meta.session_id
-            .as_ref()
-            .map(|id| captured_ids.contains(id))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        *live_counts
-            .entry(launch_signature(&s.meta.cwd, &s.meta.argv))
-            .or_insert(0) += 1;
-    }
+    // safe to run twice, and safe to run when only half the agents died. Every
+    // agent has a tag and a restored one comes back under its captured tag, so
+    // a captured tag that is live *is* that agent, already running.
+    let live: HashSet<String> = crate::registry::list()
+        .into_iter()
+        .map(|s| s.meta.tag)
+        .filter(|t| !t.is_empty())
+        .collect();
 
     let empty = Vec::new();
-    let mut launched = 0usize;
     let mut skipped = 0usize;
+    let mut plan: Vec<(String, &Value, Vec<&Value>)> = Vec::new();
     for ws in snapshot["workspaces"].as_array().unwrap_or(&empty) {
         let name = ws["name"].as_str().unwrap_or_default().to_string();
-        if let Some(only) = &only {
-            if *only != name {
-                continue;
-            }
-        }
-        let agents = ws["agents"].as_array().unwrap_or(&empty);
-        let mut todo: Vec<&Value> = Vec::new();
-        for a in agents {
-            if let Some(id) = a["session_id"].as_str() {
-                if live_ids.contains(id) {
-                    skipped += 1;
-                    continue;
-                }
-            }
-            let key = launch_signature(
-                a["cwd"].as_str().unwrap_or_default(),
-                &argv_of(a),
-            );
-            if let Some(n) = live_counts.get_mut(&key).filter(|n| **n > 0) {
-                *n -= 1;
-                skipped += 1;
-                continue;
-            }
-            todo.push(a);
-        }
-        if todo.is_empty() {
+        if only.as_ref().is_some_and(|only| *only != name) {
             continue;
         }
+        let mut todo: Vec<&Value> = Vec::new();
+        for a in ws["agents"].as_array().unwrap_or(&empty) {
+            let tag = a["tag"].as_str().unwrap_or_default();
+            if live.contains(tag) {
+                skipped += 1;
+            } else if !crate::registry::valid_tag(tag) {
+                // Only a layout captured by a pre-tag binary can hold one: its
+                // tags were conversation-id prefixes, and `run` would refuse
+                // an all-digits one after the window had already opened.
+                eprintln!(
+                    "seagents: {}: captured tag {tag:?} is not a valid tag; not restored",
+                    a["dir"].as_str().unwrap_or("?")
+                );
+            } else {
+                todo.push(a);
+            }
+        }
+        // Parents before children, so a child's `--parent` can find its parent
+        // live. Launch order within a workspace is free: i3 swallows by
+        // criteria, not by order.
+        todo.sort_by_key(|a| a["depth"].as_u64().unwrap_or(0));
+        if !todo.is_empty() {
+            plan.push((name, ws, todo));
+        }
+    }
+    let restoring: HashSet<&str> = plan
+        .iter()
+        .flat_map(|(_, _, todo)| todo.iter().filter_map(|a| a["tag"].as_str()))
+        .collect();
 
+    let mut launched = 0usize;
+    let mut started: HashSet<&str> = HashSet::new();
+    for (name, ws, todo) in &plan {
         let keep: HashSet<String> = todo
             .iter()
             .filter_map(|a| a["tag"].as_str().map(str::to_string))
@@ -939,9 +937,14 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
             todo.len(),
             if todo.len() == 1 { "" } else { "s" }
         );
-        for a in &todo {
+        for a in todo {
             let cmd = resume_argv(a);
-            println!("  {:<24}  {}", a["dir"].as_str().unwrap_or("?"), cmd.join(" "));
+            let lineage = match a["parent"].as_str() {
+                Some(p) if live.contains(p) || restoring.contains(p) => format!("  (under {p})"),
+                Some(p) => format!("  ({p} is not running: restored without a parent)"),
+                None => String::new(),
+            };
+            println!("  {:<24}  {}{lineage}", a["dir"].as_str().unwrap_or("?"), cmd.join(" "));
         }
         if dry_run {
             launched += todo.len();
@@ -949,7 +952,7 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
         }
 
         if let Err(e) = place_workspace(
-            &name,
+            name,
             ws["output"].as_str().unwrap_or_default(),
             &layout,
             &matchers,
@@ -963,8 +966,12 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
             }
             let tag = a["tag"].as_str().unwrap_or_default();
             let cwd = a["cwd"].as_str().unwrap_or_default();
+            let parent = a["parent"]
+                .as_str()
+                .filter(|p| parent_is_up(p, &live, &started));
             if let Err(e) = launch::spawn_terminal(
                 tag,
+                parent,
                 cwd,
                 &resume_argv(a),
                 a["terminal_class"].as_str().unwrap_or_default(),
@@ -972,6 +979,7 @@ pub fn restore_cmd(dry_run: bool, stagger: u64, only: Option<String>) -> i32 {
                 eprintln!("seagents: {}: {e}", a["dir"].as_str().unwrap_or("?"));
                 continue;
             }
+            started.insert(tag);
             launched += 1;
         }
     }
@@ -1043,8 +1051,9 @@ fn argv_of(agent: &Value) -> Vec<String> {
         .unwrap_or_else(|| vec!["claude".to_string()])
 }
 
-/// An argv with any session-selection flag removed, so "the same agent
-/// launched again" compares equal whether or not it was resumed.
+/// An argv with any session-selection flag removed, so a restored window can
+/// be pointed at the conversation we captured instead of whichever one the
+/// agent was originally launched on.
 fn argv_without_resume(argv: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut it = argv.iter().peekable();
@@ -1061,14 +1070,29 @@ fn argv_without_resume(argv: &[String]) -> Vec<String> {
     out
 }
 
-/// What makes two agent launches interchangeable: same project, same command.
-fn launch_signature(cwd: &str, argv: &[String]) -> String {
-    let mut key = String::from(cwd);
-    for arg in argv_without_resume(argv) {
-        key.push('\u{1}');
-        key.push_str(&arg);
+/// Whether a restored agent can be launched under `parent`: `run --parent`
+/// refuses a parent that is not live, so it must be running already or have
+/// been launched earlier in this restore — in which case its terminal may
+/// still be starting, and it is given a moment to register. Otherwise the
+/// lineage is dropped rather than failing the child's launch. (A parent that
+/// restores *after* its child, on a later workspace, is the case this loses.)
+fn parent_is_up(parent: &str, live: &HashSet<String>, started: &HashSet<&str>) -> bool {
+    if live.contains(parent) {
+        return true;
     }
-    key
+    if !started.contains(parent) {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if crate::registry::list().iter().any(|s| s.meta.tag == parent) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 /// Focus the workspace, put it on the output it came from, and append the
@@ -1250,25 +1274,6 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(leaf_tag(&kept[0]).as_deref(), Some("b"));
         assert_eq!(kept[0]["percent"].as_f64(), Some(1.0));
-    }
-
-    #[test]
-    fn launch_signatures_ignore_how_a_session_was_selected() {
-        let fresh = launch_signature("/p", &["claude".into(), "--model".into(), "opus".into()]);
-        let resumed = launch_signature(
-            "/p",
-            &[
-                "claude".into(),
-                "--model".into(),
-                "opus".into(),
-                "--resume".into(),
-                "5c603939-bf27-47c8-8b0f-13731d2cc6eb".into(),
-            ],
-        );
-        assert_eq!(fresh, resumed);
-        // Different project, or different flags, are different agents.
-        assert_ne!(fresh, launch_signature("/q", &["claude".into()]));
-        assert_ne!(fresh, launch_signature("/p", &["claude".into()]));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! A window seagents opens itself — a restored agent today, a spawned one once
 //! orchestration lands — is launched carrying a minted handle,
 //! `seagents-<tag>` ([`handle_for`]), so i3 can swallow it into a placeholder
-//! and `seagents run --window` can identify it without a focus race. *Which*
+//! and `seagents run --tag` can identify it without a focus race. *Which*
 //! X11 property carries the handle is the terminal's business — a role for
 //! Terminator, a WM_CLASS instance for most others — so each launch recipe
 //! ([`terminal`]) pairs the command line with the [`WindowMatch`] that finds
@@ -184,8 +184,8 @@ pub(crate) fn matcher_for(class: &str) -> WindowMatch {
         .unwrap_or(WindowMatch::Instance)
 }
 
-/// Launch one terminal window running `argv` under `seagents run`, carrying
-/// the handle minted from `tag`.
+/// Launch one terminal window running `argv` under `seagents run --tag <tag>`
+/// (and `--parent`, when given), carrying the handle minted from that tag.
 ///
 /// The agent runs under `seagents run` so the session is teed and
 /// tracked from its first byte, and the shell survives it — closing the agent
@@ -197,18 +197,29 @@ pub(crate) fn matcher_for(class: &str) -> WindowMatch {
 /// substituted.
 pub(crate) fn spawn_terminal(
     tag: &str,
+    parent: Option<&str>,
     cwd: &str,
     argv: &[String],
     class: &str,
 ) -> Result<(), String> {
     let handle = handle_for(tag);
-    // `--window` so the wrapper identifies its own window by handle rather than
-    // by winning a focus race it cannot win.
-    let inner = format!(
-        "seagents run --window {} -- {}; exec \"$SHELL\"",
-        shell_quote(&handle),
-        argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+    // This very binary, by absolute path: the new window's shell has whatever
+    // PATH its rc files give it, and the one it finds need not be us.
+    let exe = std::env::current_exe().map_err(|e| format!("locating seagents: {e}"))?;
+    // `--tag` so the wrapper identifies its own window by `handle_for(tag)`
+    // rather than by winning a focus race it cannot win.
+    let mut inner = format!(
+        "{} run --tag {}",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(tag)
     );
+    if let Some(parent) = parent {
+        inner.push_str(&format!(" --parent {}", shell_quote(parent)));
+    }
+    inner.push_str(&format!(
+        " -- {}; exec \"$SHELL\"",
+        argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+    ));
     let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
         return Err("terminal command is empty".to_string());

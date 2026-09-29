@@ -92,6 +92,11 @@ pub(crate) struct Session {
     /// stripped; empty when the agent hasn't named the conversation yet, so a
     /// caller showing it can fall back to the directory.
     pub(crate) title: String,
+    /// The agent's name — what every command addresses it by.
+    pub(crate) tag: String,
+    /// Its spawner's tag, and its spawn generation (0 without a parent).
+    pub(crate) parent: Option<String>,
+    pub(crate) depth: u32,
 }
 
 /// The three questions the list can be ordered to answer. Also the value of
@@ -166,15 +171,18 @@ pub fn print(sort: Sort) -> i32 {
         return 0;
     }
 
+    let tag_w = sessions.iter().map(|s| s.tag.len()).max().unwrap_or(3).max(3);
     let dir_w = sessions.iter().map(|s| s.dir.len()).max().unwrap_or(3).max(3);
     let cmd_w = sessions.iter().map(|s| s.cmd.len()).max().unwrap_or(3).max(3);
     for s in &sessions {
         println!(
-            "{:<11}  {:<dw$}  {:<cw$}  {:>6}",
+            "{:<11}  {:<tw$}  {:<dw$}  {:<cw$}  {:>6}",
             s.state.badge(),
+            s.tag,
             s.dir,
             s.cmd,
             humanize_secs(s.state_secs),
+            tw = tag_w,
             dw = dir_w,
             cw = cmd_w,
         );
@@ -187,7 +195,7 @@ pub fn print(sort: Sort) -> i32 {
 
 /// `seagents status --json`: machine-readable session list, one array on
 /// stdout. This is the integration surface for widget frontends (eww etc.):
-/// poll this, render rows, and wire clicks to `seagents focus <pid>`.
+/// poll this, render rows, and wire clicks to `seagents focus <tag>`.
 pub fn print_json(sort: Sort) -> i32 {
     let sessions = collect(sort);
     crate::snapshot::maybe_capture();
@@ -203,6 +211,9 @@ pub fn print_json(sort: Sort) -> i32 {
                 "pid": s.pid,
                 "state_secs": s.state_secs,
                 "title": s.title,
+                "tag": s.tag,
+                "parent": s.parent,
+                "depth": s.depth,
             })
         })
         .collect();
@@ -259,6 +270,9 @@ fn read_session(live: &crate::registry::Session) -> Session {
         pid: child_pid,
         state_secs: now.saturating_sub(record.since),
         title,
+        tag: meta.tag.clone(),
+        parent: meta.parent.clone(),
+        depth: meta.depth,
     }
 }
 

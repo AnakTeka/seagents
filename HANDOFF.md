@@ -114,14 +114,18 @@ windows.
 
 ```
 seagents [hud]              floating agent HUD (also the default with no args)
-seagents run <cmd> [args]   launch an agent, teeing its output (this is how tracking happens)
+seagents run [--tag T] [--parent P] <cmd> [args]
+                           launch an agent, teeing its output (this is how
+                           tracking happens); every agent gets a tag (below)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
-                            incl. each agent's conversation `title`;
+                            incl. each agent's conversation `title`, `tag`,
+                            `parent`, `depth`;
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
-seagents focus <child_pid> focus that agent's i3 window
+seagents focus <target>    focus that agent's i3 window (target: `tag`,
+                           `@tag`, or the `pid` status --json reports)
 seagents snapshot [--refresh] [--print]
                            capture the agent layout now (it is also captured
                            continuously; --refresh re-resolves session ids)
@@ -137,8 +141,8 @@ seagents debug-screen <FILE> [COLS] [ROWS] [--agent A] [--json]
 definition in `main.rs`, so they are the authoritative reference. Every flag
 takes both `--flag value` and `--flag=value`. `run` passes everything after
 the agent's first word through untouched (`seagents run claude --model opus
---help` hands `--help` to claude); `--window` is only `run`'s own when it comes
-before the command. Usage errors exit 2. `debug-screen` used to guess which
+--help` hands `--help` to claude); `--tag`/`--parent` are only `run`'s own
+when they come before the command. Usage errors exit 2. `debug-screen` used to guess which
 argument was the file and which were the geometry (any number was a
 dimension); since the move to clap it is strictly file, then cols, then rows.
 
@@ -179,8 +183,11 @@ Source layout under `src/`:
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord`, `list()` (live,
   never deletes) / `reap()` (deletes the dead) / `by_child_pid()`, and the
-  locked `update_meta()` / `update_state()`. No other module builds a
-  `<pid>.*` path or parses one.
+  locked `update_meta()` / `update_state()`; tags (`valid_tag()`,
+  `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
+  `backfill_tags()`) and `resolve_target()`, the one resolver every command
+  that addresses an agent uses. No other module builds a `<pid>.*` path or
+  parses one.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then
   detects), `print()`, `read_session()` (detection), `observe_state()` (the
   `.state` transition rules), OSC-title parsing (`all_titles`,
@@ -204,7 +211,9 @@ Source layout under `src/`:
   afterwards: `handle_for()` (the minted `seagents-<tag>` handle),
   `WindowMatch` (which X11 property carries it), the per-terminal recipes
   (`terminal()`, `recipe_for_class()`, `matcher_for()`), `spawn_terminal()`,
-  `shell_quote()`. Used by `restore`; `spawn` will share it.
+  `shell_quote()`. `spawn_terminal()` runs `<abs path of this binary> run
+  --tag <tag> [--parent <p>]`, so the new window's PATH doesn't matter. Used
+  by `restore`; `spawn` will share it.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -285,6 +294,9 @@ Per session, keyed by the wrapper's pid:
     "cols": 212, "rows": 53,        // launch geometry (fallback for rendering)
     "con_id": 103471613296720,      // i3 window recorded at launch (focus handle)
     "window_id": 30728026,          // X11 id (survives an i3 restart)
+    "tag": "homelab-3f9a",          // the agent's name (see Tags, below)
+    "parent": null,                 // spawner's tag; depth = its depth + 1
+    "depth": 0,
     "session_id": "5c603939-…",     // the agent's own conversation, for restore
     "session_id_source": "proc"     // how it was learned: "proc" | "title"
   }
@@ -296,6 +308,22 @@ Per session, keyed by the wrapper's pid:
   may come from an older or newer seagents than the one reading it.
 - **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`
   or `.state`.
+- **`tags.lock`** — one for the whole cache; see Tags.
+
+**Tags.** Every agent has one: its name for every command (`focus reviewer`),
+the window handle `restore` swallows on (`seagents-<tag>`), and the lineage
+key. `run --tag T` asks for one; otherwise `run` mints `<cwd basename>-<4 hex>`.
+Charset `[a-z0-9][a-z0-9-]{0,31}`, never all digits (so a bare target can't be
+mistaken for a pid). `registry::claim_tag()` checks uniqueness among live
+agents under an exclusive `flock` on `tags.lock` and keeps it held — through
+the pty open and the fork — until `TagClaim::create_meta()` has written the
+`.meta`, so two concurrent `run`s cannot both get a name. A malformed or taken
+`--tag`, or a `--parent` that isn't a live agent, exits 2 before anything is
+spawned. Minting also avoids every tag recorded in `layout.json`, so a new
+agent can't take a placeholder a pending restore will want back; a *requested*
+tag may be one of those — that is how `restore` relaunches an agent under its
+old name. `parent`/`depth` are lineage (0 without a parent); nothing enforces
+anything with them yet.
 
 **Every sidecar goes through `registry.rs`**, because `.meta` and `.state` have
 writers in several processes (`.meta`: the wrapper at launch, window healing
@@ -452,6 +480,8 @@ overwrites on the first repaint. Restored windows are therefore launched
 carrying a minted handle, `seagents-<tag>`, and the placeholder swallows on that
 alone.
 
+The tag is the agent's own (§2), recorded per agent in `layout.json` along
+with its `parent` and `depth`.
 *Which* X11 property carries the handle is the terminal's business — Terminator
 has `--role` and no `--class`; alacritty (and most others) are the reverse — so
 the **stored layout is terminal-agnostic**: leaves keep a `tag`, and the swallow
@@ -475,9 +505,9 @@ that works is a role we mint for a window that doesn't exist yet. Its output is
 also not valid JSON, and it would be a subprocess per workspace every 30 s from
 a thread that already holds the parsed tree.
 
-Because `restore` launches those windows itself, it also passes `--window` to
-`seagents run`, which then identifies its own window **by handle instead of by
-focus**. Focus-based capture is a race a spawned window loses: the shell inside
+Because `restore` launches those windows itself, it passes `--tag` (the
+captured one) to `seagents run`, which then identifies its own window **by
+handle — `handle_for(tag)` — instead of by focus**. Focus-based capture is a race a spawned window loses: the shell inside
 reaches `run` while the terminal is still mapping, so several restored agents
 would all record whichever window was focused *before* — one con_id shared by
 many sessions. (Capture guards against that anyway: when two live sessions name
@@ -508,10 +538,23 @@ being a genuinely ambiguous duplicate title and a session still showing the
 default "Claude Code". **Matching on transcript mtime was tried and rejected —
 it was wrong 3 times out of 3.** It is not a fallback, it is a coin flip.
 
-`restore` is safe to run twice and safe to run when only half the agents died: a
-conversation already on screen is skipped by id, and agents without an id are
-matched *by count* per launch signature (project + argv, ignoring `--resume`),
-so three live out of four captured restores exactly one.
+`restore` is safe to run twice and safe to run when only half the agents died:
+a restored agent comes back under its captured tag, so **a captured agent whose
+tag is live is already on screen and is skipped** — tag identity alone makes
+restore idempotent. Lineage comes back too: a child is relaunched with
+`--parent` when its parent is live or restored earlier in the same run (each
+workspace launches parents first, and waits up to 10 s for a parent's `.meta`);
+a parent that is gone, or that restores on a later workspace than its child,
+drops the lineage rather than failing the launch.
+
+**One-time cost of the tag cutover.** Agents started by a pre-tag binary carry
+no tag. A capture by the new binary backfills one into their `.meta`
+(`registry::backfill_tags`), but their own (old-binary) monitor threads keep
+writing the old layout format, whose tags are conversation-id prefixes /
+`p<pid>` that match no live tag — so a `restore` run while such wrappers are
+still alive can relaunch them as duplicates, and an old-format tag that happens
+to be all digits is refused and not restored. Restart those agents (or reboot
+and restore) once; after that every agent is tagged at launch.
 
 ---
 

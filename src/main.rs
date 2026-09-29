@@ -40,11 +40,17 @@ enum Command {
     /// Everything after the command's first word is passed to it untouched,
     /// flags included: `seagents run claude --model opus`.
     Run {
-        /// The handle of the i3 window this agent will live in. `restore`
-        /// passes it for windows it launched itself, which may not be focused
-        /// yet when the wrapper looks.
-        #[arg(long, value_name = "HANDLE")]
-        window: Option<String>,
+        /// The agent's name ([a-z0-9][a-z0-9-]{0,31}, not all digits); minted
+        /// as `<cwd basename>-<4 hex>` when omitted. Refused (exit 2) while a
+        /// live agent holds it. A terminal seagents opened carries the handle
+        /// `seagents-<TAG>`, which is how the wrapper finds its own window.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+
+        /// The spawning agent's tag; must be live. Sets this agent's lineage
+        /// (depth = the parent's + 1).
+        #[arg(long, value_name = "TAG")]
+        parent: Option<String>,
 
         /// The agent's command line
         #[arg(
@@ -82,8 +88,9 @@ enum Command {
 
     /// Focus that agent's i3 window
     Focus {
-        /// The agent's `pid`, as `status --json` reports it
-        child_pid: u64,
+        /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid` as
+        /// `status --json` reports it
+        target: String,
     },
 
     /// Capture the agent layout now (it is also captured continuously)
@@ -150,11 +157,11 @@ fn main() {
 fn dispatch(command: Command) -> i32 {
     match command {
         Command::Hud => hud::run(),
-        Command::Run { window, cmd } => wrapper::run(cmd, window),
+        Command::Run { tag, parent, cmd } => wrapper::run(cmd, tag, parent),
         Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Status { json: true, sort } => status::print_json(sort),
         Command::Status { json: false, sort } => status::print(sort),
-        Command::Focus { child_pid } => window::focus(child_pid),
+        Command::Focus { target } => window::focus(&target),
         Command::Snapshot { refresh, print } => snapshot::snapshot_cmd(refresh, print),
         Command::Restore {
             dry_run,
@@ -197,14 +204,14 @@ mod tests {
 
     #[test]
     fn run_passes_the_agents_own_flags_through_untouched() {
-        let Command::Run { window, cmd } =
-            parse(&["seagents", "run", "claude", "--model", "x", "--window", "w", "-p", "--"])
+        let Command::Run { tag, cmd, .. } =
+            parse(&["seagents", "run", "claude", "--model", "x", "--tag", "w", "-p", "--"])
         else {
             panic!("not run");
         };
-        // --window after the agent's first word belongs to the agent.
-        assert_eq!(window, None);
-        assert_eq!(cmd, ["claude", "--model", "x", "--window", "w", "-p", "--"]);
+        // --tag after the agent's first word belongs to the agent.
+        assert_eq!(tag, None);
+        assert_eq!(cmd, ["claude", "--model", "x", "--tag", "w", "-p", "--"]);
 
         // Even --help, once the command has started.
         let Command::Run { cmd, .. } = parse(&["seagents", "run", "claude", "--help"]) else {
@@ -220,16 +227,27 @@ mod tests {
     }
 
     #[test]
-    fn run_takes_window_before_the_command_in_both_spellings() {
+    fn run_takes_tag_and_parent_before_the_command_in_both_spellings() {
         for args in [
-            &["seagents", "run", "--window", "seagents-ab", "--", "claude", "--resume", "id"][..],
-            &["seagents", "run", "--window=seagents-ab", "claude", "--resume", "id"][..],
+            &["seagents", "run", "--tag", "ab", "--parent", "p", "--", "claude", "--resume", "id"][..],
+            &["seagents", "run", "--parent=p", "--tag=ab", "claude", "--resume", "id"][..],
         ] {
-            let Command::Run { window, cmd } = parse(args) else {
+            let Command::Run { tag, parent, cmd } = parse(args) else {
                 panic!("not run");
             };
-            assert_eq!(window.as_deref(), Some("seagents-ab"));
+            assert_eq!(tag.as_deref(), Some("ab"));
+            assert_eq!(parent.as_deref(), Some("p"));
             assert_eq!(cmd, ["claude", "--resume", "id"]);
+        }
+    }
+
+    #[test]
+    fn focus_takes_a_tag_or_a_pid() {
+        for t in ["reviewer", "@reviewer", "1234"] {
+            let Command::Focus { target } = parse(&["seagents", "focus", t]) else {
+                panic!("not focus");
+            };
+            assert_eq!(target, t);
         }
     }
 
@@ -237,7 +255,7 @@ mod tests {
     fn run_and_lead_need_a_command() {
         for args in [
             &["seagents", "run"][..],
-            &["seagents", "run", "--window", "h"][..],
+            &["seagents", "run", "--tag", "h"][..],
             &["seagents", "__lead"][..],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
@@ -346,7 +364,6 @@ mod tests {
         for args in [
             &["seagents", "frobnicate"][..],
             &["seagents", "focus"][..],
-            &["seagents", "focus", "abc"][..],
             &["seagents", "snapshot", "--bogus"][..],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();

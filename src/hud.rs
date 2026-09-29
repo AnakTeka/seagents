@@ -779,6 +779,9 @@ mod tests {
             pid: 2,
             state_secs: secs,
             title: String::new(),
+            tag: format!("{dir}-0000"),
+            parent: None,
+            depth: 0,
         }
     }
 

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::launch::handle_for;
 use crate::registry::{self, Files};
 use crate::window;
 
@@ -24,8 +25,33 @@ mod pumps;
 
 pub(crate) use lead::lead;
 
-pub(crate) fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
-    let (con_id, window_id) = identify_window(window.as_deref());
+/// `seagents run [--tag T] [--parent P] <cmd…>`. Exit 2 — before anything is
+/// spawned — when the tag cannot be had (malformed, or held by a live agent)
+/// or the parent is not a live agent.
+pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>) -> i32 {
+    if let Some(t) = tag.as_deref().filter(|t| !registry::valid_tag(t)) {
+        eprintln!("seagents: invalid tag {t:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits");
+        return 2;
+    }
+    // A requested tag is also the window's handle: whoever launched us with
+    // one (restore) put `handle_for(tag)` on the terminal it opened.
+    let (con_id, window_id) = identify_window(tag.as_deref().map(handle_for).as_deref());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Held from here until the `.meta` exists, so no other `run` can take the
+    // same tag in between. Only the pty and the fork happen under it.
+    let claim = match registry::claim_tag(
+        tag.as_deref(),
+        parent.as_deref(),
+        &cwd,
+        &crate::snapshot::captured_tags(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("seagents: {e}");
+            return 2;
+        }
+    };
 
     let size = terminal_size();
 
@@ -82,8 +108,7 @@ pub(crate) fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
     // Open the tee target and write the identity sidecar. Both best-effort.
     let files = Files::of(u64::from(std::process::id()));
     let tee = File::create(&files.raw).ok();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    write_meta(&files, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
+    write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, con_id, window_id);
     if std::env::var("SEAGENTS_DEBUG").is_ok() {
         eprintln!("seagents: teeing to {}", files.raw.display());
     }
@@ -128,7 +153,7 @@ pub(crate) fn run(cmd: Vec<String>, window: Option<String>) -> i32 {
 ///   2. our own /proc ancestry ↔ the window's _NET_WM_PID — also exact, but
 ///      only on a one-process-per-window terminal (Terminator shares one
 ///      process across all its windows, so this abstains there);
-///   3. the handle `restore` minted and passed as --window;
+///   3. the handle `restore` put on the terminal, `handle_for(--tag)`;
 ///   4. the focused terminal, which is right when a human just typed the
 ///      command into it and wrong for anything spawned programmatically.
 fn identify_window(handle: Option<&str>) -> (Option<u64>, Option<u64>) {
@@ -242,9 +267,11 @@ fn terminal_size() -> PtySize {
 }
 
 /// Record who this agent is so the daemon can label it and locate its process /
-/// i3 window. cwd here is the launch cwd; the daemon can also read the live cwd
-/// from /proc/<child_pid>/cwd.
+/// i3 window, under the tag `claim` holds (and releasing it). cwd here is the
+/// launch cwd; the daemon can also read the live cwd from /proc/<child_pid>/cwd.
+#[allow(clippy::too_many_arguments)]
 fn write_meta(
+    claim: registry::TagClaim,
     files: &Files,
     child_pid: Option<u32>,
     cwd: &Path,
@@ -267,5 +294,5 @@ fn write_meta(
         window_id,
         ..registry::Meta::default()
     };
-    registry::create_meta(files, &meta);
+    claim.create_meta(files, meta);
 }

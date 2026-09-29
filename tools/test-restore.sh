@@ -60,7 +60,8 @@ export HOME="$ROOT/home"
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 export SEAGENTS_NO_NOTIFY=1
 mkdir -p "$HOME" "$ROOT/bin"
-# `restore` spawns a bare `seagents`; make sure it finds the build under test.
+# The launches below run a bare `seagents` (restore itself uses its own
+# absolute path); make sure it finds the build under test.
 ln -sf "$SEA" "$ROOT/bin/seagents"
 export PATH="$ROOT/bin:$PATH"
 
@@ -106,8 +107,8 @@ def walk(n,ws=None,d=0):
 walk(json.load(sys.stdin))"
 }
 
-launch() {  # handle, cwd, grep-token
-  local inner="seagents run --window '$1' -- sleep 3600"
+launch() {  # handle, cwd, tag [, parent] — the handle is what `restore` mints: seagents-<tag>
+  local inner="seagents run --tag '$3' ${4:+--parent '$4'} -- sleep 3600"
   case $TERM_UNDER_TEST in
     terminator) terminator -u --role "$1" --working-directory="$2" \
                   -x /bin/sh -c "$inner" >/dev/null 2>&1 &
@@ -131,7 +132,7 @@ launch() {  # handle, cwd, grep-token
   echo "timed out waiting for window $1"; return 1
 }
 
-# Identity check: `run` must find its own window with no --window handle and
+# Identity check: `run` must find its own window with no --tag handle and
 # focus parked elsewhere — from ALACRITTY_WINDOW_ID, or failing that from /proc
 # ancestry. Terminator supplies neither (no window-id variable, and one process
 # behind every window), so it falls back to focus capture and this is skipped.
@@ -178,7 +179,8 @@ i3-msg 'workspace --no-auto-back-and-forth "7"' >/dev/null
 launch seagents-t1 /tmp t1
 launch seagents-t2 "$HOME" t2
 i3-msg 'split v' >/dev/null
-launch seagents-t3 /etc t3
+# t3 is t1's child: restore must bring the lineage back too.
+launch seagents-t3 /etc t3 t1
 sleep 1
 
 before=$(dump)
@@ -201,10 +203,24 @@ sleep 4
 after=$(dump)
 echo "=== restored layout ==="; echo "$after"
 
-if [ "$before" = "$after" ]; then
-  echo "PASS ($TERM_UNDER_TEST): restored tree matches the captured one"
-  exit 0
+if [ "$before" != "$after" ]; then
+  echo "FAIL ($TERM_UNDER_TEST): restored tree differs"
+  diff <(echo "$before") <(echo "$after")
+  exit 1
 fi
-echo "FAIL ($TERM_UNDER_TEST): restored tree differs"
-diff <(echo "$before") <(echo "$after")
-exit 1
+echo "PASS ($TERM_UNDER_TEST): restored tree matches the captured one"
+
+# The restored agents are the captured ones by name, lineage included.
+tags=$("$SEA" status --json | python3 -c "
+import json,sys
+print(' '.join(sorted('%s:%s:%s' % (s['tag'], s['parent'], s['depth']) for s in json.load(sys.stdin))))")
+want="t1:None:0 t2:None:0 t3:t1:1"
+[ "$tags" = "$want" ] || { echo "FAIL: restored tags '$tags', want '$want'"; exit 1; }
+echo "PASS: restored agents carry their captured tags and lineage ($tags)"
+
+# Idempotent by tag: everything captured is live, so a second restore is a no-op.
+out=$("$SEA" restore --stagger=0) || { echo "second restore failed"; exit 1; }
+echo "$out" | grep -qE 'restored 0 windows' && echo "$out" | grep -q '3 already running' || {
+  echo "FAIL: second restore was not a no-op:"; echo "$out"; exit 1; }
+echo "PASS: a second restore relaunches nothing"
+exit 0
