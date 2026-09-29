@@ -17,9 +17,10 @@
 //! 3. [`Adapter::default`] — the generic adapter for any other command: no
 //!    seed flag, no hooks, no identity; state from the screen only.
 //!
-//! Data only so far: `spawn`, `send`, `stop` and the hook are its consumers.
+//! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
+//! `spawn`, `send` and `stop` are its other consumers.
 
-// Nothing in the binary reads adapters until spawn/send land; the tests do.
+// The seed, permission and send facts have no reader until spawn/send land.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::path::PathBuf;
@@ -67,6 +68,9 @@ pub(crate) struct Launch {
     /// The flag that takes a settings JSON carrying our hooks; empty when the
     /// tool has no hook support.
     pub(crate) settings_flag: String,
+    /// Flags under which the tool skips hooks altogether (Claude's `--bare`):
+    /// nothing is injected, and `.agent` stays empty.
+    pub(crate) hookless_flags: Vec<String>,
     /// The flag that sets a permission mode; empty when there is none.
     pub(crate) permission_flag: String,
     /// The modes that flag takes, least privileged first — the order a child
@@ -165,6 +169,7 @@ mod tests {
         let claude = parse(BUNDLED[0].1).unwrap();
         assert_eq!(claude.launch.seed_prompt, ["--", "{prompt}"]);
         assert_eq!(claude.launch.settings_flag, "--settings");
+        assert_eq!(claude.launch.hookless_flags, ["--bare"]);
         assert_eq!(claude.launch.permission_flag, "--permission-mode");
         assert_eq!(
             claude.launch.permission_modes,

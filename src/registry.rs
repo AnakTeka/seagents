@@ -4,22 +4,27 @@
 //!
 //! - `.raw` — the tee. Append-only, written by the wrapper's output pump; this
 //!   module only names it (and deletes it on reap).
-//! - `.meta` — who and where: pids, argv, cwd, window handles, the resolved
-//!   conversation id. Written by the wrapper at launch, then updated from any
-//!   process: window healing from the wrapper's input pump *and* from the
-//!   focus/HUD processes, conversation ids from whichever process runs a
-//!   snapshot capture.
+//! - `.meta` — who and where: pids, argv, cwd, window handles, tag and
+//!   lineage. Written by the wrapper at launch, then updated from any process:
+//!   window healing from the wrapper's input pump *and* from the focus/HUD
+//!   processes, tag backfill from whichever process runs a snapshot capture.
 //! - `.state` — the last observed screen state, since when, and whether the
 //!   user has seen it. Written by the wrapper's monitor and by every observer
 //!   whose own detection disagrees (see `status::observe_state`).
+//! - `.agent` — what the agent itself reports: which conversation it is
+//!   writing, and the turn ledger ([`AgentRecord`]). Written by `__hook`,
+//!   which the agent runs at its own lifecycle events. Kept apart from
+//!   `.meta` because it churns on every prompt and turn end while `.meta`
+//!   almost never changes.
 //!
-//! Because `.meta` and `.state` have writers in several processes, every change
-//! is a locked read-modify-write ([`update_meta`], [`update_state`]): an
+//! Because every sidecar has writers in several processes, every change is a
+//! locked read-modify-write ([`update_meta`], [`update_state`],
+//! [`update_agent`]): an
 //! exclusive `flock` on the session's `.lock` sibling, read, mutate the typed
 //! record, write a pid-suffixed tmp file, rename it over, unlock. Readers take
 //! no lock — the rename means they see the old record or the new one, never a
 //! torn one. tmp+rename alone fixes torn reads; only the lock fixes lost
-//! updates (a healed con_id and a resolved session id landing at once, one
+//! updates (a healed con_id and a backfilled tag landing at once, one
 //! silently dropping the other).
 //!
 //! Liveness is one rule, [`procfs::alive`] on the child pid, and two
@@ -63,7 +68,9 @@ pub(crate) struct Files {
     pub(crate) meta: PathBuf,
     /// Last observed state: [`StateRecord`].
     pub(crate) state: PathBuf,
-    /// Guards every read-modify-write of `meta` and `state`.
+    /// Identity and the turn ledger: [`AgentRecord`].
+    pub(crate) agent: PathBuf,
+    /// Guards every read-modify-write of `meta`, `state` and `agent`.
     lock: PathBuf,
 }
 
@@ -79,6 +86,7 @@ impl Files {
             raw_tmp: dir.join(format!("{wrapper_pid}.raw.tmp")),
             meta: dir.join(format!("{wrapper_pid}.meta")),
             state: dir.join(format!("{wrapper_pid}.state")),
+            agent: dir.join(format!("{wrapper_pid}.agent")),
             lock: dir.join(format!("{wrapper_pid}.lock")),
         }
     }
@@ -128,12 +136,6 @@ pub(crate) struct Meta {
     /// Spawn generation: 0 without a parent, the parent's depth + 1 with one.
     #[serde(default)]
     pub(crate) depth: u32,
-    /// The agent's own conversation id, filled in lazily by the snapshot
-    /// capture, and how it was learned (`proc` | `title`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) session_id_source: Option<String>,
     /// Fields written by another version of seagents, preserved verbatim.
     #[serde(flatten)]
     pub(crate) extra: Map<String, Value>,
@@ -173,6 +175,63 @@ fn seen_by_default() -> bool {
     true
 }
 
+/// What the agent reports about itself, as its `.agent` records it: which
+/// conversation it is writing (identity) and the turn ledger. Written by
+/// `__hook` from the agent's own lifecycle events; absent for agents without
+/// hooks, and every field defaults, so a missing or older file reads as "not
+/// known yet".
+///
+/// The ledger counts `Stop`s; it does not pair prompts with turns. A message
+/// typed mid-turn fires a prompt event reusing the running turn's id and is
+/// answered by a second `Stop` nobody announced, and an Esc-interrupted turn
+/// fires the prompt event and no `Stop` at all — so prompt counts drift and
+/// prompt ids don't pair, and `stops` is the one monotonic edge. It never
+/// resets (not on `/clear`, not on a resume), so a baseline a caller holds
+/// stays comparable for the wrapper's whole life.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub(crate) struct AgentRecord {
+    /// The conversation file the agent is writing now; changes on `/clear`.
+    pub(crate) transcript_path: Option<String>,
+    /// The conversation id — what `restore` resumes with.
+    pub(crate) session_id: Option<String>,
+    /// Why the current conversation began: startup | resume | clear | compact.
+    pub(crate) source: Option<String>,
+    /// The agent's permission mode, as last reported.
+    pub(crate) permission_mode: Option<String>,
+    /// Turn ends seen, +1 at every `Stop`.
+    pub(crate) stops: u64,
+    /// When the last prompt was submitted, and the last turn ended (unix s).
+    pub(crate) prompted_at: Option<u64>,
+    pub(crate) stopped_at: Option<u64>,
+    /// The final assistant text of the last turn.
+    pub(crate) last_message: Option<String>,
+    /// When any of the above last changed.
+    pub(crate) updated: u64,
+    /// Fields written by another version of seagents, preserved verbatim.
+    #[serde(flatten)]
+    pub(crate) extra: Map<String, Value>,
+}
+
+/// Is the agent in a turn — has it been given a prompt it has not finished?
+/// The one definition `status`, `wait` and `send` share.
+///
+/// A prompt after the last `Stop`, and the screen not seen `idle` since that
+/// prompt. The second clause is what ends an Esc-interrupted turn, which fires
+/// no `Stop`: the detector seeing the agent back at an idle prompt is the only
+/// edge it leaves. (Seconds resolution: an idle observation stamped in the
+/// same second as the prompt counts as after it.) Blocked is still in a turn —
+/// a permission prompt interrupts a turn, it does not end one.
+pub(crate) fn in_turn(agent: &AgentRecord, state: Option<&StateRecord>) -> bool {
+    let Some(prompted) = agent.prompted_at else {
+        return false;
+    };
+    if prompted <= agent.stopped_at.unwrap_or(0) {
+        return false;
+    }
+    !state.is_some_and(|s| s.state == "idle" && s.since >= prompted)
+}
+
 /// One tracked session: its files and its identity.
 #[derive(Clone, Debug)]
 pub(crate) struct Session {
@@ -197,8 +256,17 @@ pub(crate) fn read_meta(files: &Files) -> Option<Meta> {
     serde_json::from_str(&fs::read_to_string(&files.meta).ok()?).ok()
 }
 
-fn read_state(files: &Files) -> Option<StateRecord> {
+pub(crate) fn read_state(files: &Files) -> Option<StateRecord> {
     serde_json::from_str(&fs::read_to_string(&files.state).ok()?).ok()
+}
+
+/// Parse a `.agent`; the empty record when there is none (no hook has fired
+/// yet, or the agent has none) or it does not parse.
+pub(crate) fn read_agent(files: &Files) -> AgentRecord {
+    fs::read_to_string(&files.agent)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// Every parseable `.meta` in `dir`, alive or not.
@@ -249,7 +317,7 @@ pub(crate) fn reap() {
 fn reap_in(dir: &Path) {
     for s in all_in(dir).into_iter().filter(|s| !is_alive(&s.meta)) {
         let f = &s.files;
-        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.lock] {
+        for path in [&f.meta, &f.raw, &f.raw_tmp, &f.state, &f.agent, &f.lock] {
             let _ = fs::remove_file(path);
         }
     }
@@ -294,6 +362,23 @@ fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
 
 fn live_by_tag(dir: &Path, tag: &str) -> Option<Session> {
     list_in(dir).into_iter().find(|s| s.meta.tag == tag)
+}
+
+/// The live session the calling process runs inside: the first of its `/proc`
+/// ancestors that is a wrapper with a live `.meta` (for a hook: sh → the agent
+/// → `__lead` → the wrapper). Derived from ancestry rather than an environment
+/// variable, which everything the agent runs inherits and can rewrite. None
+/// for a process outside every session.
+pub(crate) fn enclosing_session() -> Option<Session> {
+    enclosing_session_in(&cache_dir(), &procfs::ancestors(u64::from(std::process::id())))
+}
+
+fn enclosing_session_in(dir: &Path, ancestors: &[u64]) -> Option<Session> {
+    ancestors.iter().find_map(|&pid| {
+        let files = Files::in_dir(dir, pid);
+        let meta = read_meta(&files).filter(|m| m.wrapper_pid == pid && is_alive(m))?;
+        Some(Session { files, meta })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +604,25 @@ pub(crate) fn update_meta(files: &Files, f: impl FnOnce(&mut Meta)) {
     }
 }
 
+/// Locked read-modify-write of a session's `.agent`, creating it on the first
+/// update. Does nothing once the session's `.meta` is gone: a hook firing as
+/// its agent is reaped must not leave a stray `.agent` behind.
+pub(crate) fn update_agent(files: &Files, f: impl FnOnce(&mut AgentRecord)) {
+    if !files.meta.exists() {
+        return;
+    }
+    // As in `update_state`: better an unlocked atomic write than a lost turn.
+    let _lock = Lock::acquire(&files.lock);
+    let before = read_agent(files);
+    let mut record = before.clone();
+    f(&mut record);
+    if record != before {
+        if let Ok(text) = serde_json::to_string_pretty(&record) {
+            write_atomic(&files.agent, text.as_bytes());
+        }
+    }
+}
+
 /// Locked read-modify-write of a session's `.state`. `f` sees the current
 /// record (None when there is none, or it does not parse) and may replace it;
 /// the file is rewritten only if it did. Returns what `f` returns.
@@ -639,12 +743,13 @@ mod tests {
     fn an_older_meta_parses_and_keeps_fields_this_binary_does_not_know() {
         let dir = scratch("oldmeta");
         let files = Files::in_dir(&dir, 7);
-        // No geometry, no window ids, no session id, no tag (a pre-tag
-        // wrapper) — and a field from some other version of seagents.
+        // No geometry, no window ids, no tag (a pre-tag wrapper) — and the
+        // conversation id a pre-hook binary cached here, which this one no
+        // longer reads from `.meta` but must not strip.
         fs::write(
             &files.meta,
             r#"{"wrapper_pid":7,"child_pid":8,"cwd":"/p","argv":["claude"],"started":5,
-                "stops":3}"#,
+                "session_id":"abc","session_id_source":"proc"}"#,
         )
         .unwrap();
 
@@ -658,11 +763,8 @@ mod tests {
         update_meta(&files, |m| m.con_id = Some(42));
         let v: Value = serde_json::from_str(&fs::read_to_string(&files.meta).unwrap()).unwrap();
         assert_eq!(v["con_id"].as_u64(), Some(42));
-        assert_eq!(v["stops"].as_u64(), Some(3));
-        assert!(
-            v.get("session_id").is_none(),
-            "absent optional fields stay absent"
-        );
+        assert_eq!(v["session_id"].as_str(), Some("abc"));
+        assert_eq!(v["session_id_source"].as_str(), Some("proc"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -673,8 +775,6 @@ mod tests {
         let mut meta = sample(1, Some(2));
         meta.con_id = Some(3);
         meta.window_id = Some(4);
-        meta.session_id = Some("abc".into());
-        meta.session_id_source = Some("proc".into());
         meta.tag = "reviewer".into();
         meta.parent = Some("planner".into());
         meta.depth = 1;
@@ -893,5 +993,91 @@ mod tests {
         assert!(resolve_target_in(&dir, "Bad Tag").unwrap_err().contains("neither"));
         assert!(resolve_target_in(&dir, "@").is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_updates_need_a_live_meta_and_keep_unknown_fields() {
+        let dir = scratch("agent");
+        let files = Files::in_dir(&dir, 1);
+        update_agent(&files, |r| r.stops = 1);
+        assert!(!files.agent.exists(), "no .meta, no .agent");
+        assert_eq!(read_agent(&files), AgentRecord::default());
+
+        write_new_meta(&files, &sample(1, Some(2)));
+        update_agent(&files, |r| r.stops += 1);
+        update_agent(&files, |r| r.stops += 1);
+        assert_eq!(read_agent(&files).stops, 2);
+
+        // A field from another version survives an update.
+        let mut v: Value = serde_json::from_str(&fs::read_to_string(&files.agent).unwrap()).unwrap();
+        v["turn"] = 9.into();
+        fs::write(&files.agent, v.to_string()).unwrap();
+        update_agent(&files, |r| r.session_id = Some("s".into()));
+        let v: Value = serde_json::from_str(&fs::read_to_string(&files.agent).unwrap()).unwrap();
+        assert_eq!((v["turn"].as_u64(), v["stops"].as_u64()), (Some(9), Some(2)));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reap_takes_the_agent_ledger_with_the_session() {
+        let dir = scratch("reapagent");
+        let gone = Files::in_dir(&dir, 2);
+        write_new_meta(&gone, &sample(2, Some(u32::MAX as u64)));
+        update_agent(&gone, |r| r.stops = 1);
+        assert!(gone.agent.exists());
+        reap_in(&dir);
+        assert!(!gone.agent.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_enclosing_session_is_the_nearest_ancestor_with_a_live_meta() {
+        let dir = scratch("enclosing");
+        let me = std::process::id() as u64;
+        let dead = u32::MAX as u64;
+        write_new_meta(&Files::in_dir(&dir, 10), &sample(10, Some(me)));
+        write_new_meta(&Files::in_dir(&dir, 20), &sample(20, Some(me)));
+        write_new_meta(&Files::in_dir(&dir, 30), &sample(30, Some(dead)));
+        let found = |chain: &[u64]| enclosing_session_in(&dir, chain).map(|s| s.meta.wrapper_pid);
+        // sh → claude → __lead → wrapper 10 → … → wrapper 20: the nearest wins
+        // (an agent running inside another agent's session belongs to its own).
+        assert_eq!(found(&[500, 501, 502, 10, 600, 20]), Some(10));
+        // A dead session is skipped, not matched.
+        assert_eq!(found(&[500, 30, 20]), Some(20));
+        assert_eq!(found(&[500, 501]), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_turn_truth_table() {
+        let agent = |prompted: Option<u64>, stopped: Option<u64>| AgentRecord {
+            prompted_at: prompted,
+            stopped_at: stopped,
+            ..AgentRecord::default()
+        };
+        let state = |word: &str, since: u64| StateRecord {
+            state: word.into(),
+            since,
+            seen: true,
+        };
+        let idle_before = state("idle", 50);
+        let working = state("working", 101);
+        let blocked = state("blocked", 102);
+        let idle_after = state("idle", 110);
+        let idle_same_second = state("idle", 100);
+
+        // Never prompted: not in a turn, whatever the screen says.
+        assert!(!in_turn(&agent(None, None), Some(&working)));
+        // Prompted, no Stop yet: in a turn until the screen says idle after it.
+        assert!(in_turn(&agent(Some(100), None), None));
+        assert!(in_turn(&agent(Some(100), None), Some(&idle_before)));
+        assert!(in_turn(&agent(Some(100), Some(90)), Some(&working)));
+        assert!(in_turn(&agent(Some(100), Some(90)), Some(&blocked)), "a gate is mid-turn");
+        // Stopped since the prompt (or in the same second): the turn is over.
+        assert!(!in_turn(&agent(Some(100), Some(105)), Some(&working)));
+        assert!(!in_turn(&agent(Some(100), Some(100)), Some(&working)));
+        // Interrupted: prompted, no Stop, idle observed after the prompt.
+        assert!(!in_turn(&agent(Some(100), Some(90)), Some(&idle_after)));
+        assert!(!in_turn(&agent(Some(100), None), Some(&idle_same_second)));
     }
 }

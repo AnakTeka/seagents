@@ -237,7 +237,7 @@ pub(crate) fn spawn_terminal(
 }
 
 /// Single-quote for `sh -c`.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 #[cfg(test)]

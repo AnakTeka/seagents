@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 mod adapter;
 mod clock;
 mod detect;
+mod hook;
 mod hud;
 mod i3;
 mod launch;
@@ -75,6 +76,18 @@ enum Command {
         cmd: Vec<String>,
     },
 
+    /// The agent's lifecycle hook `run` injects (internal)
+    ///
+    /// Reads one hook event (JSON) on stdin and records it in the enclosing
+    /// session's `.agent`. Always exits 0 and prints nothing: a nonzero `Stop`
+    /// hook changes what the agent does. Any arguments are ignored, so no
+    /// command line can make it a usage error.
+    #[command(name = "__hook", hide = true, disable_help_flag = true, disable_version_flag = true)]
+    Hook {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        _ignored: Vec<String>,
+    },
+
     /// One-shot table of every tracked agent's state
     Status {
         /// Machine-readable output, for widget frontends (includes each
@@ -96,11 +109,6 @@ enum Command {
 
     /// Capture the agent layout now (it is also captured continuously)
     Snapshot {
-        /// Re-resolve every session's conversation id instead of trusting the
-        /// cached one
-        #[arg(long)]
-        refresh: bool,
-
         /// Print the snapshot as JSON instead of a summary
         #[arg(long)]
         print: bool,
@@ -160,10 +168,11 @@ fn dispatch(command: Command) -> i32 {
         Command::Hud => hud::run(),
         Command::Run { tag, parent, cmd } => wrapper::run(cmd, tag, parent),
         Command::Lead { cmd } => wrapper::lead(cmd),
+        Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
         Command::Status { json: false, sort } => status::print(sort),
         Command::Focus { target } => window::focus(&target),
-        Command::Snapshot { refresh, print } => snapshot::snapshot_cmd(refresh, print),
+        Command::Snapshot { print } => snapshot::snapshot_cmd(print),
         Command::Restore {
             dry_run,
             stagger,
@@ -271,6 +280,16 @@ mod tests {
             panic!("not __lead");
         };
         assert_eq!(cmd, ["bash", "--norc", "--help"]);
+    }
+
+    #[test]
+    fn hook_takes_anything_and_never_fails_to_parse() {
+        for args in [
+            &["seagents", "__hook"][..],
+            &["seagents", "__hook", "--help", "--version", "-x", "stray"][..],
+        ] {
+            assert!(matches!(parse(args), Command::Hook { .. }), "{args:?}");
+        }
     }
 
     #[test]

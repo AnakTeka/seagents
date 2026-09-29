@@ -121,14 +121,15 @@ seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
                             incl. each agent's conversation `title`, `tag`,
-                            `parent`, `depth`;
+                            `parent`, `depth`, and from its hooks `stops`,
+                            `in_turn`, `transcript_path`, `session_id`;
                             sorts: urgency = triage, longest-waiting first;
                             dir = grouped by cwd; recent = latest change first)
 seagents focus <target>    focus that agent's i3 window (target: `tag`,
                            `@tag`, or the `pid` status --json reports)
-seagents snapshot [--refresh] [--print]
+seagents snapshot [--print]
                            capture the agent layout now (it is also captured
-                           continuously; --refresh re-resolves session ids)
+                           continuously)
 seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]
                            rebuild that layout after a reboot, each window
                            resuming its own conversation
@@ -180,10 +181,15 @@ Source layout under `src/`:
     transitions, `notify_transition()`, the done-ack on focus, the snapshot
     offer.
   - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
+- **`src/hook.rs`** — the agent's lifecycle hooks (§6): `inject_settings()`
+  (the one merged `--settings` `run` hands a hook-capable agent) and `run()`,
+  the hidden `__hook` command that records each event in `.agent`.
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
-  sidecar paths (`Files`), the typed `Meta` / `StateRecord`, `list()` (live,
-  never deletes) / `reap()` (deletes the dead) / `by_child_pid()`, and the
-  locked `update_meta()` / `update_state()`; tags (`valid_tag()`,
+  sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
+  `list()` (live, never deletes) / `reap()` (deletes the dead) /
+  `by_child_pid()` / `enclosing_session()` (the caller's session, by `/proc`
+  ancestry), the locked `update_meta()` / `update_state()` / `update_agent()`,
+  and `in_turn()`, the one definition of "this agent is mid-turn"; tags (`valid_tag()`,
   `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
   `backfill_tags()`) and `resolve_target()`, the one resolver every command
   that addresses an agent uses. No other module builds a `<pid>.*` path or
@@ -222,7 +228,9 @@ Source layout under `src/`:
   replaces the bundled file whole (an unparseable override is an error, not a
   silent default); unknown agents get the generic state-only adapter. Bundled:
   `claude`, and a conservative `codex` (no hooks, screen turns) until its
-  `notify` hook is verified. Nothing consumes it yet — spawn/send will.
+  `notify` hook is verified. `run` reads it to decide on hook injection
+  (`settings_flag`, `hookless_flags`, `identity`/`turns`); spawn/send will
+  read the rest.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -230,8 +238,9 @@ Source layout under `src/`:
 - **`src/clock.rs`** — `unix_now()`, the unit of every stored timestamp.
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 - **`src/snapshot.rs`** — the reboot snapshot, layout capture/restore only:
-  `capture()`, layout emission with i3 swallow criteria,
-  `resolve_session_ids()`, `restore_cmd()` (which launches through `launch`).
+  `capture()` (conversation ids read from each session's `.agent`), layout
+  emission with i3 swallow criteria, `restore_cmd()` (which launches through
+  `launch`).
 
 ### 1. `seagents run` — the transparent pty-tee launcher
 
@@ -308,18 +317,34 @@ Per session, keyed by the wrapper's pid:
     "window_id": 30728026,          // X11 id (survives an i3 restart)
     "tag": "homelab-3f9a",          // the agent's name (see Tags, below)
     "parent": null,                 // spawner's tag; depth = its depth + 1
-    "depth": 0,
-    "session_id": "5c603939-…",     // the agent's own conversation, for restore
-    "session_id_source": "proc"     // how it was learned: "proc" | "title"
+    "depth": 0
   }
   ```
-  `session_id` is filled in lazily by the snapshot capture (see §6), not by
-  `run` — nothing at launch time knows it yet. Parsed as a typed record with
+  `argv` is the user's command line — never what `run` injected (§6) —
+  because `restore` relaunches from it. Parsed as a typed record with
   every field but `wrapper_pid` optional, and fields this binary doesn't know
   carried through untouched — live wrappers outlast a reinstall, so a `.meta`
   may come from an older or newer seagents than the one reading it.
-- **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`
-  or `.state`.
+- **`<wrapper_pid>.agent`** — what the agent reports about itself, written by
+  `__hook` from its own lifecycle events (§6); absent for agents without
+  hooks:
+  ```json
+  {
+    "transcript_path": "/home/me/.claude-work/projects/…/1f81….jsonl",
+    "session_id": "1f81…",          // the conversation, for restore's --resume
+    "source": "startup",            // startup | resume | clear | compact
+    "permission_mode": "bypassPermissions",
+    "stops": 7,                     // +1 at every Stop; never resets
+    "prompted_at": 1783468390,      // last UserPromptSubmit
+    "stopped_at": 1783468399,       // last Stop
+    "last_message": "…",            // the last turn's final assistant text
+    "updated": 1783468399
+  }
+  ```
+  Its own file because it churns on every prompt and turn end while `.meta`
+  almost never changes.
+- **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`,
+  `.state` or `.agent`.
 - **`tags.lock`** — one for the whole cache; see Tags.
 
 **Tags.** Every agent has one: its name for every command (`focus reviewer`),
@@ -337,14 +362,14 @@ tag may be one of those — that is how `restore` relaunches an agent under its
 old name. `parent`/`depth` are lineage (0 without a parent); nothing enforces
 anything with them yet.
 
-**Every sidecar goes through `registry.rs`**, because `.meta` and `.state` have
-writers in several processes (`.meta`: the wrapper at launch, window healing
-from its input pump *and* from `focus`/the HUD, conversation ids from whichever
-process runs a snapshot capture). Each change is `flock` on `.lock` → read →
+**Every sidecar goes through `registry.rs`**, because each has writers in
+several processes (`.meta`: the wrapper at launch, window healing from its
+input pump *and* from `focus`/the HUD, tag backfill from whichever process runs
+a snapshot capture; `.agent`: each `__hook` the agent runs). Each change is `flock` on `.lock` → read →
 mutate the typed record → write a pid-suffixed tmp file → rename over → unlock;
 readers take no lock. tmp+rename is what stops a reader seeing torn JSON (a row
 vanishing for a tick); only the lock stops two writers dropping each other's
-update (a healed con_id or a resolved session id silently lost).
+update (two window heals landing at once, one silently lost).
 
 Sessions self-reap: `status::collect()` (so `status` and the HUD) calls
 `registry::reap()`, which deletes every file of a session whose child process is
@@ -545,29 +570,68 @@ many sessions. (Capture guards against that anyway: when two live sessions name
 one window, the earliest launch keeps it and the rest are reported unplaced,
 which the input-driven re-capture heals on the next keystroke.)
 
-**A window must know which conversation it was.** Nothing in a `.meta` records
-it, so `resolve_session_ids()` recovers it from two sources, strongest first,
-and caches the answer into the `.meta` so the pass is a no-op afterwards:
+**A window must know which conversation it was.** The agent says so itself.
+For an agent whose adapter takes hooks (Claude Code: `settings_flag`,
+`identity`/`turns = "hook"`), `run` hands the child one extra `--settings`
+carrying three hooks — `SessionStart`, `UserPromptSubmit`, `Stop` — each
+running `'<abs path of this binary>' __hook` (absolute, so the agent's `PATH`
+doesn't matter). Every payload carries `session_id` and `transcript_path`;
+`__hook` finds its session by walking its own `/proc` ancestry (hook sh →
+claude → `__lead` → wrapper) to the first pid with a live `.meta`
+(`registry::enclosing_session`), and records the event in `.agent`. The
+snapshot capture copies `.agent`'s `session_id` into the layout, and `restore`
+resumes it. Because `/clear` (and compact, and a resume) fires `SessionStart`
+again with the new conversation, the id is always the one the window is
+writing *now* — the stale-after-`/clear` problem the old resolvers had is gone,
+and so is their `~/.claude/projects` hardcoding, which pointed at the wrong
+directory under `CLAUDE_CONFIG_DIR=~/.claude-work` (the hook reports the real
+path).
 
-1. **`/proc` file descriptors** — a running Claude holds a directory fd on
-   `/tmp/claude-<uid>/<project-slug>/<session-uuid>/`, validated against the
-   transcript actually existing. Exact, but only present once a session has used
-   that scratch area: 14 of 20 live sessions on the dev machine.
-2. **Window title ↔ transcript `aiTitle`** — Claude writes the conversation's
-   generated title into both the transcript and the terminal's title, so a
-   transcript in the same project carrying the window's title is almost
-   certainly the one. The title comes from the **i3 tree**, not from re-deriving
-   the last OSC title out of the tee (two live sessions here have a stray `;`
-   title later in the stream than their real one). Accepted only when it
-   identifies exactly one *unclaimed* transcript whose mtime is at least the
-   wrapper's start time — two windows in a project can show the same title (a
-   resumed session and its parent), and the wrong conversation is worse than
-   none.
+Details that matter:
 
-Together: 17 of the dev machine's 19 placed agents resolved, the two refusals
-being a genuinely ambiguous duplicate title and a session still showing the
-default "Claude Code". **Matching on transcript mtime was tried and rejected —
-it was wrong 3 times out of 3.** It is not a fallback, it is a coin flip.
+- **One merged `--settings`, never a second one.** Verified 2026-09-28:
+  repeated `--settings` flags *replace* each other (only the last one's hooks
+  run), while settings-*file* hooks and flag hooks coexist. So the user's
+  settings files are left alone (seagents never writes the user's config), and
+  a `--settings X` the user passed (inline JSON or a path, `--settings X` or
+  `--settings=X`) is loaded, has our three entries appended to its
+  `hooks.<Event>` arrays, and goes back as ONE inline flag in its place. An X
+  that can't be read or isn't a settings object passes through untouched and
+  the agent runs without hooks, with a warning on stderr. Our flag goes right
+  after `argv[0]`: anything after a `--` is the agent's positional text.
+- **`claude --bare` skips hooks**, so nothing is injected under it (the
+  adapter's `hookless_flags`); `.agent` stays empty.
+- **`.meta` `argv` is the user's argv**, without the injected flag: `restore`
+  relaunches from it, and a recorded `--settings` would stack on every restore.
+- **`__hook` must never change the agent**: it always exits 0 (a `Stop` hook
+  exiting 2 *keeps Claude from stopping*), prints nothing on stdout (hook
+  stdout can be read as a decision), catches its own panics, and parses any
+  arguments without error. It is one ancestry walk, one small read and one
+  rename — no i3, no detection. Failures go to `~/.cache/seagents/hook.log`
+  only under `SEAGENTS_DEBUG`. The wrapper forks the agent before its `.meta`
+  exists, so a miss is retried for up to ½ s.
+- **Every event refreshes identity**, not only `SessionStart`: a lost
+  `SessionStart` heals at the next prompt. `source` comes only from
+  `SessionStart`.
+
+**The turn ledger** in `.agent` counts `Stop`s; it does not pair prompts with
+turns (verified 2026-09-29: a message typed mid-turn fires `UserPromptSubmit`
+reusing the running turn's `prompt_id` and is answered by a second `Stop` with a
+fresh one; an Esc-interrupted turn fires `UserPromptSubmit` and no `Stop` at
+all). `registry::in_turn()` is the one definition of "mid-turn": prompted after
+the last `Stop`, and `.state` not `idle` since that prompt — the second clause
+is what ends an interrupted turn. `status --json` reports it with `stops`;
+`wait`/`send` will share it. Caveat, measured live on 2.1.284: while Claude
+streams a plain-text answer it shows no spinner, and the detector calls that
+screen `idle` — so `in_turn` can read false mid-answer, and a turn interrupted
+before the detector ever saw it `working` stays `in_turn` until the next prompt
+or `Stop`. `stops` itself is exact.
+
+**One-time cost of the hook cutover.** Wrappers started by a pre-hook binary
+have no `.agent` (and the conversation id an old capture cached in their
+`.meta` is no longer read), so a reboot before they are restarted restores them
+*without* `--resume` — fresh conversations in the right windows. Restart those
+agents once; every agent launched since carries its hooks.
 
 `restore` is safe to run twice and safe to run when only half the agents died:
 a restored agent comes back under its captured tag, so **a captured agent whose
@@ -631,13 +695,6 @@ and restore) once; after that every agent is tagged at launch.
   a container that already holds live windows. The post-reboot case (nothing
   alive) is exact — verified by `tools/test-restore.sh`. Restoring alongside
   survivors puts the missing windows at workspace level instead, and says so.
-- **A `/clear` invalidates a cached `session_id`.** Both resolvers describe the
-  transcript a session is writing *now*; `/clear` starts a new one under a new
-  id, and the cached value in the `.meta` goes stale until `snapshot --refresh`.
-  The durable fix is Claude's `SessionStart` hook (see ORCHESTRATION-SPEC),
-  which reports the id on every identity change — `--resume`, `/clear`, compact.
-  Deliberately not wired in here: it means injecting `--settings` into every
-  `claude` launch, which is the orchestration milestone's call to make.
 - **Only `terminator`, `alacritty` and `alacritty-daemon` have built-in launch
   recipes.** All three are verified by `tools/test-restore.sh`.
   `alacritty-daemon` needs a daemon already running (`alacritty --daemon`) and
@@ -687,10 +744,6 @@ and restore) once; after that every agent is tagged at launch.
 - ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
   locks AGPL-3.0-or-later; LICENSE file added.
 - Sweep **orphan `.raw`** files that have no `.meta` (only pre-`meta`-era leftovers).
-- **Wire the `SessionStart` hook** so `session_id` is exact for every new
-  session (and survives `/clear`) instead of being recovered after the fact —
-  ORCHESTRATION-SPEC already specs it; today's two resolvers are the bridge for
-  sessions that predate it.
 - Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once
   it has been through a real reboot, or keep running it by hand.
 - Optional: **eww** port of the HUD for a prettier always-on widget.

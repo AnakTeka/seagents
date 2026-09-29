@@ -782,6 +782,8 @@ mod tests {
             tag: format!("{dir}-0000"),
             parent: None,
             depth: 0,
+            agent: Default::default(),
+            in_turn: false,
         }
     }
 

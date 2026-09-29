@@ -28,9 +28,10 @@
 //!    WM_CLASS instance for most others — so the stored layout keeps the tag
 //!    and the criterion is built at restore time. See [`WindowMatch`].
 //!
-//! 3. **A window must know which conversation it was.** See
-//!    [`resolve_session_ids`] — the hard half, because nothing in a `.meta`
-//!    records it today.
+//! 3. **A window must know which conversation it was.** The agent says so
+//!    itself: the `SessionStart` hook `run` injects records the conversation
+//!    id in the session's `.agent` (again after every `/clear`), and the
+//!    capture copies it into the layout for `restore` to resume.
 //!
 //! The layout JSON is emitted here rather than by shelling to `i3-save-tree`,
 //! and installing that tool would not change it. It dumps a workspace whole —
@@ -52,7 +53,7 @@ use serde_json::{json, Value};
 
 use crate::i3;
 use crate::launch::{self, WindowMatch};
-use crate::registry::{Files, Session};
+use crate::registry::Session;
 
 /// One layout write per this many seconds, across all wrappers. Short enough
 /// that moving a window between workspaces is captured before you walk away,
@@ -158,253 +159,15 @@ fn consume_prev_boot(dir: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Which conversation is this window running?
-// ---------------------------------------------------------------------------
-
-/// `~/.claude/projects/<slug>` for a working directory. Claude Code slugs a
-/// path by replacing every non-alphanumeric character with `-`, so
-/// `/home/me/.config/i3` becomes `-home-me--config-i3`.
-fn claude_project_dir(cwd: &str) -> Option<PathBuf> {
-    let slug: String = cwd
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude/projects").join(slug))
-}
-
-fn is_uuid(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 36
-        && b.iter().enumerate().all(|(i, c)| match i {
-            8 | 13 | 18 | 23 => *c == b'-',
-            _ => c.is_ascii_hexdigit(),
-        })
-}
-
-/// Pull conversation ids out of a running Claude's open file descriptors.
-///
-/// Claude keeps a directory fd on its per-session scratch area,
-/// `/tmp/claude-<uid>/<project-slug>/<session-uuid>/…`, so the id is readable
-/// straight off `/proc`. **Exact when present, but not always present** — the
-/// fd only exists once a session has used the scratch area (background tasks,
-/// subagents), which on the dev machine covered 14 of 20 live sessions.
-fn session_id_from_proc(child_pid: u64, project_dir: &Path) -> Option<String> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|p| p.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        // The agent is a child of the `__lead` anchor we recorded.
-        if crate::procfs::parent_pid(pid) != Some(child_pid) {
-            continue;
-        }
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            for part in target.iter().filter_map(|p| p.to_str()) {
-                // Validated against the session's own project dir: a bare
-                // uuid-shaped path component proves nothing on its own.
-                if is_uuid(part) && project_dir.join(format!("{part}.jsonl")).exists() {
-                    found.push(part.to_string());
-                }
-            }
-        }
-    }
-    found.sort();
-    found.dedup();
-    // Two different conversations behind one pid would mean we guessed wrong
-    // about what the fd is; refuse rather than pick.
-    if found.len() == 1 {
-        found.pop()
-    } else {
-        None
-    }
-}
-
-/// Every `aiTitle` recorded in a transcript. Claude writes the conversation's
-/// generated title into the transcript *and* into the terminal's OSC title, so
-/// this is what lets us match a live window to its conversation.
-///
-/// Only the tail is read: the title is re-stamped as the conversation grows
-/// (a 4.8 MB transcript here carries one every ~35 KB), so the current one is
-/// always near the end, and transcripts run to tens of megabytes.
-fn transcript_titles(path: &Path) -> Vec<String> {
-    let Some(buf) = crate::status::read_tail(path, 2 * 1024 * 1024) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in buf.split(|b| *b == b'\n') {
-        // Cheap reject before paying for a JSON parse.
-        if !line.windows(7).any(|w| w == b"aiTitle") {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_slice::<Value>(line) {
-            if let Some(t) = v["aiTitle"].as_str() {
-                out.push(t.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Persist a resolved conversation id into the session's `.meta`, so later
-/// captures skip the (comparatively expensive) resolution entirely.
-fn record_session_id(files: &Files, session_id: &str, source: &str) {
-    crate::registry::update_meta(files, |meta| {
-        if meta.session_id.as_deref() != Some(session_id) {
-            meta.session_id = Some(session_id.to_string());
-            meta.session_id_source = Some(source.to_string());
-        }
-    });
-}
-
-/// Work out which conversation each live Claude window is running.
-///
-/// Two sources, strongest first — and the result is cached into the `.meta`,
-/// so this whole pass is a no-op on every capture after the first.
-///
-/// 1. **`/proc` file descriptors** — exact, but only present for sessions that
-///    have touched their scratch area.
-/// 2. **Window title ↔ transcript `aiTitle`** — the window is showing the
-///    conversation's own generated title, so a transcript in the same project
-///    that carries that title is almost certainly the one. Accepted **only**
-///    when it identifies exactly one *unclaimed* transcript: two windows in a
-///    project can show the same title (a resumed session and its parent), and
-///    the wrong conversation is worse than none. Candidates are limited to
-///    transcripts appended to since the wrapper started, which is what a live
-///    session must have been doing.
-///
-///    The title comes from the **i3 tree**, not from re-deriving the last OSC
-///    title out of the teed stream: the tree holds what the terminal is
-///    actually displaying, it costs nothing extra (the capture reads the tree
-///    anyway), and the stream's last title sequence is not reliably the real
-///    one — two live sessions here have a stray `;` title later in the tee
-///    than their real one.
-///
-/// Measured on the dev machine's 20 live sessions: 14 exact from `/proc`, the
-/// remaining 6 title-matched, with the two genuinely ambiguous pairs correctly
-/// refused. (Matching on file mtime instead was tried and was wrong 3 times
-/// out of 3 — it is not a fallback, it is a coin flip.)
-///
-/// Neither source survives `/clear`, which starts a new transcript under a new
-/// id. The durable fix is Claude's `SessionStart` hook (ORCHESTRATION-SPEC),
-/// which reports the id — including after `/clear` — for sessions launched
-/// once that lands. `--refresh` re-resolves everything in the meantime.
-fn resolve_session_ids(
-    sessions: &mut [Session],
-    titles: &HashMap<u64, String>,
-    refresh: bool,
-) {
-    if refresh {
-        for s in sessions.iter_mut() {
-            s.meta.session_id = None;
-        }
-    }
-
-    // Project dir per session, and a set of ids already spoken for so the
-    // title pass can never hand one conversation to two windows.
-    let mut claimed: HashSet<String> = HashSet::new();
-    let mut project: HashMap<u64, PathBuf> = HashMap::new();
-    for s in sessions.iter() {
-        if let Some(p) = claude_project_dir(&s.meta.cwd) {
-            project.insert(s.meta.wrapper_pid, p);
-        }
-        if let Some(id) = &s.meta.session_id {
-            claimed.insert(id.clone());
-        }
-    }
-
-    // Pass 1: exact, from /proc.
-    for s in sessions.iter_mut() {
-        if s.meta.session_id.is_some() || s.meta.agent() != "claude" {
-            continue;
-        }
-        let Some(dir) = project.get(&s.meta.wrapper_pid) else {
-            continue;
-        };
-        if let Some(id) = session_id_from_proc(s.child_pid(), dir) {
-            if claimed.insert(id.clone()) {
-                record_session_id(&s.files, &id, "proc");
-                s.meta.session_id = Some(id);
-            }
-        }
-    }
-
-    // Pass 2: title match, over what pass 1 left unclaimed.
-    for s in sessions.iter_mut() {
-        if s.meta.session_id.is_some() || s.meta.agent() != "claude" {
-            continue;
-        }
-        let Some(dir) = project.get(&s.meta.wrapper_pid) else {
-            continue;
-        };
-        let Some(title) = titles.get(&s.meta.wrapper_pid) else {
-            continue;
-        };
-        let title = crate::status::strip_title_glyph(title).to_string();
-        if title.is_empty() {
-            continue;
-        }
-        let mut hits: Vec<String> = Vec::new();
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if claimed.contains(id) {
-                continue;
-            }
-            // A live session has been appending since its wrapper started.
-            let recent = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() >= s.meta.started)
-                .unwrap_or(false);
-            if !recent {
-                continue;
-            }
-            if transcript_titles(&path).iter().any(|t| *t == title) {
-                hits.push(id.to_string());
-            }
-        }
-        if hits.len() == 1 {
-            let id = hits.pop().unwrap();
-            claimed.insert(id.clone());
-            record_session_id(&s.files, &id, "title");
-            s.meta.session_id = Some(id);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The i3 tree
 // ---------------------------------------------------------------------------
 
-/// Where a window sits: the workspace it is on, the output that workspace is
-/// displayed on, and the title it is currently showing.
+/// Where a window sits: the workspace it is on and the output that workspace
+/// is displayed on.
 #[derive(Clone)]
 struct Place {
     workspace: String,
     output: String,
-    title: String,
     /// WM_CLASS general class — which terminal this agent is actually running
     /// in, so `restore` can put it back in the same one.
     class: String,
@@ -444,12 +207,6 @@ fn walk_index(
                 Place {
                     workspace: ws.to_string(),
                     output: output.unwrap_or_default().to_string(),
-                    // window_properties.title is what the terminal reports to
-                    // X11 — i.e. Claude's own OSC title, already parsed for us.
-                    title: node["window_properties"]["title"]
-                        .as_str()
-                        .unwrap_or(name)
-                        .to_string(),
                     class: node["window_properties"]["class"]
                         .as_str()
                         .unwrap_or_default()
@@ -710,7 +467,7 @@ fn capture_due() -> bool {
 /// pays for a capture per interval and the rest return after a single `stat`.
 pub(crate) fn maybe_capture() {
     if capture_due() {
-        let _ = capture(false);
+        let _ = capture();
     }
 }
 
@@ -719,20 +476,19 @@ pub(crate) fn maybe_capture() {
 pub(crate) fn maybe_capture_async() {
     if capture_due() {
         std::thread::spawn(|| {
-            let _ = capture(false);
+            let _ = capture();
         });
     }
 }
 
 /// Build the snapshot and write it atomically. Returns it for callers that
 /// want to report on what was captured.
-fn capture(refresh: bool) -> Result<Value, String> {
+fn capture() -> Result<Value, String> {
     let mut sessions = crate::registry::list();
     let tree = i3::tree().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
     let (places, by_xid) = index_tree(&tree);
 
-    // Locate every agent on screen first: the window it lives in supplies the
-    // title that identifies its conversation.
+    // Locate every agent on screen.
     //
     // Two sessions can name the same window — an agent launched while its own
     // terminal was still mapping records whatever was focused instead, and
@@ -766,12 +522,13 @@ fn capture(refresh: bool) -> Result<Value, String> {
         owner.insert(con_id, (s.meta.started, s.meta.wrapper_pid));
         located.insert(s.meta.wrapper_pid, con_id);
     }
-    let titles: HashMap<u64, String> = located
+    // Which conversation each agent is running, as its own SessionStart hook
+    // reported it. None for agents without hooks and for wrappers started by
+    // a pre-hook binary: those restore fresh, without `--resume`.
+    let session_ids: HashMap<u64, Option<String>> = sessions
         .iter()
-        .map(|(wrapper, con_id)| (*wrapper, places[con_id].title.clone()))
+        .map(|s| (s.meta.wrapper_pid, crate::registry::read_agent(&s.files).session_id))
         .collect();
-
-    resolve_session_ids(&mut sessions, &titles, refresh);
     // A placeholder needs a name; sessions from a pre-tag wrapper get theirs
     // now, in their `.meta`, so the restore that reads it back knows them.
     crate::registry::backfill_tags(&mut sessions, &captured_tags());
@@ -794,7 +551,7 @@ fn capture(refresh: bool) -> Result<Value, String> {
                 "cwd": s.meta.cwd,
                 "dir": s.meta.dir(),
                 "argv": s.meta.argv,
-                "session_id": s.meta.session_id,
+                "session_id": session_ids[&s.meta.wrapper_pid],
             }));
             continue;
         };
@@ -825,7 +582,7 @@ fn capture(refresh: bool) -> Result<Value, String> {
                     "cwd": s.meta.cwd,
                     "dir": s.meta.dir(),
                     "argv": s.meta.argv,
-                    "session_id": s.meta.session_id,
+                    "session_id": session_ids[&s.meta.wrapper_pid],
                     "terminal_class": located
                         .get(&s.meta.wrapper_pid)
                         .map(|c| places[c].class.clone()),
@@ -866,9 +623,9 @@ fn workspace_sort_key(name: &str) -> (u8, u64, String) {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// `seagents snapshot [--refresh] [--print]` — force a capture now.
-pub fn snapshot_cmd(refresh: bool, print_json: bool) -> i32 {
-    match capture(refresh) {
+/// `seagents snapshot [--print]` — force a capture now.
+pub fn snapshot_cmd(print_json: bool) -> i32 {
+    match capture() {
         Ok(snapshot) => {
             let dir = layout_dir();
             // The capture just made is not what the next `restore` reads while
@@ -1176,6 +933,15 @@ fn argv_of(agent: &Value) -> Vec<String> {
         .unwrap_or_else(|| vec!["claude".to_string()])
 }
 
+fn is_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// An argv with any session-selection flag removed, so a restored window can
 /// be pointed at the conversation we captured instead of whichever one the
 /// agent was originally launched on.
@@ -1262,14 +1028,6 @@ fn place_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slugs_a_working_directory_the_way_claude_does() {
-        let dir = claude_project_dir("/home/me/.config/i3").unwrap();
-        assert_eq!(dir.file_name().unwrap(), "-home-me--config-i3");
-        let dir = claude_project_dir("/home/me/projects/x_y").unwrap();
-        assert_eq!(dir.file_name().unwrap(), "-home-me-projects-x-y");
-    }
 
     #[test]
     fn recognizes_session_ids() {

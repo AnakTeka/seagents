@@ -68,9 +68,9 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
     // under the `__lead` anchor (see `lead()`): spawned directly it would be a
     // lone, orphaned process group whose Ctrl+Z SIGTSTP the kernel discards.
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
-    let mut builder = CommandBuilder::new(exe);
+    let mut builder = CommandBuilder::new(&exe);
     builder.arg("__lead");
-    for arg in &cmd {
+    for arg in child_argv(&cmd, &exe, &cwd) {
         builder.arg(arg);
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -141,6 +141,28 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, parent: Option<String>)
         let _ = crossterm::terminal::disable_raw_mode();
     }
     code
+}
+
+/// What the agent is actually started with: the user's `cmd`, plus our hooks
+/// when its adapter takes them. Only the child sees this; `.meta` records
+/// `cmd` itself, because `restore` relaunches from the recorded argv and
+/// would otherwise stack a second `--settings` on every restore.
+fn child_argv(cmd: &[String], exe: &Path, cwd: &Path) -> Vec<String> {
+    let adapter = match crate::adapter::for_command(&cmd[0]) {
+        Ok(a) => a,
+        Err(e) => {
+            // The agent still starts — a broken override must not take every
+            // `claude` launch down with it — just without anything the
+            // adapter would have added.
+            eprintln!("seagents: agent adapter: {e}; launching without hooks");
+            return cmd.to_vec();
+        }
+    };
+    let (argv, warning) = crate::hook::inject_settings(cmd, &adapter, exe, cwd);
+    if let Some(w) = warning {
+        eprintln!("seagents: {w}");
+    }
+    argv
 }
 
 /// Capture the i3 window this agent lives in, as (con_id, X window id).
@@ -309,4 +331,31 @@ fn write_meta(
         ..registry::Meta::default()
     };
     claim.create_meta(files, meta);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_child_gets_the_hooks_and_the_recorded_argv_stays_the_users() {
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cmd: Vec<String> = ["claude", "--model", "haiku", "--", "say hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let before = cmd.clone();
+        let child = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"));
+        assert_eq!(child[1], "--settings");
+        assert!(child[2].contains("'/x/seagents' __hook"));
+        assert_eq!(&child[3..], &cmd[1..]);
+        // `cmd` is what `write_meta` records; building the child's argv must
+        // not have touched it.
+        assert_eq!(cmd, before);
+        // A tool with no hook support is started exactly as typed.
+        let bash = vec!["bash".to_string()];
+        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/")), bash);
+    }
 }

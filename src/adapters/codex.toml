@@ -7,6 +7,7 @@
 # `codex "<prompt>"` starts an interactive session seeded with the prompt.
 seed_prompt      = ["{prompt}"]
 settings_flag    = ""
+hookless_flags   = []
 permission_flag  = ""
 permission_modes = []
 identity         = "none"

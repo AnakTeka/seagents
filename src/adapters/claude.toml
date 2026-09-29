@@ -9,6 +9,8 @@ seed_prompt      = ["--", "{prompt}"]
 # How hooks are injected. Repeated --settings flags replace each other
 # (verified 2026-09-28), so `run` merges into one.
 settings_flag    = "--settings"
+# `--bare` skips hooks, so nothing is injected under it.
+hookless_flags   = ["--bare"]
 permission_flag  = "--permission-mode"
 # Least to most privileged.
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]

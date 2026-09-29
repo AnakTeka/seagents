@@ -97,6 +97,11 @@ pub(crate) struct Session {
     /// Its spawner's tag, and its spawn generation (0 without a parent).
     pub(crate) parent: Option<String>,
     pub(crate) depth: u32,
+    /// What the agent reports about itself (conversation, turn ledger); the
+    /// empty record for an agent without hooks.
+    pub(crate) agent: crate::registry::AgentRecord,
+    /// [`crate::registry::in_turn`], as of this read.
+    pub(crate) in_turn: bool,
 }
 
 /// The three questions the list can be ordered to answer. Also the value of
@@ -214,6 +219,10 @@ pub fn print_json(sort: Sort) -> i32 {
                 "tag": s.tag,
                 "parent": s.parent,
                 "depth": s.depth,
+                "stops": s.agent.stops,
+                "in_turn": s.in_turn,
+                "transcript_path": s.agent.transcript_path,
+                "session_id": s.agent.session_id,
             })
         })
         .collect();
@@ -254,6 +263,8 @@ fn read_session(live: &crate::registry::Session) -> Session {
 
     let now = crate::clock::unix_now();
     let record = observe_state(&live.files, state, now, false);
+    let agent = crate::registry::read_agent(&live.files);
+    let in_turn = crate::registry::in_turn(&agent, Some(&record));
     // Present unacknowledged completions as their own state.
     let state = if state == State::Idle && !record.seen {
         State::Done
@@ -273,6 +284,8 @@ fn read_session(live: &crate::registry::Session) -> Session {
         tag: meta.tag.clone(),
         parent: meta.parent.clone(),
         depth: meta.depth,
+        agent,
+        in_turn,
     }
 }
 
