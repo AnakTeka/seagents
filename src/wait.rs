@@ -36,8 +36,9 @@ pub(crate) enum For {
 enum Reason {
     /// `stops` passed the baseline. Exit 0.
     Turn,
-    /// No baseline given and the agent is not in a turn: there is nothing
-    /// to wait for, and the last turn's result is returned. Exit 0.
+    /// No baseline given, and the agent is not in a turn, at a gate or
+    /// gone: there is nothing to wait for, and the last turn's result is
+    /// returned. Exit 0.
     Idle,
     /// Waiting on a human (a permission prompt, the folder-trust dialog, …).
     /// Exit 3.
@@ -85,16 +86,21 @@ struct Seen<'a> {
 
 /// The whole decision, given one look: Some(reason) to return now.
 ///
+/// `after` is the turn waited on: `stops` must pass it. None when there is
+/// no turn to wait for (no `--after`, and the agent was not in a turn) —
+/// then the agent's condition is the answer at once, by the same rules.
+///
 /// Order matters. A finished turn wins over everything (its result is what
 /// was asked for, even if the agent has since exited or hit a gate); then
 /// exit (a dead agent's last `.state` may still say blocked); then a gate;
-/// then an interrupt — a turn opened since the last `Stop` (so the one after
-/// N, as `stops` is still N) that is no longer running.
-fn decide(what: For, after: u64, seen: &Seen) -> Option<Reason> {
+/// then, with nothing to wait for, idle; then an interrupt — a turn opened
+/// since the last `Stop` (so the one after N, as `stops` is still N) that is
+/// no longer running.
+fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
     if what == For::Exit {
         return (!seen.alive).then_some(Reason::Exit);
     }
-    if seen.agent.stops > after {
+    if after.is_some_and(|n| seen.agent.stops > n) {
         return Some(Reason::Turn);
     }
     if !seen.alive {
@@ -102,6 +108,9 @@ fn decide(what: For, after: u64, seen: &Seen) -> Option<Reason> {
     }
     if seen.state.is_some_and(|s| s.state == "blocked") {
         return Some(Reason::Blocked);
+    }
+    if after.is_none() {
+        return Some(Reason::Idle);
     }
     let opened = seen.agent.prompted_at > seen.agent.stopped_at;
     (opened && !seen.in_turn).then_some(Reason::Interrupted)
@@ -165,8 +174,7 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
     };
 
     let (agent, state, alive, in_turn) = look();
-    let baseline = match (what, after) {
-        (For::Exit, _) => 0,
+    let after = match (what, after) {
         (For::Turn, Some(n)) if n > agent.stops => {
             eprintln!(
                 "seagents wait: --after {n} is ahead of {}'s ledger (stops = {}); a restored agent \
@@ -175,11 +183,8 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
             );
             return 1;
         }
-        (For::Turn, Some(n)) => n,
-        (For::Turn, None) if in_turn => agent.stops,
-        (For::Turn, None) => {
-            return report(&session.meta.tag, Reason::Idle, &ledger, &agent, state.as_ref(), in_turn);
-        }
+        (For::Turn, None) => in_turn.then_some(agent.stops),
+        (_, after) => after,
     };
 
     let deadline = Instant::now() + timeout;
@@ -192,7 +197,7 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
             alive: *alive,
             in_turn: *in_turn,
         };
-        let reason = decide(what, baseline, &now)
+        let reason = decide(what, after, &now)
             .or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
         if let Some(reason) = reason {
             return report(&session.meta.tag, reason, &ledger, agent, state.as_ref(), *in_turn);
@@ -245,45 +250,58 @@ mod tests {
         }
     }
 
-    fn decide_on(what: For, after: u64, a: &AgentRecord, s: Option<&str>, alive: bool, in_turn: bool) -> Option<Reason> {
+    fn decide_on(what: For, after: Option<u64>, a: &AgentRecord, s: Option<&str>, alive: bool, in_turn: bool) -> Option<Reason> {
         let st = s.map(state);
         decide(what, after, &Seen { agent: a, state: st.as_ref(), alive, in_turn })
     }
 
+    /// Every reason path, one row each: (what, after, ledger, .state, alive,
+    /// in_turn) → the decision. `after: None` is a plain `wait` on an agent
+    /// that was not in a turn.
     #[test]
-    fn a_turn_ends_when_stops_passes_the_baseline_and_not_before() {
-        // Just spawned: no prompt yet, the screen idle — keep waiting.
+    fn the_decision_table() {
+        use Reason::*;
         let fresh = ledger(0, None, None);
-        assert_eq!(decide_on(For::Turn, 0, &fresh, Some("idle"), true, false), None);
-        // The seed submitted and running.
-        let running = ledger(0, Some(10), None);
-        assert_eq!(decide_on(For::Turn, 0, &running, Some("working"), true, true), None);
-        // Stopped: the turn after 0 ended — even if it has exited since.
-        let done = ledger(1, Some(10), Some(20));
-        assert_eq!(decide_on(For::Turn, 0, &done, Some("idle"), true, false), Some(Reason::Turn));
-        assert_eq!(decide_on(For::Turn, 0, &done, None, false, false), Some(Reason::Turn));
-        // The same ledger against its own count as baseline: nothing yet.
-        assert_eq!(decide_on(For::Turn, 1, &done, Some("idle"), true, false), None);
-    }
-
-    #[test]
-    fn gates_exits_and_interrupts_end_a_wait_early() {
         let running = ledger(2, Some(30), Some(20));
-        assert_eq!(decide_on(For::Turn, 2, &running, Some("blocked"), true, true), Some(Reason::Blocked));
-        // A dead agent's stale gate is not the news.
-        assert_eq!(decide_on(For::Turn, 2, &running, Some("blocked"), false, true), Some(Reason::Exit));
-        // Opened after the last Stop and no longer running: Esc.
-        assert_eq!(decide_on(For::Turn, 2, &running, Some("idle"), true, false), Some(Reason::Interrupted));
-        // Not opened (idle since its last Stop): nothing to report yet.
-        let idle = ledger(2, Some(10), Some(20));
-        assert_eq!(decide_on(For::Turn, 2, &idle, Some("idle"), true, false), None);
-    }
-
-    #[test]
-    fn waiting_for_exit_ignores_everything_else() {
-        let done = ledger(5, Some(10), Some(20));
-        assert_eq!(decide_on(For::Exit, 0, &done, Some("blocked"), true, false), None);
-        assert_eq!(decide_on(For::Exit, 0, &done, Some("idle"), false, false), Some(Reason::Exit));
+        let stopped = ledger(2, Some(10), Some(20));
+        let done = ledger(3, Some(30), Some(40));
+        #[rustfmt::skip]
+        let table: &[(For, Option<u64>, &AgentRecord, Option<&str>, bool, bool, Option<Reason>)] = &[
+            // Just spawned: no prompt yet, the screen idle — keep waiting.
+            (For::Turn, Some(0), &fresh, Some("idle"), true, false, None),
+            // The turn after N is running (the screen may say anything).
+            (For::Turn, Some(2), &running, Some("working"), true, true, None),
+            (For::Turn, Some(2), &running, Some("idle"), true, true, None),
+            // It ended — even if the agent has since hit a gate or exited.
+            (For::Turn, Some(2), &done, Some("idle"), true, false, Some(Turn)),
+            (For::Turn, Some(2), &done, Some("blocked"), true, false, Some(Turn)),
+            (For::Turn, Some(2), &done, None, false, false, Some(Turn)),
+            // The same ledger against its own count: nothing yet.
+            (For::Turn, Some(3), &done, Some("idle"), true, false, None),
+            // A gate mid-turn, and the stale gate of a dead agent.
+            (For::Turn, Some(2), &running, Some("blocked"), true, true, Some(Blocked)),
+            (For::Turn, Some(2), &running, Some("blocked"), false, true, Some(Exit)),
+            // Opened after the last Stop and no longer running: Esc.
+            (For::Turn, Some(2), &running, Some("idle"), true, false, Some(Interrupted)),
+            // Not opened since its last Stop: nothing to report yet.
+            (For::Turn, Some(2), &stopped, Some("idle"), true, false, None),
+            // Nothing to wait for: the agent's condition, by the same rules —
+            // a gate is `blocked` whether or not a turn is open (the trust
+            // dialog comes before any prompt), and a dead agent is `exit`.
+            (For::Turn, None, &stopped, Some("idle"), true, false, Some(Idle)),
+            (For::Turn, None, &fresh, None, true, false, Some(Idle)),
+            (For::Turn, None, &fresh, Some("blocked"), true, false, Some(Blocked)),
+            (For::Turn, None, &stopped, Some("blocked"), true, false, Some(Blocked)),
+            (For::Turn, None, &stopped, Some("idle"), false, false, Some(Exit)),
+            (For::Turn, None, &stopped, Some("blocked"), false, false, Some(Exit)),
+            // --for exit: only exit.
+            (For::Exit, None, &done, Some("blocked"), true, false, None),
+            (For::Exit, None, &running, Some("idle"), true, false, None),
+            (For::Exit, None, &done, Some("idle"), false, false, Some(Exit)),
+        ];
+        for (i, &(what, after, a, s, alive, in_turn, want)) in table.iter().enumerate() {
+            assert_eq!(decide_on(what, after, a, s, alive, in_turn), want, "row {i}");
+        }
     }
 
     #[test]

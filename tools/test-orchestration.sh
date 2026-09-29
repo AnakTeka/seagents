@@ -302,6 +302,19 @@ walk(json.load(sys.stdin))")
 [ "$focused" = "$got" ] || fail "focus: focused is $focused, it-a is $got"
 pass "focus it-a focused con_id $got"
 
+# 5b. A gate before any turn: Claude in a never-trusted directory opens on
+#     the folder-trust dialog before its first prompt. A plain wait (no
+#     baseline, no turn open) says blocked, as --after would — not idle.
+#     No model call is made; stop takes a gated agent straight to SIGTERM.
+UNTRUSTED=$(mktemp -d /tmp/sg-untrusted.XXXXXX)
+(cd "$UNTRUSTED" && "$SEA" spawn --tag it-t "${HAIKU[@]}" -- 'never' > /dev/null) || fail "untrusted spawn"
+for _ in $(seq 1 60); do [ "$(status_of it-t | jq_ "d['state']")" = blocked ] && break; sleep 0.25; done
+out=$("$SEA" wait it-t --timeout 5s); rc=$?
+[ $rc -eq 3 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "blocked 0" ] || fail "plain wait at the trust dialog: rc=$rc $out"
+"$SEA" stop it-t > /dev/null || fail "stopping it-t"
+rm -rf "$UNTRUSTED"
+pass "a plain wait on an agent at the trust dialog, no turn open, is blocked (rc 3, $(echo "$out" | jq_ "d['rule']"))"
+
 # 6. stop: the agent exits (Claude's /exit), a waiter on its exit (already
 #    waiting, as a caller would be) says so, its control socket is gone, and
 #    the window closes with it — a spawned window keeps no shell behind.

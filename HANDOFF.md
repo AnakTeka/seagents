@@ -910,7 +910,7 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 | reason | exit | when |
 |---|---|---|
 | `turn` | 0 | `stops > N`: the turn after N ended; `last_message` is its final text (wins even if the agent has since exited) |
-| `idle` | 0 | no `--after` and not in a turn: nothing to wait for, the last result at once |
+| `idle` | 0 | no `--after`, not in a turn, alive and not at a gate: nothing to wait for, the last result at once |
 | `timeout` | 2 | `--timeout` (default 5m; `30s`/`5m`/`1h`/seconds) passed — call again with the same N; nothing is consumed |
 | `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
 | `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) |
@@ -918,7 +918,11 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 
 1 is an error (unknown target; an N ahead of the ledger — a restored agent's
 ledger restarts at 0, so wait without `--after`). `--for exit` waits for exit
-only. Without `--after`, a running turn is waited on (N = current `stops`).
+only. Without `--after`, a running turn is waited on (N = current `stops`);
+with no turn running the agent's condition is the answer at once, by the same
+rules — `blocked` at a gate (the trust dialog comes before any prompt, so no
+turn is open there), `exit` when gone, else `idle`. `wait::decide()` is the
+whole table, a pure function over one look, tested row by row.
 The reported `state` follows the ledger for hook agents (`.state` lags a turn's
 end by up to one monitor tick). `wait` only reads: it never acknowledges
 `done` and never writes `.state`.
