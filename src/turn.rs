@@ -17,14 +17,15 @@ use std::path::Path;
 
 use crate::adapter::Turns;
 use crate::registry::{AgentRecord, StateRecord};
+use crate::transcript::Format;
 
 /// Where one session's turn edges come from — resolved once per read from
 /// its command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ledger {
     pub(crate) turns: Turns,
-    /// Adapter id, which also names the transcript format.
-    agent: Option<&'static str>,
+    /// The format of the transcript the agent writes, per its adapter.
+    transcript: Option<Format>,
 }
 
 impl Ledger {
@@ -32,19 +33,18 @@ impl Ledger {
     /// does not parse reads as the screen rule: the ledger is only as exact
     /// as the adapter that says where it comes from.
     pub(crate) fn for_command(argv0: &str) -> Ledger {
+        let adapter = crate::adapter::for_command(argv0).unwrap_or_default();
         Ledger {
-            turns: crate::adapter::for_command(argv0)
-                .map(|a| a.launch.turns)
-                .unwrap_or_default(),
-            agent: crate::adapter::agent_id(argv0),
+            turns: adapter.launch.turns,
+            transcript: adapter.read.transcript,
         }
     }
 
     /// Is the agent in a turn? `state` is only read by screen adapters.
     pub(crate) fn in_turn(&self, agent: &AgentRecord, state: Option<&StateRecord>) -> bool {
         in_turn_with(self.turns, agent, state, |path, since| {
-            self.agent
-                .is_some_and(|id| crate::transcript::interrupted_since(id, Path::new(path), since))
+            self.transcript
+                .is_some_and(|f| crate::transcript::interrupted_since(f, Path::new(path), since))
         })
     }
 }

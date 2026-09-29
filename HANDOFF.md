@@ -134,6 +134,11 @@ seagents send <target> [--now] [--keys] [--no-submit] [--answer-permission]
 seagents stop <target> [--force]
                            make the agent exit: its exit command, then
                            SIGTERM, then SIGKILL (§9)
+seagents read (<target> | --transcript PATH) [--json] [--from CURSOR]
+              [--tail N] [--raw]
+                           the conversation's main line from the agent's
+                           transcript, collapsed text or NDJSON records,
+                           ending with a cursor to continue from (§10)
 seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
@@ -231,9 +236,19 @@ Source layout under `src/`:
 - **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
   is mid-turn" (§6), per adapter: the hook ledger plus the transcript's
   interrupt record, or the screen for hookless agents.
-- **`src/transcript/`** — the agent's own conversation file, one parser per
-  format (`claude.rs`); today only `interrupted_since()`. Phase 3's `read`
-  grows the common record model here.
+- **`src/transcript/`** — the agent's own conversation file (§10), the
+  shared layer `read` and the future sessions browser read through:
+  `model.rs` (the common record model), `claude.rs` (the one Claude JSONL
+  parser: a line's cheap `head()` for the index, its `records()`, the
+  subagent sidecars, and `interrupted_since()` for the turn ledger),
+  `index.rs` (the lazy, incrementally extended offset index cached under
+  `sessions/`), `mainline.rs` (the tree, the main line, `resume()` for a
+  cursor), `render.rs` (the collapse rules); `Transcript` in `mod.rs` ties
+  them together. `Format` names a parser; the adapter's `[read] transcript`
+  picks it.
+- **`src/read.rs`** — `seagents read`: the source (a target's reported
+  transcript, or `--transcript`), the cursor and its token, continuing
+  after one (`rewound`/`reset`), text and NDJSON output.
 - **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then
   detects), `print()`, `read_session()` (detection), `settle()` (screen fused
   with the turn ledger), `observe_state()` (the `.state` transition rules), OSC-title parsing (`all_titles`,
@@ -290,10 +305,12 @@ Source layout under `src/`:
   (`settings_flag`, `hookless_flags`, `identity`/`turns`) and to turn a
   seed into argv (`Launch::seed_args()`); `spawn` reads the permission flag
   and mode order; `capabilities()` is what `status --json` reports per agent
-  (`state`, `wait`, `turns`, `spawn`, `send`, `stop` as applicable); `send`
+  (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
   and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
   when a body goes by reference: `long_prompt`, `inline_max_chars`,
-  `inline_max_lines`).
+  `inline_max_lines`); `[read] transcript` names the transcript format
+  (`claude`) that `read` and the turn ledger's interrupt check parse —
+  `read` is a capability where there is one and a way to learn the path.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
@@ -419,6 +436,10 @@ Per session, keyed by the wrapper's pid:
 - **`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md`** — a
   `send` body too long to paste as the user's words (§9), 0600. Outside the
   cache, but the session's: named and deleted by `registry`.
+- **`sessions/<session id>.idx`** — a transcript's offset index (§10),
+  about a conversation rather than a live agent, so never reaped; a
+  subagent's transcript (not named by a uuid) is keyed by a hash of its
+  path. `registry::sessions_dir()`.
 - **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
   socket (§9; 0600 in a 0700 dir, the cache dir when there is no runtime
   dir). Bound once the `.meta` exists; removed by the wrapper on exit and on
@@ -934,6 +955,63 @@ to SIGTERM (verified: the gated command never ran). The lineage rule applies;
 the blocked refusal does not. The wrapper exits with its agent, so
 `Control::finish()` lets in-flight requests reply (≤ 2 s) before the socket is
 removed.
+
+### 10. `seagents read` — the conversation
+
+Content comes from the agent's own transcript (the path its hooks
+reported in `.agent`; `--transcript PATH` reads any file), never the screen.
+Everything is parsed into the **common record model** (`transcript/model.rs`):
+`user`/`assistant`/`thinking` `{text}`, `tool_use {id, name, input[,
+subagent]}`, `tool_result {tool_use_id, text, bytes[, is_error]}`, each with
+`uuid`, `parent_uuid`, `timestamp`. One JSONL line can hold several blocks;
+it yields several records sharing the line's uuid, while the tree, the main
+line and the cursor are made of lines, so they never care about blocks.
+
+**The main line.** A transcript is a tree (`uuid`/`parentUuid`): a rewind or
+an edit branches off an earlier node, so the file in line order interleaves
+abandoned attempts. `read` shows root → newest tip — the newest
+*conversation* node with no conversation below it. Not the newest leaf of
+any kind: `system`, `attachment` and `progress` lines are tree nodes too (a
+prompt's parent is often the last turn's `turn_duration` note) and many are
+side leaves — measured, 94 are newer than the sibling the conversation went
+on through, and a cursor left on one would read as a rewind a moment later.
+A compaction's boundary takes its `logicalParentUuid` as parent; when that
+line was never written (5 of 15 here) the walk bridges to the newest tip
+before the boundary, so the line still starts at the real beginning.
+
+**Collapse rules** (`render.rs`, SESSIONS-SPEC's): user text in full behind
+`│`, assistant text in full, `⋯ thinking (N words)`, `● Tool(short arg)`,
+`  ⎿ first line (N bytes)`; `--raw` shows all. A real subagent (an `Agent` /
+`Task` call) is one line at its call, `▸ subagent: <type> — <description>`,
+labelled from its `subagents/agent-<id>.meta.json` sidecar when there is one
+(matched by `toolUseId`) and from the call's input otherwise; the
+`agent-a<word>-…` helper transcripts are never subagents. `isMeta` user lines
+(image notes, skill bodies) are context, not the user's words: not shown. A
+user line that only points at a prompt `send` wrote by reference gets the
+file's words under it while the file exists (text mode only).
+
+**The cursor** is `{transcript_path, offset, leaf}` (plus `token`, the same as
+`<offset>:<leaf>:<path>` — the text mode's last line is `-- cursor: <token>`,
+and `--from` takes that line, the token, or the JSON cursor). `leaf` is the
+main line's tip. `--from` continues after it if the current main line still
+runs through it; if not (a rewind), `{"rewound":{"fork":…}}` names the node
+the two lines share and reading resumes after it; a different path (`/clear`
+starts a new transcript) or a file shorter than `offset` is `{"reset":…}`,
+read from the start. **Claude writes its transcript behind its hooks**
+(measured 2.1.284: a read the moment `wait` returned saw the prompt but not
+the answer, ~60 ms late), so a target read after a finished turn waits (≤ 1
+s) until a line stamped at or after the `Stop` is there — the turn's
+`stop_hook_summary`, written once the hooks have run.
+
+**The offset index** (`index.rs`, SESSIONS-SPEC's `.idx`): one 53-byte entry
+per tree node (offset, length, kind, timestamp, uuid, parent), so the main
+line is found without parsing content and `--tail N` reads only the lines it
+prints. Cached in `~/.cache/seagents/sessions/`, extended from the last
+indexed byte on every open (transcripts are append-only; only complete lines
+are indexed), rebuilt when the file is shorter than that or its first 4 KiB
+no longer hash the same. Measured on the largest transcript here (53 MB):
+`read --tail 20` in 65 ms cold, 6 ms warm; the whole main line as NDJSON in
+90 ms.
 
 ---
 

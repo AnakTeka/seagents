@@ -1,21 +1,111 @@
 //! An agent's own conversation record, as it writes it to disk — the source
-//! for content (and, today, for the one turn fact the hooks cannot give: an
-//! interrupt). One parser per transcript format; this is the only per-agent
-//! code orchestration has, and the rest of seagents asks through here.
+//! for content (`read`, and one day the sessions browser) and for the one
+//! turn fact the hooks cannot give: an interrupt.
 //!
-//! Phase 3 (`read`) grows the common record model in this module.
+//! Layers, each written once and shared by every format:
+//!
+//! - [`model`] — the common record model (user / assistant / thinking /
+//!   tool_use / tool_result, with uuid, parent and timestamp).
+//! - one parser per format ([`claude`]) — the only per-agent code: a cheap
+//!   per-line *head* (uuid, parent, timestamp, kind) for the index, and the
+//!   full records of one line when it is actually read.
+//! - [`index`] — the lazy per-transcript offset index, cached and extended
+//!   incrementally, so a 50 MB transcript is scanned once, not per read.
+//! - [`mainline`] — the tree those heads form, and the main line through it.
+//! - [`render`] — the collapse rules, records → text lines.
+//!
+//! [`Transcript`] ties them together for a reader: open (index), walk the
+//! main line, read the records of the nodes wanted.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 mod claude;
+pub(crate) mod index;
+pub(crate) mod mainline;
+pub(crate) mod model;
+pub(crate) mod render;
+
+use index::{Index, Node};
+use model::{Kind, Record, Subagent};
+
+/// A transcript format — named by an adapter's `[read] transcript`.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Format {
+    /// Claude Code's JSONL.
+    Claude,
+}
 
 /// Did the agent write an interrupt record — its turn cut short by the user —
-/// stamped at or after `since_ms`? `agent` is the adapter id (`claude`, …); a
-/// format without a parser here never reports one.
-pub(crate) fn interrupted_since(agent: &str, transcript: &Path, since_ms: u64) -> bool {
-    match agent {
-        "claude" => claude::interrupted_since(transcript, since_ms),
-        _ => false,
+/// stamped at or after `since_ms`?
+pub(crate) fn interrupted_since(format: Format, transcript: &Path, since_ms: u64) -> bool {
+    match format {
+        Format::Claude => claude::interrupted_since(transcript, since_ms),
+    }
+}
+
+/// One transcript opened for reading: its index (built or extended on open)
+/// and the file, read by offset only for the lines asked for.
+pub(crate) struct Transcript {
+    path: PathBuf,
+    format: Format,
+    file: File,
+    pub(crate) index: Index,
+    /// Subagents by the id of the tool call that spawned them, looked up
+    /// the first time a line holds such a call.
+    subagents: OnceCell<HashMap<String, Subagent>>,
+}
+
+impl Transcript {
+    /// Open `path`, its index cached in the sessions dir.
+    pub(crate) fn open(path: &Path, format: Format) -> std::io::Result<Transcript> {
+        let cache = index::cache_path(path);
+        Transcript::open_cached(path, format, cache.as_deref())
+    }
+
+    /// Open `path` with its index cached at `cache` (None: in memory only).
+    pub(crate) fn open_cached(path: &Path, format: Format, cache: Option<&Path>) -> std::io::Result<Transcript> {
+        let head = match format {
+            Format::Claude => claude::head,
+        };
+        let index = Index::load(path, cache, head)?;
+        Ok(Transcript {
+            path: path.to_path_buf(),
+            format,
+            file: File::open(path)?,
+            index,
+            subagents: OnceCell::new(),
+        })
+    }
+
+    /// The records of one indexed line — none for a line that is not
+    /// conversation (a system note, an attachment) or no longer parses.
+    pub(crate) fn records(&self, node: &Node) -> Vec<Record> {
+        let mut buf = vec![0; node.len as usize];
+        let mut f = &self.file;
+        if f.seek(SeekFrom::Start(node.offset)).is_err() || f.read_exact(&mut buf).is_err() {
+            return Vec::new();
+        }
+        let mut records = match self.format {
+            Format::Claude => claude::records(&buf),
+        };
+        for r in &mut records {
+            if let Kind::ToolUse { id, subagent: Some(sub), .. } = &mut r.kind {
+                let known = self.subagents.get_or_init(|| match self.format {
+                    Format::Claude => claude::subagents(&self.path),
+                });
+                if let Some(found) = known.get(id.as_str()) {
+                    *sub = found.clone();
+                }
+            }
+        }
+        records
     }
 }
 

@@ -423,6 +423,18 @@ fn reference_line(file: &std::path::Path, cwd: &str, who: &str) -> String {
     )
 }
 
+/// The inverse of [`reference_line`]: the prompt file a stand-in line
+/// names, as written there (relative to the agent's working directory, or
+/// absolute) — for `read`, which can show the words the agent was only told
+/// where to find.
+pub(crate) fn referenced_file(text: &str) -> Option<&str> {
+    let at = text
+        .strip_prefix("Read the file ")?
+        .split_once(" and carry out the instructions in it. They were sent to you through seagents by ")?
+        .0;
+    Some(at.strip_suffix(" (relative to your working directory)").unwrap_or(at))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn send(
     shared: &Shared,
@@ -639,6 +651,9 @@ mod tests {
         assert!(!line.contains('\n'));
         let abs = reference_line(std::path::Path::new("/elsewhere/p.md"), "/w/proj", "the user");
         assert!(abs.starts_with("Read the file /elsewhere/p.md and") && abs.ends_with("by the user."), "{abs}");
+        assert_eq!(referenced_file(&line), Some(".seagents/prompts/7-2-beef.md"));
+        assert_eq!(referenced_file(&abs), Some("/elsewhere/p.md"));
+        assert_eq!(referenced_file("Read the file x.md please"), None);
     }
 
     #[test]

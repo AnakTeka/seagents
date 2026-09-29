@@ -15,6 +15,7 @@ mod hud;
 mod i3;
 mod launch;
 mod procfs;
+mod read;
 mod registry;
 mod send;
 mod snapshot;
@@ -223,6 +224,51 @@ enum Command {
         force: bool,
     },
 
+    /// Print an agent's conversation — its main line — ending with a cursor
+    ///
+    /// Read from the agent's own transcript (the path its hooks reported),
+    /// or any transcript file with --transcript. Abandoned branches (a
+    /// rewind, an edit) are left out. Text: the user's words behind a bar,
+    /// the assistant's in full, thinking, tool calls and results one line
+    /// each (--raw: in full), subagents as `▸ subagent: <type> —
+    /// <description>`; the last line is `-- cursor: <offset>:<leaf>:<path>`.
+    /// --json: one record per line, `{"uuid","parent_uuid","timestamp",
+    /// "kind",…}` with kind user|assistant|thinking (`text`), tool_use
+    /// (`id`,`name`,`input`[,`subagent`]) or tool_result
+    /// (`tool_use_id`,`text`,`bytes`[,`is_error`]), then
+    /// `{"cursor":{"transcript_path","offset","leaf","token"}}`. With --from,
+    /// only what came after that cursor — preceded by
+    /// `{"rewound":{"fork"}}` when the conversation was rewound past it
+    /// (continuing from the fork), or `{"reset":{"transcript_path"}}` when
+    /// the transcript changed (`/clear`; read from its start). Exit 1, with
+    /// the reason on stderr, when there is nothing to read.
+    Read {
+        /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
+        #[arg(required_unless_present = "transcript", conflicts_with = "transcript")]
+        target: Option<String>,
+
+        /// Read this transcript file instead of an agent's
+        #[arg(long, value_name = "PATH")]
+        transcript: Option<PathBuf>,
+
+        /// NDJSON records instead of text
+        #[arg(long)]
+        json: bool,
+
+        /// Only what came after this cursor (a previous read's last line, its
+        /// token, or its JSON cursor record)
+        #[arg(long, value_name = "CURSOR", allow_hyphen_values = true)]
+        from: Option<String>,
+
+        /// Only the last N records
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+
+        /// Don't collapse thinking, tool input or tool output
+        #[arg(long)]
+        raw: bool,
+    },
+
     /// The in-PTY job-control anchor `run` wraps around the agent (internal)
     ///
     /// The PTY session leader must not BE the agent: a lone process group in
@@ -376,6 +422,21 @@ fn dispatch(command: Command) -> i32 {
             text,
         }),
         Command::Stop { target, force } => send::stop(&target, force),
+        Command::Read {
+            target,
+            transcript,
+            json,
+            from,
+            tail,
+            raw,
+        } => read::run(read::Args {
+            target,
+            transcript,
+            json,
+            from,
+            tail,
+            raw,
+        }),
         Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
@@ -542,6 +603,33 @@ mod tests {
             panic!("not stop");
         };
         assert_eq!((target.as_str(), force), ("it-b", true));
+    }
+
+    #[test]
+    fn read_takes_a_target_or_a_transcript_never_both() {
+        let Command::Read { target, transcript, json, from, tail, raw } =
+            parse(&["seagents", "read", "@it-a", "--json", "--from", "0::/t.jsonl", "--tail=5", "--raw"])
+        else {
+            panic!("not read");
+        };
+        assert_eq!((target.as_deref(), transcript, json, raw), (Some("@it-a"), None, true, true));
+        assert_eq!((from.as_deref(), tail), (Some("0::/t.jsonl"), Some(5)));
+        // A text read's last line, pasted whole.
+        let Command::Read { from, .. } = parse(&["seagents", "read", "x", "--from", "-- cursor: 0::/t.jsonl"]) else {
+            panic!("not read");
+        };
+        assert_eq!(from.as_deref(), Some("-- cursor: 0::/t.jsonl"));
+        let Command::Read { target, transcript, .. } = parse(&["seagents", "read", "--transcript", "/t.jsonl"]) else {
+            panic!("not read");
+        };
+        assert_eq!((target, transcript), (None, Some(PathBuf::from("/t.jsonl"))));
+        for bad in [
+            &["seagents", "read"][..],
+            &["seagents", "read", "x", "--transcript", "/t.jsonl"][..],
+            &["seagents", "read", "x", "--tail", "many"][..],
+        ] {
+            assert_eq!(Cli::try_parse_from(bad).unwrap_err().exit_code(), 2, "{bad:?}");
+        }
     }
 
     #[test]

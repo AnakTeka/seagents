@@ -55,3 +55,8 @@ exit_sequence    = "/exit"
 long_prompt      = "file"
 inline_max_chars = 700
 inline_max_lines = 2
+
+[read]
+# JSONL under $CLAUDE_CONFIG_DIR/projects, path reported by the hooks. Also
+# where the turn ledger finds an Esc's interrupt record.
+transcript       = "claude"

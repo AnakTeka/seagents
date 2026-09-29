@@ -18,7 +18,8 @@
 //!    seed flag, no hooks, no identity; state from the screen only.
 //!
 //! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
-//! `spawn`, `send` and `stop` are its other consumers.
+//! `spawn`, `send` and `stop` are its other consumers, and `[read]` names the
+//! transcript format ([`crate::transcript`]) `read` and the turn ledger parse.
 
 use std::path::PathBuf;
 
@@ -65,6 +66,16 @@ pub(crate) enum Turns {
 pub(crate) struct Adapter {
     pub(crate) launch: Launch,
     pub(crate) send: Send,
+    pub(crate) read: Read,
+}
+
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Read {
+    /// The format of the transcript the agent writes — which parser reads
+    /// it. None: seagents cannot read this agent's conversation (and a hook
+    /// turn ledger has no interrupt record to go by).
+    pub(crate) transcript: Option<crate::transcript::Format>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
@@ -263,7 +274,8 @@ pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
 /// turn ledger, from hooks), `spawn` (a seed prompt can go on its command
 /// line), `send` (the default submit-when-idle needs a detector to say idle;
 /// any agent takes `send --now`), `stop` (always: signals need nothing from
-/// the agent). `read` joins in Phase 3.
+/// the agent), `read` (a transcript parser, and a way to learn which file the
+/// agent writes).
 pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
     let Ok(adapter) = for_command(argv0) else {
         return vec!["wait", "stop"];
@@ -283,6 +295,9 @@ pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
         caps.push("send");
     }
     caps.push("stop");
+    if adapter.read.transcript.is_some() && adapter.launch.identity != Identity::None {
+        caps.push("read");
+    }
     caps
 }
 
@@ -328,6 +343,7 @@ mod tests {
             ["plan", "default", "acceptEdits", "bypassPermissions"]
         );
         assert_eq!((claude.launch.identity, claude.launch.turns), (Identity::Hook, Turns::Hook));
+        assert_eq!(claude.read.transcript, Some(crate::transcript::Format::Claude));
         assert_eq!(claude.send.submit_delay_ms, 300);
         assert_eq!(claude.send.exit_sequence, "/exit");
         assert_eq!(
@@ -340,6 +356,7 @@ mod tests {
         assert_eq!(codex.launch.settings_flag, "");
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::None, Turns::Screen));
         assert_eq!(codex.send.long_prompt, LongPrompt::Paste);
+        assert_eq!(codex.read.transcript, None, "Phase 4");
     }
 
     #[test]
@@ -400,7 +417,7 @@ mod tests {
         let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn", "send", "stop"]);
+        assert_eq!(capabilities("claude"), ["state", "wait", "turns", "spawn", "send", "stop", "read"]);
         assert_eq!(capabilities("/usr/bin/codex"), ["state", "wait", "spawn", "send", "stop"]);
         assert_eq!(capabilities("gemini"), ["state", "wait", "send", "stop"]);
         assert_eq!(capabilities("sleep"), ["wait", "stop"]);
@@ -429,6 +446,8 @@ mod tests {
         assert_eq!(a.send.exit_sequence, "/quit");
         assert_eq!(a.send.submit_delay_ms, 300);
         assert_eq!(a.launch, Launch::default());
+        assert_eq!(a.read, Read::default());
+        assert!(parse("[read]\ntranscript = \"hieroglyphs\"\n").is_err());
         assert!(parse("[launch]\nidentity = \"telepathy\"\n").is_err());
         assert!(parse("[launch]\nseed_flag = \"-p\"\n").is_err(), "typos are errors");
         assert!(parse("[launch]\nseed_prompt = [\"-p\"]\n").unwrap_err().contains("{prompt}"));

@@ -27,6 +27,7 @@ mod lead;
 mod monitor;
 mod pumps;
 
+pub(crate) use control::referenced_file;
 pub(crate) use lead::lead;
 
 /// `seagents run [--tag T] [--parent P] [--seed-file F] <cmd…>`. Exit 2 —

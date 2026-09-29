@@ -61,6 +61,15 @@ pub(crate) fn cache_dir() -> PathBuf {
     base
 }
 
+/// `~/.cache/seagents/sessions/`, created on demand: per-transcript caches
+/// (`transcript::index`'s `.idx` files) — about conversations, not live
+/// agents, so nothing here is reaped with a session. None when it cannot be
+/// created.
+pub(crate) fn sessions_dir() -> Option<PathBuf> {
+    let dir = cache_dir().join("sessions");
+    fs::create_dir_all(&dir).ok().map(|_| dir)
+}
+
 /// Where sessions live: the cache (every sidecar) and the runtime dir (their
 /// control sockets, [`runtime_dir`]). Two roots because a socket belongs on
 /// tmpfs, private and gone at logout, while `.meta` & co. must be readable by
