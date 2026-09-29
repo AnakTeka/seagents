@@ -181,7 +181,7 @@ impl OutputDrain {
 ///
 /// The writer is shared with the control thread and locked per chunk, so a
 /// `send` body (written under one lock) is never split by a keystroke.
-pub(super) fn spawn_input(writer: SharedWriter, files: Files) {
+pub(super) fn spawn_input(writer: SharedWriter, files: Files, wake: Arc<super::monitor::Wake>) {
     thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 8192];
@@ -197,6 +197,8 @@ pub(super) fn spawn_input(writer: SharedWriter, files: Files) {
                         }
                         let _ = w.flush();
                     }
+                    // A human answering a gate at the window.
+                    wake.input();
                     let due = last_capture
                         .map_or(true, |t| t.elapsed().as_secs() >= 60);
                     if due && input_capture_eligible(&buf[..n]) {

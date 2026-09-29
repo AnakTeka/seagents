@@ -57,6 +57,12 @@ const POLL: Duration = Duration::from_millis(200);
 /// is simply a pause long enough for the detector to see the turn start.
 const LANDING_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a `send --answer-permission` waits, after writing, for the
+/// monitor to see the gate gone before it replies. Long enough for the agent
+/// to read the key and repaint; a key that doesn't clear the gate (moving
+/// through a menu) just replies this much later.
+const ANSWER_SETTLE: Duration = Duration::from_secs(1);
+
 /// `stop`: how long the exit sequence, then SIGTERM, then SIGKILL each get.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -73,6 +79,8 @@ pub(super) struct Wiring {
     pub(super) master_fd: RawFd,
     pub(super) writer: SharedWriter,
     pub(super) modes: Arc<PtyModes>,
+    /// Hurries the monitor after a write that may have answered a gate.
+    pub(super) wake: Arc<super::monitor::Wake>,
     /// The agent's command, first word: which adapter, which ledger.
     pub(super) argv0: String,
 }
@@ -456,6 +464,13 @@ fn send(
                 let ms = crate::clock::unix_now_ms();
                 inject::deliver(&w.writer, &w.modes, body, submit, framing(&adapter))
                     .map_err(|e| Reply::refused(Refusal::Failed, e))?;
+                // Into a gate: reply once `.state` has caught up, so a
+                // `wait` called the moment this returns doesn't read the
+                // gate that was just answered.
+                w.wake.input();
+                if state.as_ref().is_some_and(|s| s.state == "blocked") {
+                    w.wake.wait_unblocked(ANSWER_SETTLE);
+                }
                 if submit {
                     *last = Some(Submitted { at: Instant::now(), ms });
                 }

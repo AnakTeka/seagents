@@ -3,18 +3,97 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::registry::{self, Files};
 use crate::status;
 use crate::window;
+
+/// The monitor's pace when nothing is happening.
+const TICK: Duration = Duration::from_secs(2);
+
+/// After input reaches a gated agent: look this often, for this long. The
+/// agent repaints once it has read the key, not when it is written, so one
+/// immediate look would mostly see the gate still up.
+const QUICK_TICK: Duration = Duration::from_millis(100);
+const QUICK_FOR: Duration = Duration::from_secs(1);
+
+/// How the rest of the wrapper hurries its monitor.
+///
+/// `.state` is what `wait` and `send` read the gate from, and this monitor is
+/// its writer — so right after a gate is answered it would say `blocked`
+/// for up to a tick, and a `wait` called in that instant would return
+/// `blocked` again. Input into a gated agent therefore wakes the monitor for
+/// a burst of quick looks, and a `send --answer-permission` can wait for the
+/// verdict to clear before it replies.
+#[derive(Default)]
+pub(super) struct Wake {
+    flags: Mutex<Flags>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Flags {
+    /// Input arrived since the monitor last slept.
+    nudged: bool,
+    /// The monitor's last verdict was `blocked`.
+    blocked: bool,
+}
+
+impl Wake {
+    fn flags(&self) -> std::sync::MutexGuard<'_, Flags> {
+        self.flags.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Something was written into the agent. Only a gated agent needs a
+    /// quick look: anywhere else the next tick is soon enough.
+    pub(super) fn input(&self) {
+        let mut f = self.flags();
+        if f.blocked {
+            f.nudged = true;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Wait, up to `within`, for the monitor to see no gate; whether it did.
+    pub(super) fn wait_unblocked(&self, within: Duration) -> bool {
+        let f = self.flags();
+        !self
+            .changed
+            .wait_timeout_while(f, within, |f| f.blocked)
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .blocked
+    }
+
+    fn set_blocked(&self, blocked: bool) {
+        let mut f = self.flags();
+        if f.blocked != blocked {
+            f.blocked = blocked;
+            self.changed.notify_all();
+        }
+    }
+
+    /// Sleep `d`, or less when nudged; whether it was.
+    fn sleep(&self, d: Duration) -> bool {
+        let f = self.flags();
+        let mut f = self
+            .changed
+            .wait_timeout_while(f, d, |f| !f.nudged)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        std::mem::take(&mut f.nudged)
+    }
+}
 
 /// Self-monitor: re-detect our own agent's state every 2s and stamp the
 /// .state sidecar on transitions. The wrapper is the only process
 /// guaranteed to live exactly as long as the agent, so this keeps
 /// "idle for / waiting for" truthful even when no HUD or status poll is
 /// watching — opening the HUD hours later shows the real durations.
-pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path) {
+pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, wake: Arc<Wake>) {
     let cmd0 = Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -36,6 +115,7 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path) {
         // HUD) may stamp the sidecar first, but the notification decision
         // must always be made from this wrapper's own observations.
         let mut prev: Option<status::State> = None;
+        let mut quick_until: Option<Instant> = None;
         loop {
             let seen = fs::metadata(&files.raw)
                 .ok()
@@ -51,6 +131,9 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path) {
                         notify_transition(prev, state, &dir0, &cmd0, con_id);
                     }
                     prev = Some(state);
+                    // After `.state` is written: whoever waits on this reads
+                    // it next.
+                    wake.set_blocked(state == status::State::Blocked);
                     // Unacknowledged completion + the agent's window is
                     // focused → the user is looking at it: done → idle.
                     // (Focusing triggers a repaint, which is exactly what
@@ -70,7 +153,13 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path) {
             // moving a window to another workspace changes the layout
             // without producing a byte of agent output.
             crate::snapshot::maybe_capture();
-            thread::sleep(std::time::Duration::from_secs(2));
+            let tick = match quick_until {
+                Some(t) if Instant::now() < t => QUICK_TICK,
+                _ => TICK,
+            };
+            if wake.sleep(tick) {
+                quick_until = Some(Instant::now() + QUICK_FOR);
+            }
         }
     });
 }
@@ -121,5 +210,41 @@ fn notify_transition(
         std::thread::spawn(move || {
             let _ = child.wait();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_hurries_the_monitor_only_at_a_gate() {
+        let wake = Wake::default();
+        wake.input();
+        let t = Instant::now();
+        assert!(!wake.sleep(Duration::from_millis(50)), "not gated: no nudge");
+        assert!(t.elapsed() >= Duration::from_millis(50));
+
+        wake.set_blocked(true);
+        wake.input();
+        let t = Instant::now();
+        assert!(wake.sleep(TICK), "gated: woken at once");
+        assert!(t.elapsed() < TICK);
+        assert!(!wake.sleep(Duration::ZERO), "one nudge, one wake");
+    }
+
+    #[test]
+    fn an_answer_waits_for_the_monitor_to_see_the_gate_go() {
+        let wake = Arc::new(Wake::default());
+        assert!(wake.wait_unblocked(Duration::ZERO), "no gate: at once");
+        wake.set_blocked(true);
+        assert!(!wake.wait_unblocked(Duration::from_millis(20)), "a key that didn't clear it");
+        let monitor = Arc::clone(&wake);
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            monitor.set_blocked(false);
+        });
+        assert!(wake.wait_unblocked(Duration::from_secs(5)));
+        t.join().unwrap();
     }
 }

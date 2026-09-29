@@ -151,7 +151,8 @@ pub(crate) fn run(
     let modes = Arc::new(inject::PtyModes::default());
     let (reader_handle, drain) =
         pumps::spawn_output(reader, master_fd, tee, files.clone(), Arc::clone(&modes));
-    pumps::spawn_input(Arc::clone(&writer), files.clone());
+    let wake = Arc::new(monitor::Wake::default());
+    pumps::spawn_input(Arc::clone(&writer), files.clone(), Arc::clone(&wake));
     pumps::spawn_resize(&master);
 
     // (Monitor guarded on a known pid: without one, geometry lookups would
@@ -159,7 +160,7 @@ pub(crate) fn run(
     // observers disagree — better no monitor than a flapping one. The
     // control socket needs it too, to signal the agent on `stop`.)
     let control = child.process_id().map(u64::from).and_then(|anchor_pid| {
-        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd);
+        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd, Arc::clone(&wake));
         // After the `.meta`: `reap` sweeps a socket no live session owns.
         control::spawn(control::Wiring {
             files: files.clone(),
@@ -167,6 +168,7 @@ pub(crate) fn run(
             master_fd,
             writer,
             modes,
+            wake,
             argv0: cmd[0].clone(),
         })
     });

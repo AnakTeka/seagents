@@ -197,7 +197,7 @@ Source layout under `src/`:
     the SIGWINCH resize pump.
   - `monitor.rs` — the self-monitor thread: detection tick, `.state`
     transitions, `notify_transition()`, the done-ack on focus, the snapshot
-    offer.
+    offer; `Wake`, how input into a gated agent hurries it.
   - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
   - `control.rs` — the control socket (§9): bind, `SO_PEERCRED`
     authorization (`authorize()`, the lineage rule), submit-when-idle
@@ -365,7 +365,8 @@ Per session, keyed by the wrapper's pid:
   the clock. Reader-written transitions are always `seen: true`, so sessions
   from pre-monitor wrappers never show a stuck done.
   **Maintained by the wrapper itself** (a monitor thread re-detects
-  its own agent every 2s, skipping the pass while the tee is unchanged), so
+  its own agent every 2s — every 100 ms for a second after input reaches it
+  at a gate, §8 — skipping the pass while the tee is unchanged), so
   durations stay truthful with no HUD open. HUD/status polls also write it
   whenever their own detection disagrees — the writers race benignly on
   transitions (both stamp since≈now; each read-decide-write is one locked
@@ -835,10 +836,18 @@ The reported `state` follows the ledger for hook agents (`.state` lags a turn's
 end by up to one monitor tick). `wait` only reads: it never acknowledges
 `done` and never writes `.state`.
 
-Right after a gate is answered (`send --answer-permission`, or a human at the
-window), `.state` still says `blocked` until the wrapper's monitor next looks
-(≤ 2 s), so a `wait` called in that instant returns `blocked` again; call it
-once more.
+The gate verdict has one source: `.state`, written by the wrapper's monitor
+(the one process that sees every byte the agent prints), read by `wait`,
+`send`'s gate and `stop`. Its 2 s tick would leave `blocked` standing for up
+to a tick after a gate is answered, so input into a gated agent hurries it
+(`wrapper/monitor.rs::Wake`): the control thread and the input pump nudge the
+monitor, which then looks every 100 ms for a second — the agent repaints once
+it has read the key, not when it is written — and `send --answer-permission`
+replies only once the monitor has seen the gate go (≤ 1 s). A `wait` issued
+the instant that returns gets the turn, not the answered gate (tested). The
+alternative, `wait`/`send` rendering `.raw` themselves, was rejected: a
+second detector per waiting process (a 1 MB vt100 render per poll while a
+turn streams) that would still race the repaint.
 
 ### 9. `seagents send` / `stop` — driving an agent
 
@@ -872,7 +881,8 @@ returns the running turn's). A **blocked** agent is refused at once — reason
 `blocked`, exit 3, with the gate's `rule` from `.state` — even with `--now`,
 since whatever is typed into a permission menu answers it;
 `--answer-permission` (humans only) is the way through, usually with
-`--keys` (e.g. `--keys 1` picks "Yes" on Claude's menu, verified). An agent no
+`--keys` (e.g. `--keys 1 --no-submit` picks "Yes" on Claude's menu, verified),
+and replies once the gate is seen gone (≤ 1 s, §8). An agent no
 detector knows (a plain shell) can't be seen to be idle: only `--now` sends
 to it (reason `unsupported` otherwise). Exit codes: 0 ok, 2 `busy_timeout`
 (nothing was sent), 3 `blocked`, 4 `exit`, 5 `forbidden`, 1 anything else.
@@ -1059,7 +1069,9 @@ tools/test-restore.sh alacritty
 tools/test-restore.sh alacritty-daemon
 
 # Integration-test spawn → wait → status → send (idle-paired; multi-line and
-# > 700-char bodies by reference, carried out in --permission-mode default) →
+# > 700-char bodies by reference, carried out in --permission-mode default;
+# a Bash permission gate: wait says blocked, send --answer-permission, and an
+# immediate wait gets the turn) →
 # lineage/caps and the socket's lineage rule → focus → stop, with a real
 # Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.

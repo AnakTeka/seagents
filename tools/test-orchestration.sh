@@ -174,6 +174,25 @@ out=$("$SEA" wait it-a --after 3 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "long wait: rc=$rc $out"
 pass "a $(wc -c < "$ROOT/long.txt")-char, 12-line body was carried out in default mode: LONGOK"
 
+# 3d. A gate: in default mode a Bash command stops at Claude's permission
+#     prompt, which wait reports as blocked. A human answers it with a key,
+#     and a wait issued the instant that returns sees the turn go on to its
+#     end — not the gate it just answered.
+rm -f "$WORK/gate-ok.txt"
+out=$("$SEA" send it-a 'Use the Bash tool to run exactly this command: touch gate-ok.txt — then reply with exactly: GATED'); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['stops']")" = 4 ] || fail "gate send: rc=$rc $out"
+out=$("$SEA" wait it-a --after 4 --timeout 90s); rc=$?
+[ $rc -eq 3 ] && [ "$(echo "$out" | jq_ "d['reason']")" = blocked ] || fail "wait at the gate: rc=$rc $out"
+rule=$(echo "$out" | jq_ "d['rule']")
+out=$("$SEA" send it-a 'never'); rc=$?
+[ $rc -eq 3 ] || fail "a plain send into the gate: rc=$rc $out"
+out=$("$SEA" send it-a --answer-permission --keys 1 --no-submit); rc=$?
+[ $rc -eq 0 ] || fail "answering the gate: rc=$rc $out"
+out=$("$SEA" wait it-a --after 4 --timeout 90s); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q GATED || fail "wait right after the answer: rc=$rc $out"
+[ -e "$WORK/gate-ok.txt" ] || fail "the gated command never ran"
+pass "wait stopped at the gate ($rule, rc 3), a plain send was refused (rc 3); answered with --keys 1, an immediate wait returned the turn: GATED"
+
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
 "$SEA" run --tag boss -- sh -c "
