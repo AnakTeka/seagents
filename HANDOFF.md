@@ -1149,7 +1149,8 @@ tools/test-restore.sh alacritty-daemon
 # Integration-test spawn → wait → status → send (idle-paired; multi-line and
 # > 700-char bodies by reference, carried out in --permission-mode default;
 # a Bash permission gate: wait says blocked, send --answer-permission, and an
-# immediate wait gets the turn) →
+# immediate wait gets the turn) → read (--json holds every answer and the
+# gated call; --from its cursor after one more turn gives just that turn) →
 # lineage/caps and the socket's lineage rule → focus → stop, with a real
 # Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.

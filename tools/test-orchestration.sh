@@ -1,6 +1,6 @@
 #!/bin/bash
-# Integration test for `seagents spawn` / `wait` / `send` / `stop` / `status` /
-# `focus`, with a real Claude Code, inside a nested, isolated desktop
+# Integration test for `seagents spawn` / `wait` / `send` / `read` / `stop` /
+# `status` / `focus`, with a real Claude Code, inside a nested, isolated desktop
 # (tools/lib-nested-desktop.sh: headless weston, rootful Xwayland on :9, its
 # own i3, HOME at a scratch directory), so no window it opens reaches your
 # session and the real cache is never touched.
@@ -192,6 +192,45 @@ out=$("$SEA" wait it-a --after 4 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q GATED || fail "wait right after the answer: rc=$rc $out"
 [ -e "$WORK/gate-ok.txt" ] || fail "the gated command never ran"
 pass "wait stopped at the gate ($rule, rc 3), a plain send was refused (rc 3); answered with --keys 1, an immediate wait returned the turn: GATED"
+
+# 3e. read: the conversation so far as NDJSON — every answer, the gated Bash
+#     call, the by-reference prompt as the user's line, a cursor last — and,
+#     after one more turn, `--from` that cursor gives that turn and nothing
+#     before it. Text mode ends with a cursor line `--from` takes whole.
+echo "$(status_of it-a)" | jq_ "' '.join(d['capabilities'])" | grep -qw read || fail "no read capability: $(status_of it-a)"
+"$SEA" read it-a --json > "$ROOT/read.ndjson"; rc=$?
+[ $rc -eq 0 ] || fail "read --json: rc=$rc"
+token=$(python3 -c "
+import json,sys
+recs=[json.loads(l) for l in open('$ROOT/read.ndjson')]
+cur=recs.pop()['cursor']
+said=' '.join(r['text'] for r in recs if r['kind']=='assistant')
+for w in ['ALPHA','BRAVO','CHARLIE','LONGOK','GATED']:
+    assert w in said, (w, said)
+assert any(r['kind']=='tool_use' and r['name']=='Bash' and 'gate-ok' in r['input'].get('command','') for r in recs)
+assert any(r['kind']=='user' and r['text'].startswith('Read the file .seagents/prompts/') for r in recs)
+assert all(r['uuid'] and r['kind'] in ('user','assistant','thinking','tool_use','tool_result') for r in recs)
+assert cur['leaf'] and cur['offset'] > 0 and cur['token'].startswith(f\"{cur['offset']}:{cur['leaf']}:\")
+print(cur['token'])") || fail "read --json: $(tail -c 600 "$ROOT/read.ndjson")"
+last=$("$SEA" read it-a --tail 4 | tail -1)
+case $last in "-- cursor: "*) ;; *) fail "text read's last line is not a cursor: $last" ;; esac
+out=$("$SEA" send it-a 'Reply with exactly: DELTA'); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['stops']")" = 5 ] || fail "delta send: rc=$rc $out"
+out=$("$SEA" wait it-a --after 5 --timeout 90s); rc=$?
+[ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q DELTA || fail "delta wait: rc=$rc $out"
+"$SEA" read it-a --json --from "$token" > "$ROOT/read2.ndjson" || fail "read --from: rc=$?"
+python3 -c "
+import json
+recs=[json.loads(l) for l in open('$ROOT/read2.ndjson')]
+assert 'cursor' in recs.pop()
+kinds=[r.get('kind') for r in recs]
+assert None not in kinds, recs  # no rewound/reset
+said=' '.join(r['text'] for r in recs if r['kind'] in ('user','assistant'))
+assert 'DELTA' in said and 'GATED' not in said and 'ALPHA' not in said, said
+" || fail "read --from gave more or less than the new turn: $(cat "$ROOT/read2.ndjson")"
+new=$("$SEA" read it-a --from "$last") || fail "text read --from: rc=$?"
+echo "$new" | grep -q "^DELTA" && ! echo "$new" | grep -q GATED || fail "text read --from: $new"
+pass "read --json: all five answers, the gated Bash call, the by-reference line, a cursor; --from it after one more turn gave only DELTA ($(($(wc -l < "$ROOT/read2.ndjson") - 1)) records); the text cursor line works as --from"
 
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
