@@ -123,7 +123,11 @@ pub(super) fn spawn(files: Files, anchor_pid: u64, cmd: &str, cwd: &Path, seeded
         let mut seed_pending = seeded;
         loop {
             let seen = Inputs::of(&files);
-            if seen.raw.is_none() || Some(&seen) != last_seen.as_ref() {
+            // A turn can also end by the clock: one dropped before its
+            // first response is told by silence (`turn`), with nothing
+            // changing — so while working, look every tick regardless.
+            let working = prev == Some(status::State::Working);
+            if working || seen.raw.is_none() || Some(&seen) != last_seen.as_ref() {
                 last_seen = Some(seen);
                 if let Some((state, acked)) = status::track_session(&files, &cmd0, anchor_pid) {
                     // Read the con_id fresh: the input pump and focus

@@ -246,6 +246,18 @@ pub(crate) struct StateRecord {
     /// the agent waits at — what `wait` reports and `send` will refuse with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rule: Option<String>,
+    /// The detector's own verdict on the screen, when it differs from
+    /// `state` — which for a hook agent is the screen with the turn ledger
+    /// folded in (a turn reads `working` while the screen may say idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) screen: Option<String>,
+}
+
+impl StateRecord {
+    /// What the screen itself shows, ledger aside.
+    pub(crate) fn screen(&self) -> &str {
+        self.screen.as_deref().unwrap_or(&self.state)
+    }
 }
 
 fn seen_by_default() -> bool {
@@ -1429,6 +1441,7 @@ mod tests {
                 since: 1,
                 seen: true,
                 rule: None,
+                screen: None,
             })
         });
         let mut names: Vec<String> = fs::read_dir(&dir)
@@ -1467,6 +1480,7 @@ mod tests {
                     since: 1,
                     seen: true,
                     rule: None,
+                    screen: None,
                 })
             });
         }

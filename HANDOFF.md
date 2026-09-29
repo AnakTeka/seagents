@@ -256,7 +256,8 @@ Source layout under `src/`:
   parses one.
 - **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
   is mid-turn" (§6), per adapter: the hook ledger plus the transcript's
-  interrupt record, or the screen for hookless agents.
+  interrupt record and the dropped-turn rule, or the screen for hookless
+  agents.
 - **`src/transcript/`** — the agent's own conversation file (§10), the
   shared layer `read` and the future sessions browser read through:
   `model.rs` (the common record model), `claude.rs` (the one Claude JSONL
@@ -266,7 +267,7 @@ Source layout under `src/`:
   `Format::detect` uses for `read --transcript`),
   `index.rs` (the lazy, incrementally extended offset index cached under
   `sessions/`), `mainline.rs` (the tree, the main line, `resume()` for a
-  cursor), `render.rs` (the collapse rules); `Transcript` in `mod.rs` ties
+  cursor), `render.rs` (the collapse rules); `interrupted_since()` and `responded_since()` in `mod.rs` are the turn ledger's two questions of it; `Transcript` there ties
   them together. `Format` names a parser; the adapter's `[read] transcript`
   picks it.
 - **`src/read.rs`** — `seagents read`: the source (a target's reported
@@ -402,7 +403,9 @@ Per session, keyed by the wrapper's pid:
 - **`<wrapper_pid>.state`** — last observed state transition
   (`{"state": "idle", "since": <unix>, "seen": bool}`, plus `"rule"` — the
   matched detection rule's id, e.g. `live_blocked_form` — while `blocked`,
-  which names the gate for `wait`); powers the
+  which names the gate for `wait`, and `"screen"` — the detector's own verdict
+  when the ledger overrode it, e.g. `working` with `screen: idle` mid-turn,
+  which the dropped-turn rule reads, §6); powers the
   "idle for / waiting for" column and the **done** state: the wrapper marks a
   working→idle completion `seen: false` (shown as 🔵 done, ranked just under
   blocked) until acknowledged — by a HUD preview/jump of that agent, or by the
@@ -818,15 +821,16 @@ all). Its stamps are **milliseconds** — a prompt in the same second as the las
 `Stop` is the common case. `turn::Ledger::in_turn()` is the one definition of
 "mid-turn", shared by `status`, `wait` and `send`:
 
-- **Hook adapters** (Claude): prompted after the last `Stop`, **and** no
-  interrupt record in the transcript since that prompt. On Esc Claude writes a
+- **Hook adapters** (Claude, Codex): prompted after the last `Stop`, **and**
+  no interrupt record in the transcript since that prompt, **and** not dropped
+  before it began (below). On Esc Claude writes a
   `user` record whose text is `[Request interrupted by user]` (or `… for tool
   use]`); `transcript/claude.rs` looks for it in the transcript's last 256 KiB,
   newest first, stopping at the first record older than the prompt (and not
-  parsing at all when the marker isn't in the tail). The screen is **not**
-  consulted: Claude 2.1.284 streams a plain-text answer with no spinner and an
-  idle title, so the detector says `idle` mid-answer, and a turn Esc'd before
-  the detector ever saw it `working` would never have ended.
+  parsing at all when the marker isn't in the tail). The screen does **not**
+  otherwise end a turn: Claude 2.1.284 streams a plain-text answer with no
+  spinner and an idle title, so the detector says `idle` mid-answer, and a
+  turn Esc'd before the detector ever saw it `working` would never have ended.
 - **Screen adapters**: prompted after the last `Stop`, and `.state` not `idle`
   since the prompt.
 
@@ -836,14 +840,29 @@ verdict. The fused state is what `.state` records, so the done marker and the
 "finished" notification fire when the turn really ends, not when the stream
 merely looks idle. `status --json` reports `stops` and `in_turn`.
 
-Residual, measured live on 2.1.284: an Esc that lands **before the model's
-first response** (well under a second after submitting) doesn't interrupt a
-turn — Claude puts the prompt back in the input box and writes neither an
-interrupt record nor a `Stop` (and no hook event exists for it: the binary's
-event list has no cancel). The transcript can't tell that from a stream in
-progress either, because Claude writes an assistant text record only when the
-block is complete. So such an agent reads as `in_turn`/`working` until its next
-prompt or `Stop`, and a `wait` on it times out rather than returning.
+**A turn dropped before it began.** An Esc that lands **before the model's
+first response** (well under a second after submitting; measured on 2.1.284)
+doesn't interrupt a turn — Claude puts the prompt back in the input box and
+writes neither an interrupt record nor a `Stop`, fires no hook (the binary's
+event list has no cancel), and the transcript records after the prompt
+(`last-prompt`, `mode`, `permission-mode`, …) are the ones every turn writes
+at its start. There is no exact trace, so `turn.rs` reads the absence of
+everything a live turn does: the detector's own screen verdict (`.state`'s
+`screen`) is idle, the tee has been silent for 10 s since the prompt, and the
+transcript has no assistant record (text, reasoning, tool call) since it
+(`transcript::responded_since`). Thinking and a slow first token show a
+spinner whose timer repaints every second (working, and the tee grows); a
+streamed answer grows the tee; a tool call is an assistant record (a 25 s
+foreground command, verified, is not taken for a drop); a permission prompt
+is `blocked`. Such a turn then ends — `wait` says `interrupted` (verified:
+rc 5, ~12 s after the Esc) and the agent reads idle. Since nothing changes on
+disk at that moment, the monitor re-looks every tick while its agent is
+`working` rather than only when the tee or `.agent` changed. Codex never
+meets the rule: it records `turn_aborted` even then, and its turn timer
+repaints every second. Found with it: after a dropped turn the prompt is
+still in the input box, and a `send` pastes after it — the two arrive as one
+prompt (`…the seaReply with exactly: …`, verified); the same as sending into
+a composer holding a human's draft.
 
 **One-time cost of the hook cutover.** Wrappers started by a pre-hook binary
 have no `.agent` (and the conversation id an old capture cached in their
@@ -934,7 +953,7 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 | `timeout` | 2 | `--timeout` (default 5m; `30s`/`5m`/`1h`/seconds) passed — call again with the same N; nothing is consumed |
 | `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
 | `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) — also for a reaped agent, from its tombstone (§2), for a day |
-| `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
+| `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc, or dropped before its first response, §6): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
 | `no_hooks` | 6 | the agent was handed hooks and given a prompt ≥ 20 s ago, and none has reported (`.agent` has no `session_id`): no turn will ever be seen to end. `message` names the adapter and `hook.log` |
 
 1 is an error (unknown target; an N ahead of the ledger — a restored agent's

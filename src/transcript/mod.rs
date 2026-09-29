@@ -76,6 +76,35 @@ pub(crate) fn interrupted_since(format: Format, transcript: &Path, since_ms: u64
     }
 }
 
+/// Did the agent write anything of its own — assistant text, reasoning, a
+/// tool call — stamped at or after `since_ms`? Read from the transcript's
+/// last 256 KiB, newest line first, stopping at the first one older than
+/// `since_ms`; what a turn writes at its start (the prompt, attachments,
+/// mode records) is not the agent's.
+pub(crate) fn responded_since(format: Format, transcript: &Path, since_ms: u64) -> bool {
+    let head = match format {
+        Format::Claude => claude::head,
+        Format::Codex => codex::head,
+    };
+    let Some(tail) = crate::status::read_tail(transcript, 256 * 1024) else {
+        return false;
+    };
+    for line in tail.rsplit(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        // Untimed lines (Claude's mode and title records) and the tail's
+        // first line, cut mid-record, say nothing either way.
+        let Some(node) = head(line, 0, &[]).filter(|n| n.ts != 0) else {
+            continue;
+        };
+        if node.ts < since_ms {
+            return false;
+        }
+        if node.kind == index::NodeKind::Assistant {
+            return true;
+        }
+    }
+    false
+}
+
 /// One transcript opened for reading: its index (built or extended on open)
 /// and the file, read by offset only for the lines asked for.
 pub(crate) struct Transcript {
@@ -178,6 +207,35 @@ fn parse_utc_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turns_start_is_not_a_response_and_an_assistant_record_is() {
+        // What Claude 2.1.284 wrote for a prompt Esc'd before its first
+        // response (measured): the prompt, its attachments, and the untimed
+        // records every turn starts with — then nothing.
+        let dir = std::env::temp_dir().join(format!("seagents-responded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("t.jsonl");
+        let u = |n: u32| format!("00000000-0000-4000-8000-{n:012}");
+        let mut lines = vec![
+            format!(r#"{{"type":"assistant","uuid":"{}","parentUuid":null,"timestamp":"2026-09-29T14:27:40.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"old"}}]}}}}"#, u(1)),
+            format!(r#"{{"type":"user","uuid":"{}","parentUuid":"{}","timestamp":"2026-09-29T14:27:44.930Z","message":{{"role":"user","content":"Write a poem"}}}}"#, u(2), u(1)),
+            format!(r#"{{"type":"attachment","uuid":"{}","parentUuid":"{}","timestamp":"2026-09-29T14:27:45.004Z","attachment":{{"type":"prompt_snapshot"}}}}"#, u(3), u(2)),
+            r#"{"type":"last-prompt","lastPrompt":"Write a poem","sessionId":"s"}"#.to_string(),
+            r#"{"type":"mode","mode":"normal","sessionId":"s"}"#.to_string(),
+        ];
+        let prompt = 1_790_692_064_930;
+        std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+        assert!(!responded_since(Format::Claude, &t, prompt));
+        // The answer's first block lands.
+        lines.push(format!(r#"{{"type":"assistant","uuid":"{}","parentUuid":"{}","timestamp":"2026-09-29T14:27:46.401Z","message":{{"role":"assistant","content":[{{"type":"thinking","thinking":"…"}}]}}}}"#, u(4), u(3)));
+        std::fs::write(&t, lines.join("\n") + "\n").unwrap();
+        assert!(responded_since(Format::Claude, &t, prompt));
+        // An older answer is not this prompt's.
+        assert!(!responded_since(Format::Claude, &t, prompt + 10_000));
+        assert!(!responded_since(Format::Claude, &dir.join("missing.jsonl"), prompt));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn utc_timestamps_parse_to_unix_milliseconds() {

@@ -457,7 +457,7 @@ fn send(
         let mut last = shared.last_submit.lock().unwrap_or_else(|e| e.into_inner());
         let agent = registry::read_agent(&w.files);
         let state = registry::read_state(&w.files);
-        let in_turn = shared.ledger.in_turn(&agent, state.as_ref());
+        let in_turn = shared.ledger.in_turn(&agent, state.as_ref(), &w.files);
         let pending = last.as_ref().is_some_and(|s| s.pending(shared.ledger.turns, agent.prompted_at));
         match gate(state.as_ref(), in_turn, pending, detectable, now, answer) {
             Gate::Go { paired } => {
@@ -634,7 +634,7 @@ mod tests {
     }
 
     fn st(word: &str) -> StateRecord {
-        StateRecord { state: word.into(), since: 0, seen: true, rule: None }
+        StateRecord { state: word.into(), since: 0, seen: true, rule: None, screen: None }
     }
 
     #[test]

@@ -256,6 +256,24 @@ new=$("$SEA" read it-a --from "$last") || fail "text read --from: rc=$?"
 echo "$new" | grep -q "^DELTA" && ! echo "$new" | grep -q GATED || fail "text read --from: $new"
 pass "read --json: all five answers, the gated Bash call, the by-reference line, a cursor; --from it after one more turn gave only DELTA ($(($(wc -l < "$ROOT/read2.ndjson") - 1)) records); the text cursor line works as --from"
 
+# 3f. A prompt dropped before its first response: an Esc right after the
+#     submit makes Claude put the prompt back in the input box with no
+#     interrupt record, no Stop and no hook. wait still ends it, as
+#     interrupted (rc 5), once the screen has sat idle and silent. Then the
+#     restored prompt is cleared (Ctrl+U), or the next send would append to it.
+tp=$("$SEA" status --json | python3 -c "import json,sys; print(next(d['transcript_path'] for d in json.load(sys.stdin) if d['tag']=='it-a'))")
+marks=$(grep -c 'Request interrupted by user' "$tp")
+out=$("$SEA" send it-a 'Write a 300 word essay about rivers'); n=$(echo "$out" | jq_ "d['stops']")
+"$SEA" send it-a --now --keys '\e' --no-submit > /dev/null || fail "sending Esc"
+out=$("$SEA" wait it-a --after "$n" --timeout 60s); rc=$?
+[ $rc -eq 5 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "interrupted $n" ] || fail "wait on a dropped prompt: rc=$rc $out"
+[ "$(status_of it-a | jq_ "d['in_turn']")" = False ] || fail "still in a turn after the drop: $(status_of it-a)"
+how="dropped before its first response: no interrupt record"
+[ "$(grep -c 'Request interrupted by user' "$tp")" = "$marks" ] \
+  || how="the Esc landed after the first response (an interrupt record); the drop path was not exercised this run"
+"$SEA" send it-a --now --keys '\x15' --no-submit > /dev/null || fail "clearing the input"
+pass "Esc right after a send: wait said interrupted (rc 5), in_turn false — $how"
+
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
 "$SEA" run --tag boss -- sh -c "

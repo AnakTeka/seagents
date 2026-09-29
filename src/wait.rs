@@ -191,7 +191,7 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
         Found::Session(s) if crate::procfs::alive(s.child_pid()) => {
             let agent = registry::read_agent(&s.files);
             let state = registry::read_state(&s.files);
-            let in_turn = ledger.in_turn(&agent, state.as_ref());
+            let in_turn = ledger.in_turn(&agent, state.as_ref(), &s.files);
             // Read again: the monitor and the control thread record when the
             // agent was first prompted.
             let meta = registry::read_meta(&s.files).unwrap_or_else(|| s.meta.clone());
@@ -290,6 +290,7 @@ mod tests {
             since: 0,
             seen: true,
             rule: None,
+            screen: None,
         }
     }
 
