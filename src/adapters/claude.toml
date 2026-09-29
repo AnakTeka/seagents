@@ -99,6 +99,16 @@ exit_sequence    = "/exit"
 long_prompt      = "file"
 inline_max_chars = 700
 inline_max_lines = 2
+# The input box: the row starting with `❯` (after the placeholder-dim
+# `Try "…"` when empty) and the rows under it, between two rules. A prompt
+# Esc'd before its first response is put back there, and a human may have a
+# draft in it; a paste would land after either (verified: one prompt
+# `…about the seaReply with exactly: …`). Ctrl+U deletes to the start of
+# the line, and at a line's start the newline before it (so a box of N
+# lines empties in 2N-1 presses, the cursor at its end). Never Ctrl+C: on
+# an empty box it starts exiting.
+input_glyph      = "❯"
+input_clear      = "\\x15"
 
 [read]
 # JSONL under $CLAUDE_CONFIG_DIR/projects, path reported by the hooks. Also

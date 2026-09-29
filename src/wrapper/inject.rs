@@ -254,7 +254,7 @@ fn enter_key(kitty_flags: u32) -> &'static [u8] {
 /// Decode the escapes `send --keys` takes: `\e` (ESC), `\r`, `\n`, `\t`,
 /// `\0`, `\\`, and `\xNN` for any byte; everything else is taken literally
 /// (as UTF-8). So `\e[B\r` is Down, then Enter.
-pub(super) fn decode_keys(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_keys(s: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

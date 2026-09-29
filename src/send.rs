@@ -115,6 +115,9 @@ pub(crate) enum Refusal {
     /// Nothing can tell when this agent is idle (no detector knows it); only
     /// `--now` can send to it. Exit 1.
     Unsupported,
+    /// The agent's input box holds text seagents did not send — someone's
+    /// draft, which a paste would be appended to. Exit 6.
+    Draft,
     /// The request itself was malformed. Exit 1.
     BadRequest,
     /// Anything else went wrong. Exit 1.
@@ -128,6 +131,7 @@ impl Refusal {
             Refusal::Blocked => 3,
             Refusal::Exit => 4,
             Refusal::Forbidden => 5,
+            Refusal::Draft => 6,
             Refusal::Unsupported | Refusal::BadRequest | Refusal::Failed => 1,
         }
     }

@@ -98,7 +98,10 @@ without `--after` first to get your bearings.
   Reading (`wait`, `read`, `status`) works on anyone.
 - `send` exit 3 (`blocked`): the child waits at a gate; tell the human.
   Exit 2 (`busy_timeout`): it stayed busy for all of `--timeout`; nothing was
-  sent — wait for its turn, then send again. Exit 4: it exited.
+  sent — wait for its turn, then send again. Exit 4: it exited. Exit 6
+  (`draft`): someone (the human) has text typed in the child's input box;
+  nothing was sent, and `--now` won't help — tell the human, or try again
+  later.
 - A child's permission mode is yours by default and can never be higher.
   Set it with `--permission-mode`; an `--arg` that touches permissions or
   sandboxing (`--dangerously-skip-permissions`, `--settings`, `--allowedTools`,

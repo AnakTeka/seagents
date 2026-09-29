@@ -171,10 +171,15 @@ enum Command {
     /// takes one, then Enter 300 ms later. Text an agent would take as
     /// quoted data rather than as your words (Claude: over 700 characters or
     /// 2 lines) is written to `<its cwd>/.seagents/prompts/` instead, and it
-    /// is sent one line telling it to read that file. Refusals print
+    /// is sent one line telling it to read that file. A paste lands after
+    /// whatever is in the agent's input box, so that box must be empty or
+    /// hold a prompt seagents sent that the agent put back (Esc'd before its
+    /// first response), which is cleared first; anything else is someone's
+    /// draft and is refused, --now too. Refusals print
     /// `{"ok":false,"reason","error"[,"rule"]}` and exit: 3 blocked, 2
     /// busy_timeout (still busy at --timeout; nothing was sent), 4 exit, 5
-    /// forbidden, 1 anything else (incl. `unsupported`: no detector knows
+    /// forbidden, 6 draft (text someone typed is in the input box; nothing
+    /// was sent), 1 anything else (incl. `unsupported`: no detector knows
     /// the agent, so only --now can send to it).
     Send {
         /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`

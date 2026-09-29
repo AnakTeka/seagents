@@ -135,6 +135,13 @@ exit_sequence    = "/exit"
 # and is submitted whole — the UserPromptSubmit `prompt` and the rollout's
 # user message hold all of it, and the model acted on its last line.
 long_prompt      = "paste"
+# The composer: the row starting with `›` (the dim `Ask Codex to do
+# anything` when empty) and the rows under it, up to the blank row above the
+# footer. An Esc'd prompt is not put back (Codex 0.152.0), but a human's
+# draft may sit there. Ctrl+U as in Claude: to the line's start, then the
+# newline before it.
+input_glyph      = "›"
+input_clear      = "\\x15"
 
 [read]
 # The rollout JSONL under $CODEX_HOME/sessions/YYYY/MM/DD/, path reported by

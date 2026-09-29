@@ -22,7 +22,7 @@ use crate::registry::{self, Files};
 use crate::window;
 
 mod control;
-mod inject;
+pub(crate) mod inject;
 mod lead;
 mod monitor;
 mod pumps;
@@ -184,6 +184,7 @@ pub(crate) fn run(
             modes,
             wake,
             argv0: cmd[0].clone(),
+            seed: seed.clone(),
         })
     });
 

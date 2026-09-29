@@ -83,6 +83,9 @@ pub(super) struct Wiring {
     pub(super) wake: Arc<super::monitor::Wake>,
     /// The agent's command, first word: which adapter, which ledger.
     pub(super) argv0: String,
+    /// The seed prompt it was started on, if any: submitted by seagents,
+    /// like a `send`.
+    pub(super) seed: Option<String>,
 }
 
 struct Shared {
@@ -93,6 +96,9 @@ struct Shared {
     /// Held across a whole submission (body, delay, Enter), so two never
     /// interleave; records the last one until the agent confirms it.
     last_submit: Mutex<Option<Submitted>>,
+    /// The text of the last prompt seagents submitted (a `send`'s paste, or
+    /// the seed): what the agent may have put back in its input box.
+    ours: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -132,6 +138,7 @@ pub(super) fn spawn(wiring: Wiring) -> Option<Control> {
     remove_on_signal(sock.clone());
     let shared = Arc::new(Shared {
         ledger: Ledger::for_command(&wiring.argv0),
+        ours: Mutex::new(wiring.seed.clone()),
         wiring,
         life: Mutex::new(Life::default()),
         changed: Condvar::new(),
@@ -469,6 +476,12 @@ fn send(
         let pending = last.as_ref().is_some_and(|s| s.pending(shared.ledger.turns, agent.prompted_at));
         match gate(state.as_ref(), in_turn, pending, detectable, now, answer) {
             Gate::Go { paired } => {
+                let gated = state.as_ref().is_some_and(|s| s.state == "blocked");
+                // A paste lands after whatever is in the input box. Keys
+                // are the caller's own business (a menu, an Esc).
+                if !gated && matches!(body, Paste(_)) {
+                    make_room(shared, &adapter.send, me)?;
+                }
                 let stops = agent.stops;
                 let line = match &body {
                     Paste(text) if adapter.send.by_reference(text) => {
@@ -484,11 +497,13 @@ fn send(
                 let ms = crate::clock::unix_now_ms();
                 inject::deliver(&w.writer, &w.modes, body, submit, framing(&adapter))
                     .map_err(|e| Reply::refused(Refusal::Failed, e))?;
+                if let (Body::Paste(text), true) = (body, submit && !gated) {
+                    *shared.ours.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+                }
                 // Into a gate: reply once `.state` has caught up, so a
                 // `wait` called the moment this returns doesn't read the
                 // gate that was just answered.
                 w.wake.input();
-                let gated = state.as_ref().is_some_and(|s| s.state == "blocked");
                 if submit && !gated {
                     // A prompt: from here its hooks owe a report (`hook::health`).
                     registry::note_engaged(&w.files);
@@ -551,6 +566,85 @@ fn send(
     }
 }
 
+/// How often, and at most how long, [`make_room`] watches the tee for the
+/// agent's repaint after a key.
+const REPAINT_POLL: Duration = Duration::from_millis(20);
+const REPAINT_WAIT: Duration = Duration::from_secs(1);
+
+/// What the agent's input box holds now (`detect::input_box`), rendered
+/// from the tee at the terminal's live size; None: nothing to go by.
+fn input_box(w: &Wiring, glyph: &str) -> Option<String> {
+    let size = crate::procfs::live_pty_size(w.anchor_pid)
+        .or_else(|| registry::read_meta(&w.files).and_then(|m| Some((m.rows?, m.cols?))));
+    let (rows, cols) = size.unwrap_or((24, 80));
+    let data = crate::status::read_tail(&w.files.raw, 1024 * 1024)?;
+    crate::detect::input_box(&data, rows, cols, glyph)
+}
+
+/// The same words, however the box wrapped and indented them.
+fn same_text(a: &str, b: &str) -> bool {
+    a.chars().filter(|c| !c.is_whitespace()).eq(b.chars().filter(|c| !c.is_whitespace()))
+}
+
+/// Make sure a paste starts a prompt of its own: the input box must be
+/// empty, or hold exactly the last prompt seagents submitted — one the agent
+/// put back after a turn dropped before its first response (Claude, §6) —
+/// which is cleared with the adapter's `input_clear`, pressed until the box
+/// reads empty. Anything else is someone's draft: refused, `--now` or not —
+/// the human is typing. An adapter with no `input_glyph`, or a screen that
+/// shows no box with the cursor in it, goes ahead as before.
+fn make_room(shared: &Shared, send: &adapter::Send, me: &str) -> Result<(), Reply> {
+    if send.input_glyph.is_empty() {
+        return Ok(());
+    }
+    let w = &shared.wiring;
+    let Some(text) = input_box(w, &send.input_glyph).filter(|t| !t.is_empty()) else {
+        return Ok(());
+    };
+    let ours = shared.ours.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !ours.is_some_and(|o| same_text(&o, &text)) {
+        // Not echoed: an agent caller has no business reading a human's
+        // unsent words.
+        return Err(Reply::refused(
+            Refusal::Draft,
+            format!(
+                "{me}'s input box holds a draft ({} characters) that seagents did not send; \
+                 whoever is typing there submits or clears it",
+                text.chars().count()
+            ),
+        ));
+    }
+    let key = inject::decode_keys(&send.input_clear).map_err(|e| Reply::refused(Refusal::Failed, e))?;
+    let plain = Framing { pre_send: "", submit_delay: Duration::ZERO };
+    // Two presses per line (its text, then the newline before it), and a
+    // few to spare; a box that stops shrinking is given up on.
+    let mut left = text;
+    let mut stalled = 0;
+    for _ in 0..2 * left.lines().count() + 4 {
+        let before = std::fs::metadata(&w.files.raw).map(|m| m.len()).ok();
+        inject::deliver(&w.writer, &w.modes, Body::Keys(&key), false, plain).map_err(|e| Reply::refused(Refusal::Failed, e))?;
+        let deadline = Instant::now() + REPAINT_WAIT;
+        while std::fs::metadata(&w.files.raw).map(|m| m.len()).ok() == before && Instant::now() < deadline {
+            thread::sleep(REPAINT_POLL);
+        }
+        // The repaint may come in more than one write.
+        thread::sleep(REPAINT_POLL * 3);
+        match input_box(w, &send.input_glyph) {
+            Some(t) if t.is_empty() => return Ok(()),
+            Some(t) if t == left => stalled += 1,
+            Some(t) => left = t,
+            None => stalled += 1,
+        }
+        if stalled >= 3 {
+            break;
+        }
+    }
+    Err(Reply::refused(
+        Refusal::Failed,
+        format!("{me}'s input box still held a prompt seagents had sent, after clearing it; nothing was sent"),
+    ))
+}
+
 /// Ask the agent to exit with its adapter's exit sequence (as a `--now`
 /// prompt), then SIGTERM its process group, then SIGKILL, a grace period
 /// apart — straight to the signals with `force`, with no exit sequence, or
@@ -566,8 +660,14 @@ fn stop(shared: &Shared, force: bool) -> Result<Reply, Reply> {
     let blocked = registry::read_state(&w.files).is_some_and(|s| s.state == "blocked");
     if !force && !blocked && !adapter.send.exit_sequence.is_empty() {
         let _serial = shared.last_submit.lock().unwrap_or_else(|e| e.into_inner());
+        // Typed after a human's draft the sequence would be submitted as
+        // part of it — a prompt, not an exit: straight to the signals then.
+        let me = registry::read_meta(&w.files).map(|m| m.tag).unwrap_or_default();
         let body = Body::Paste(&adapter.send.exit_sequence);
-        if inject::deliver(&w.writer, &w.modes, body, true, framing(&adapter)).is_ok() && shared.wait_exit(STOP_GRACE) {
+        if make_room(shared, &adapter.send, &me).is_ok()
+            && inject::deliver(&w.writer, &w.modes, body, true, framing(&adapter)).is_ok()
+            && shared.wait_exit(STOP_GRACE)
+        {
             return gone;
         }
     }
@@ -681,6 +781,16 @@ mod tests {
         assert_eq!(referenced_file(&line), Some(".seagents/prompts/7-2-beef.md"));
         assert_eq!(referenced_file(&abs), Some("/elsewhere/p.md"));
         assert_eq!(referenced_file("Read the file x.md please"), None);
+    }
+
+    #[test]
+    fn a_prompt_put_back_is_ours_however_the_box_wrapped_it() {
+        let line = "Read the file .seagents/prompts/7-2-beef.md (relative to your working directory) and carry out";
+        assert!(same_text(line, "Read the file .seagents/prompts/7-2-beef.md (relative to your working\ndirectory) and carry out"));
+        assert!(same_text(line, "Read the file .seagents/prompts/7-2-beef.md (relative to your wor\nking directory) and carry out"));
+        assert!(same_text("one\ntwo", "one\ntwo"));
+        assert!(!same_text("Reply with exactly: A", "Reply with exactly: AB"));
+        assert!(!same_text("Reply with exactly: A", "my own draft"));
     }
 
     #[test]

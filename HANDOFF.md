@@ -224,7 +224,9 @@ Source layout under `src/`:
   - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
   - `control.rs` — the control socket (§9): bind, `SO_PEERCRED`
     authorization (`authorize()`, the lineage rule), submit-when-idle
-    (`gate()`), `stop`'s escalation; `Control::finish()` at exit.
+    (`gate()`), the input-box check (`make_room()`: clear a prompt of ours
+    the agent put back, refuse a draft), `stop`'s escalation;
+    `Control::finish()` at exit.
   - `inject.rs` — the one implementation of writing into the agent
     (§9): `SharedWriter` (the PTY master's input side, shared by the input
     pump and the control thread), `ModeScanner`/`PtyModes` (bracketed paste
@@ -278,7 +280,8 @@ Source layout under `src/`:
   detects), `print()`, `read_session()` (detection), `settle()` (screen fused
   with the turn ledger), `observe_state()` (the `.state` transition rules), OSC-title parsing (`all_titles`,
   `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
-- **`src/detect.rs`** — `render()` (vt100) plus regression tests that pin the
+- **`src/detect.rs`** — `render()` (vt100), `input_box()` (what the
+  agent's input box holds, §9) plus regression tests that pin the
   vendored engine's verdicts on live-capture scenarios; `debug_screen()`; the
   manifest-update helpers (`update_manifests_now()`, the HUD's daily
   `spawn_manifest_update()`, `manifest_health_warning()`).
@@ -337,9 +340,9 @@ Source layout under `src/`:
   `spawn` reads the mode order,
   `permission_argv` and, for an agent caller, `privileged`; `capabilities()` is what `status --json` reports per agent
   (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
-  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence, and
+  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence,
   when a body goes by reference: `long_prompt`, `inline_max_chars`,
-  `inline_max_lines`); `[read] transcript` names the transcript format
+  `inline_max_lines`, and the input box: `input_glyph`, `input_clear`); `[read] transcript` names the transcript format
   (`claude`, `codex`) that `read` and the turn ledger's interrupt check parse —
   `read` is a capability where there is one and a way to learn the path.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
@@ -878,10 +881,10 @@ rc 5, ~12 s after the Esc) and the agent reads idle. Since nothing changes on
 disk at that moment, the monitor re-looks every tick while its agent is
 `working` rather than only when the tee or `.agent` changed. Codex never
 meets the rule: it records `turn_aborted` even then, and its turn timer
-repaints every second. Found with it: after a dropped turn the prompt is
-still in the input box, and a `send` pastes after it — the two arrive as one
-prompt (`…the seaReply with exactly: …`, verified); the same as sending into
-a composer holding a human's draft.
+repaints every second. After a dropped turn the prompt is still in the
+input box, and a paste lands after it — the two used to arrive as one
+prompt (`…the seaReply with exactly: …`, verified); `send` now clears it
+first (§9).
 
 **One-time cost of the hook cutover.** Wrappers started by a pre-hook binary
 have no `.agent` (and the conversation id an old capture cached in their
@@ -1088,7 +1091,35 @@ since whatever is typed into a permission menu answers it;
 and replies once the gate is seen gone (≤ 1 s, §8). An agent no
 detector knows (a plain shell) can't be seen to be idle: only `--now` sends
 to it (reason `unsupported` otherwise). Exit codes: 0 ok, 2 `busy_timeout`
-(nothing was sent), 3 `blocked`, 4 `exit`, 5 `forbidden`, 1 anything else.
+(nothing was sent), 3 `blocked`, 4 `exit`, 5 `forbidden`, 6 `draft`
+(below), 1 anything else.
+
+**The input box.** A paste lands after whatever the agent's input box
+already holds: a prompt Claude put back after a turn dropped before its
+first response (§6), or a human's half-typed draft. So before any paste
+(not `--keys`, not into a gate) the wrapper looks (`control::make_room`):
+`detect::input_box` renders the tee at the live size and takes the last row
+starting with the adapter's `[send] input_glyph` (Claude `❯`, Codex `›`)
+and the rows under it up to a blank row or a rule. The empty box's
+placeholder (`Try "…"`, `Ask Codex to do anything`) is drawn dim, which
+vt100 0.15 does not record, so the cursor tells it apart: both tools park it
+where typing goes — at the text's start in an empty box (measured) — and a
+box the cursor is not in counts as "nothing to go by" (send as before), so a
+placeholder never reads as a draft. Text that is, whitespace aside, the last
+prompt this wrapper submitted (a `send`'s paste, or the seed) is ours: the
+adapter's `input_clear` (Ctrl+U for both: to the line's start, then the
+newline before it — never Ctrl+C, which on an empty box starts exiting) is
+pressed, one at a time and re-looked after each repaint, until the box reads
+empty. Anything else is refused, `draft`, rc 6, `--now` or not — the human is
+typing; the reply gives its length, never its words. `stop` makes the same
+check before its exit sequence, and with a draft there goes straight to
+SIGTERM (`/exit` typed after it would be submitted as a prompt). Verified
+live, Claude 2.1.284: a dropped one-line, two-line and by-reference prompt
+were each cleared and the next send arrived alone; a tmux-typed draft was
+refused (rc 6, also with `--now`); `stop` after a drop exited via `/exit` in
+1.2 s. Codex 0.152.0 does not put an Esc'd prompt back, but its composer
+takes a draft, refused the same way. Known gap: a one-line draft whose
+cursor was moved to its start reads as empty.
 
 **Framing** (`wrapper/inject.rs`, copied from herdr): text is a bracketed
 paste (`ESC[200~…ESC[201~`, the end marker stripped from the body) when the
@@ -1432,6 +1463,8 @@ tools/test-restore.sh alacritty-daemon
 # a Bash permission gate: wait says blocked, send --answer-permission, and an
 # immediate wait gets the turn) → read (--json holds every answer and the
 # gated call; --from its cursor after one more turn gives just that turn) →
+# a prompt Esc'd before its first response (interrupted; the next send clears
+# it from the input box and arrives alone) → a draft in the box (send rc 6) →
 # lineage/caps and the socket's lineage rule → focus → stop, with a real
 # Claude (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.
@@ -1443,7 +1476,7 @@ tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon] [--codex]
 # --codex: the same loop with a real Codex (gpt-5.6-luna, low effort) in a
 # scratch CODEX_HOME that links the real auth.json only — seeded turn,
 # capabilities, send, a 41-line paste, Esc → interrupted then a fresh turn,
-# read, stop. Skipped with a note when codex isn't installed.
+# a draft in its composer (send rc 6), read, stop. Skipped with a note when codex isn't installed.
 ```
 
 The HUD and interactive relay need a real terminal — they can't be driven from a

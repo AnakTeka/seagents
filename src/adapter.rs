@@ -222,6 +222,13 @@ pub(crate) struct Send {
     pub(crate) long_prompt: LongPrompt,
     pub(crate) inline_max_chars: usize,
     pub(crate) inline_max_lines: usize,
+    /// The glyph the input box's first row starts with, so a `send` can see
+    /// what is already typed there before pasting after it
+    /// ([`crate::detect::input_box`]). Empty: the box is not looked at.
+    pub(crate) input_glyph: String,
+    /// Keys, in `send --keys` syntax, that clear one line of the input box;
+    /// pressed until it reads empty.
+    pub(crate) input_clear: String,
 }
 
 impl Default for Send {
@@ -233,6 +240,8 @@ impl Default for Send {
             long_prompt: LongPrompt::Paste,
             inline_max_chars: 0,
             inline_max_lines: 0,
+            input_glyph: String::new(),
+            input_clear: String::new(),
         }
     }
 }
@@ -505,6 +514,13 @@ fn parse(text: &str) -> Result<Adapter, String> {
     if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
         return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
     }
+    if !send.input_glyph.is_empty() {
+        match crate::wrapper::inject::decode_keys(&send.input_clear) {
+            Ok(keys) if !keys.is_empty() => {}
+            Ok(_) => return Err("send.input_glyph needs input_clear".to_string()),
+            Err(e) => return Err(format!("send.input_clear: {e}")),
+        }
+    }
     Ok(adapter)
 }
 
@@ -658,6 +674,8 @@ mod tests {
         assert_eq!((codex.launch.identity, codex.launch.turns), (Identity::Hook, Turns::Hook));
         assert_eq!(codex.send.long_prompt, LongPrompt::Paste);
         assert_eq!(codex.send.exit_sequence, "/exit");
+        assert_eq!((claude.send.input_glyph.as_str(), claude.send.input_clear.as_str()), ("❯", "\\x15"));
+        assert_eq!((codex.send.input_glyph.as_str(), codex.send.input_clear.as_str()), ("›", "\\x15"));
         assert_eq!(codex.read.transcript, Some(crate::transcript::Format::Codex));
         assert_eq!(codex.restore.resume, ["resume", "{session}"]);
         // Same vocabulary as Claude's, since its hooks report a parent's mode
@@ -834,6 +852,9 @@ mod tests {
         assert!(parse(&format!("{hooks}events = [\"Interrupt\"]\n")).unwrap_err().contains("Interrupt"));
         assert!(parse("[hooks]\nflags = [\"c\"]\n").unwrap_err().contains("not a flag"));
         assert!(parse("[restore]\nresume = [\"--resume\"]\n").unwrap_err().contains("{session}"));
+        assert!(parse("[send]\ninput_glyph = \">\"\n").unwrap_err().contains("input_clear"));
+        assert!(parse("[send]\ninput_glyph = \">\"\ninput_clear = \"\\\\q\"\n").unwrap_err().contains("input_clear"));
+        assert!(parse("[send]\ninput_glyph = \">\"\ninput_clear = \"\\\\x15\"\n").is_ok());
         assert!(parse("[launch.privileged]\nflags = [\"x\"]\n").unwrap_err().contains("not a flag"));
         assert!(parse("[launch.privileged]\ncommands = [\"-x\"]\n").unwrap_err().contains("not a word"));
         assert!(parse("[launch.privileged]\nconfig_keys = [\"k\"]\n").unwrap_err().contains("config_flags"));

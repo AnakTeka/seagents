@@ -262,8 +262,9 @@ pass "read --json: all five answers, the gated Bash call, the by-reference line,
 # 3f. A prompt dropped before its first response: an Esc right after the
 #     submit makes Claude put the prompt back in the input box with no
 #     interrupt record, no Stop and no hook. wait still ends it, as
-#     interrupted (rc 5), once the screen has sat idle and silent. Then the
-#     restored prompt is cleared (Ctrl+U), or the next send would append to it.
+#     interrupted (rc 5), once the screen has sat idle and silent. The next
+#     send finds its own prompt back in the input box and clears it first —
+#     without that the two arrive as one prompt (`…about riversReply with…`).
 tp=$("$SEA" status --json | python3 -c "import json,sys; print(next(d['transcript_path'] for d in json.load(sys.stdin) if d['tag']=='it-a'))")
 marks=$(grep -c 'Request interrupted by user' "$tp")
 out=$("$SEA" send it-a 'Write a 300 word essay about rivers'); n=$(echo "$out" | jq_ "d['stops']")
@@ -274,8 +275,28 @@ out=$("$SEA" wait it-a --after "$n" --timeout 60s); rc=$?
 how="dropped before its first response: no interrupt record"
 [ "$(grep -c 'Request interrupted by user' "$tp")" = "$marks" ] \
   || how="the Esc landed after the first response (an interrupt record); the drop path was not exercised this run"
-"$SEA" send it-a --now --keys '\x15' --no-submit > /dev/null || fail "clearing the input"
 pass "Esc right after a send: wait said interrupted (rc 5), in_turn false — $how"
+out=$("$SEA" send it-a 'Reply with exactly: AFTERDROP'); rc=$?; n=$(echo "$out" | jq_ "d['stops']")
+[ $rc -eq 0 ] || fail "send after the drop: rc=$rc $out"
+out=$("$SEA" wait it-a --after "$n" --timeout 90s); rc=$?
+[ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['last_message'].strip()")" = AFTERDROP ] || fail "wait after the drop: rc=$rc $out"
+"$SEA" read it-a --json --tail 4 | python3 -c "
+import json,sys
+users=[r['text'] for r in map(json.loads, sys.stdin) if r.get('kind')=='user']
+assert users and users[-1].strip()=='Reply with exactly: AFTERDROP', users
+" || fail "the prompt after the drop did not arrive alone: $("$SEA" read it-a --tail 4)"
+pass "the next send cleared the input box first: its prompt arrived alone, answered AFTERDROP"
+
+# 3g. A draft someone typed (not a prompt seagents sent) is refused, --now
+#     or not: the human is typing.
+"$SEA" send it-a --now --keys 'half a thought' --no-submit > /dev/null || fail "typing a draft"
+sleep 1
+out=$("$SEA" send it-a 'never'); rc=$?
+[ $rc -eq 6 ] && [ "$(echo "$out" | jq_ "d['reason']")" = draft ] || fail "send over a draft: rc=$rc $out"
+out=$("$SEA" send it-a --now 'never'); rc=$?
+[ $rc -eq 6 ] || fail "send --now over a draft: rc=$rc $out"
+for _ in 1 2 3; do "$SEA" send it-a --now --keys '\x15' --no-submit > /dev/null; done
+pass "a send into a human's draft was refused (rc 6, draft), --now too: $(echo "$out" | jq_ "d['error']")"
 
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
@@ -367,14 +388,14 @@ pass "stop it-a: wait --for exit returned exit (rc 4), the socket and its prompt
 "$SEA" status > /dev/null
 [ -z "$(meta_of it-a)" ] && [ -f "$CACHE/it-a.exited" ] || fail "it-a was not reaped into a tombstone"
 out=$("$SEA" wait it-a --timeout 5s); rc=$?
-[ $rc -eq 4 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "exit 6" ] \
-  && echo "$out" | jq_ "d['last_message']" | grep -q DELTA || fail "wait on a reaped agent: rc=$rc $out"
+[ $rc -eq 4 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "exit 7" ] \
+  && echo "$out" | jq_ "d['last_message']" | grep -q AFTERDROP || fail "wait on a reaped agent: rc=$rc $out"
 out=$("$SEA" wait it-a --after 5 --timeout 5s); rc=$?
 [ $rc -eq 0 ] && [ "$(echo "$out" | jq_ "d['reason']")" = turn ] || fail "wait --after 5 on a reaped agent: rc=$rc $out"
-"$SEA" read it-a --tail 2 | grep -q DELTA || fail "read of a reaped agent"
+"$SEA" read it-a --tail 2 | grep -q AFTERDROP || fail "read of a reaped agent"
 "$SEA" send it-a 'never' > /dev/null 2>&1; rc=$?
 [ $rc -eq 1 ] || fail "send to a reaped agent: rc=$rc"
-pass "reaped it-a: wait says exit (rc 4, last_message DELTA), --after 5 still gets its turn, read works, send refuses"
+pass "reaped it-a: wait says exit (rc 4, last_message AFTERDROP), --after 5 still gets its turn, read works, send refuses"
 
 # 7. Codex: the same loop through its adapter — hooks injected as one trusted
 #    `-c hooks=…` (no "hooks need review" dialog, or no turn would land), the
@@ -443,6 +464,13 @@ out=$("$SEA" send it-c 'Reply with exactly: AFTER'); n=$(echo "$out" | jq_ "d['s
 out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q AFTER || fail "codex after Esc: rc=$rc $out"
 pass "an Esc'd codex turn is interrupted (rc 5); the next send's wait gets its own turn (AFTER)"
+
+"$SEA" send it-c --now --keys 'half a thought' --no-submit > /dev/null || fail "codex: typing a draft"
+sleep 1
+out=$("$SEA" send it-c 'never'); rc=$?
+[ $rc -eq 6 ] && [ "$(echo "$out" | jq_ "d['reason']")" = draft ] || fail "codex send over a draft: rc=$rc $out"
+for _ in 1 2 3; do "$SEA" send it-c --now --keys '\x15' --no-submit > /dev/null; done
+pass "codex: a send into a draft in its composer was refused (rc 6, draft)"
 
 out=$("$SEA" read it-c)
 for w in XRAY LONGOK AFTER; do echo "$out" | grep -q "$w" || fail "codex read lacks $w: $out"; done
