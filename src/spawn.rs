@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::adapter::Launch;
 use crate::launch;
-use crate::registry::{self, Caps};
+use crate::registry;
 
 /// How long the child's `.meta` may take to appear. `run` writes it right
 /// after forking the agent, before it looks for its window, so this covers
@@ -103,7 +103,6 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
         caller.as_ref().map(|s| s.meta.wrapper_pid),
         &cwd,
         &crate::snapshot::captured_tags(),
-        &caps_from_env()?,
     )?;
 
     let cwd = if args.worktree {
@@ -234,31 +233,6 @@ fn privileged_check(launch: &Launch, args: &[String]) -> Result<(), String> {
              use --permission-mode (capped at your own)"
         )),
     }
-}
-
-/// Caps from `SEAGENTS_MAX_DEPTH` / `_MAX_CHILDREN` / `_MAX_SPAWNED`, else
-/// the defaults (3 deep, 4 wide, 12 in all). A value that isn't a number is
-/// an error, not silently the default.
-fn caps_from_env() -> Result<Caps, String> {
-    caps_from(|k| std::env::var(k).ok())
-}
-
-fn caps_from(var: impl Fn(&str) -> Option<String>) -> Result<Caps, String> {
-    let d = Caps::default();
-    let get = |name: &str, default: usize| -> Result<usize, String> {
-        match var(name) {
-            None => Ok(default),
-            Some(v) => v
-                .trim()
-                .parse()
-                .map_err(|_| format!("{name}={v:?} is not a number")),
-        }
-    };
-    Ok(Caps {
-        depth: get("SEAGENTS_MAX_DEPTH", d.depth as usize)? as u32,
-        children: get("SEAGENTS_MAX_CHILDREN", d.children)?,
-        spawned: get("SEAGENTS_MAX_SPAWNED", d.spawned)?,
-    })
 }
 
 /// `$runtime/seed-<tag>`, 0600, holding the prompt for `run --seed-file`.
@@ -493,16 +467,6 @@ mod tests {
         ] {
             assert_eq!(refused(&l, args), None, "{args:?}");
         }
-    }
-
-    #[test]
-    fn caps_default_and_env_overrides_must_be_numbers() {
-        assert_eq!(caps_from(|_| None).unwrap(), Caps::default());
-        let c = caps_from(|k| (k == "SEAGENTS_MAX_CHILDREN").then(|| " 9 ".to_string())).unwrap();
-        assert_eq!((c.depth, c.children, c.spawned), (3, 9, 12));
-        assert!(caps_from(|k| (k == "SEAGENTS_MAX_DEPTH").then(|| "lots".to_string()))
-            .unwrap_err()
-            .contains("SEAGENTS_MAX_DEPTH"));
     }
 
     fn scratch(name: &str) -> PathBuf {

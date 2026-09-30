@@ -803,13 +803,21 @@ impl TagClaim {
 /// avoids them, so a new agent never takes a placeholder a pending restore
 /// will want back. It may also be one a `spawn` reserved ([`claim_spawn`]):
 /// that is the spawned `run` taking the name it was launched with.
+///
+/// A child (`parent` given) is held to the fan-out caps ([`admit_child`]),
+/// whoever runs it: `spawn`'s own `run`, `restore`, or a `run --parent`
+/// typed by hand — which is otherwise a way round `spawn`'s caps.
 pub(crate) fn claim_tag(
     requested: Option<&str>,
     parent: Option<&str>,
     cwd: &Path,
     reserved: &HashSet<String>,
 ) -> Result<TagClaim, String> {
-    claim_tag_in(&Dirs::live(), requested, parent, cwd, reserved)
+    let caps = match parent {
+        Some(_) => Caps::configured()?,
+        None => Caps::default(),
+    };
+    claim_tag_in(&Dirs::live(), requested, parent, cwd, reserved, &caps)
 }
 
 fn claim_tag_in(
@@ -818,6 +826,7 @@ fn claim_tag_in(
     parent: Option<&str>,
     cwd: &Path,
     reserved: &HashSet<String>,
+    caps: &Caps,
 ) -> Result<TagClaim, String> {
     check_requested(requested)?;
     // Unlike a session lock, this one must hold: without it two runs can both
@@ -825,6 +834,7 @@ fn claim_tag_in(
     let lock = Lock::acquire(&dir.join("tags.lock"))
         .ok_or("could not lock the tag registry")?;
     let live = list_in(dir);
+    let pending = live_pending(dir);
 
     let (parent, depth) = match parent {
         None => (None, 0),
@@ -833,11 +843,12 @@ fn claim_tag_in(
             let Some(ps) = live.iter().find(|s| s.meta.tag == p) else {
                 return Err(format!("parent {p}: no live agent has that tag"));
             };
+            admit_child(caps, &ps.meta, &live, &pending, requested)?;
             (Some(p.to_string()), ps.meta.depth + 1)
         }
     };
 
-    let pending: HashSet<String> = live_pending(dir).into_iter().map(|p| p.tag).collect();
+    let pending: HashSet<String> = pending.into_iter().map(|p| p.tag).collect();
     let live: HashSet<String> = live.into_iter().map(|s| s.meta.tag).collect();
     let tag = match requested {
         Some(t) if live.contains(t) => {
@@ -872,14 +883,48 @@ fn check_requested(requested: Option<&str>) -> Result<(), String> {
 /// Fan-out limits for agent-spawned agents (ORCHESTRATION-SPEC "Fan-out
 /// caps"). Depth alone would not stop an agent opening fifty windows at
 /// depth 1, hence breadth and a global count too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Caps {
     /// Deepest generation a spawn may create.
+    #[serde(rename = "max_depth")]
     pub(crate) depth: u32,
     /// Live children one agent may have.
+    #[serde(rename = "max_children")]
     pub(crate) children: usize,
     /// Live agent-spawned agents, machine-wide.
+    #[serde(rename = "max_spawned")]
     pub(crate) spawned: usize,
+}
+
+impl Caps {
+    /// The user's caps: `[spawn] max_depth / max_children / max_spawned` in
+    /// `~/.config/seagents/config.toml` (beside the adapter overrides), each
+    /// defaulting when absent; the compiled defaults when there is no file.
+    ///
+    /// Never from the environment: the process asking for a child is the
+    /// agent the caps bound, and everything it runs inherits — and can set —
+    /// its environment (`SEAGENTS_MAX_SPAWNED=999 seagents spawn …` once lifted
+    /// every cap). A file that does not parse, or names a key this binary
+    /// doesn't know, is an error rather than silently the defaults: the user
+    /// wrote it to change a limit.
+    pub(crate) fn configured() -> Result<Caps, String> {
+        let path = crate::vendor::herdr_detect::config::config_dir().join("config.toml");
+        match fs::read_to_string(&path) {
+            Ok(text) => Caps::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Caps::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn parse(text: &str) -> Result<Caps, String> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Config {
+            spawn: Caps,
+        }
+        toml::from_str::<Config>(text).map(|c| c.spawn).map_err(|e| e.message().to_string())
+    }
 }
 
 impl Default for Caps {
@@ -959,9 +1004,12 @@ pub(crate) fn claim_spawn(
     caller: Option<u64>,
     cwd: &Path,
     reserved: &HashSet<String>,
-    caps: &Caps,
 ) -> Result<SpawnClaim, String> {
-    claim_spawn_in(&Dirs::live(), requested, caller, cwd, reserved, caps, std::process::id())
+    let caps = match caller {
+        Some(_) => Caps::configured()?,
+        None => Caps::default(),
+    };
+    claim_spawn_in(&Dirs::live(), requested, caller, cwd, reserved, &caps, std::process::id())
 }
 
 fn claim_spawn_in(
@@ -984,12 +1032,7 @@ fn claim_spawn_in(
             let Some(me) = live.iter().find(|s| s.meta.wrapper_pid == pid) else {
                 return Err("the calling agent's session is gone".to_string());
             };
-            let mut lineage: Vec<(String, Option<String>)> = live
-                .iter()
-                .map(|s| (s.meta.tag.clone(), s.meta.parent.clone()))
-                .collect();
-            lineage.extend(pending.iter().map(|p| (p.tag.clone(), p.parent.clone())));
-            check_caps(caps, &me.meta.tag, me.meta.depth, &lineage)?;
+            admit_child(caps, &me.meta, &live, &pending, None)?;
             Some(me.meta.tag.clone())
         }
     };
@@ -1020,6 +1063,32 @@ fn claim_spawn_in(
     Ok(SpawnClaim { tag, parent, file })
 }
 
+/// Whether agent `parent` may have one more child: the one cap check, made
+/// under the tags lock by a `spawn` reserving a child ([`claim_spawn`]) and
+/// by any `run --parent` registering one ([`claim_tag`]). Counts every live
+/// agent and every reservation, except a reservation of `claiming` itself —
+/// that is this very child, the `run` a `spawn` launched taking the tag it
+/// reserved, and the spawn already counted it.
+fn admit_child(
+    caps: &Caps,
+    parent: &Meta,
+    live: &[Session],
+    pending: &[Pending],
+    claiming: Option<&str>,
+) -> Result<(), String> {
+    let lineage: Vec<(String, Option<String>)> = live
+        .iter()
+        .map(|s| (s.meta.tag.clone(), s.meta.parent.clone()))
+        .chain(
+            pending
+                .iter()
+                .filter(|p| Some(p.tag.as_str()) != claiming)
+                .map(|p| (p.tag.clone(), p.parent.clone())),
+        )
+        .collect();
+    check_caps(caps, &parent.tag, parent.depth, &lineage)
+}
+
 /// Whether agent `parent` (at `depth`) may have one more child, given every
 /// live or reserved agent's (tag, parent). The error names what is in the way,
 /// so the caller can `wait` on a child instead of piling on.
@@ -1032,7 +1101,7 @@ fn check_caps(
     if depth + 1 > caps.depth {
         return Err(format!(
             "{parent} is at depth {depth}: a child would be depth {}, past the cap of {} \
-             (SEAGENTS_MAX_DEPTH)",
+             (the user's max_depth)",
             depth + 1,
             caps.depth
         ));
@@ -1044,7 +1113,7 @@ fn check_caps(
         .collect();
     if children.len() >= caps.children {
         return Err(format!(
-            "{parent} already has {} live {} ({}), the cap is {} (SEAGENTS_MAX_CHILDREN); \
+            "{parent} already has {} live {} ({}), the cap is {} (the user's max_children); \
              wait on one of them first",
             children.len(),
             if children.len() == 1 { "child" } else { "children" },
@@ -1059,7 +1128,7 @@ fn check_caps(
         .collect();
     if spawned.len() >= caps.spawned {
         return Err(format!(
-            "{} agent-spawned agents are live ({}), the cap is {} (SEAGENTS_MAX_SPAWNED)",
+            "{} agent-spawned agents are live ({}), the cap is {} (the user's max_spawned)",
             spawned.len(),
             spawned.join(", "),
             caps.spawned
@@ -1640,7 +1709,7 @@ mod tests {
     }
 
     fn claim(dir: &Dirs, requested: Option<&str>, parent: Option<&str>) -> Result<TagClaim, String> {
-        claim_tag_in(dir, requested, parent, Path::new("/home/u/My Project!"), &HashSet::new())
+        claim_tag_in(dir, requested, parent, Path::new("/home/u/My Project!"), &HashSet::new(), &Caps::default())
     }
 
     /// Claim and create a live session (child = this test process).
@@ -1720,10 +1789,10 @@ mod tests {
             .filter(|n| *n != 0x2a)
             .map(|n| format!("p-{n:04x}"))
             .collect();
-        let c = claim_tag_in(&dir, None, None, Path::new("/p"), &reserved).unwrap();
+        let c = claim_tag_in(&dir, None, None, Path::new("/p"), &reserved, &Caps::default()).unwrap();
         assert_eq!(c.tag, "p-002a");
         drop(c);
-        assert!(claim_tag_in(&dir, Some("p-0001"), None, Path::new("/p"), &reserved).is_ok());
+        assert!(claim_tag_in(&dir, Some("p-0001"), None, Path::new("/p"), &reserved, &Caps::default()).is_ok());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2060,16 +2129,84 @@ mod tests {
         c.create_meta(&Files::in_dir(&dir, 3), sample(3, Some(std::process::id() as u64)));
         assert_eq!(read_meta(&Files::in_dir(&dir, 3)).unwrap().depth, 2);
         let e = spawn_claim(&dir, None, Some(3), &none, &caps).unwrap_err();
-        assert!(e.contains("depth 3") && e.contains("SEAGENTS_MAX_DEPTH"), "{e}");
+        assert!(e.contains("depth 3") && e.contains("max_depth"), "{e}");
         // Global: b and c are spawned, one reservation makes three.
         let _d = spawn_claim(&dir, Some("d"), Some(1), &none, &caps).unwrap();
         let e = spawn_claim(&dir, None, Some(2), &none, &caps).unwrap_err();
-        assert!(e.contains("3 agent-spawned") && e.contains("SEAGENTS_MAX_SPAWNED"), "{e}");
+        assert!(e.contains("3 agent-spawned") && e.contains("max_spawned"), "{e}");
         // A human is not capped, and has no parent.
         let h = spawn_claim(&dir, None, None, &none, &caps).unwrap();
         assert_eq!(h.parent, None);
         // A caller whose session is gone is refused rather than made human.
         assert!(spawn_claim(&dir, None, Some(99), &none, &caps).unwrap_err().contains("gone"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_with_a_parent_is_held_to_the_caps_its_spawn_already_counted_once() {
+        let dir = scratch("runcaps");
+        let none = HashSet::new();
+        let caps = Caps { depth: 3, children: 2, spawned: 12 };
+        let run = |tag: &str, parent: &str| {
+            claim_tag_in(&dir, Some(tag), Some(parent), Path::new("/p"), &none, &caps)
+        };
+        create(&dir, 1, Some("root"), None).unwrap();
+        // A spawn reserves root's second child…
+        run("a", "root").unwrap().create_meta(&Files::in_dir(&dir, 2), sample(2, Some(std::process::id() as u64)));
+        let b = spawn_claim(&dir, Some("b"), Some(1), &none, &caps).unwrap();
+        // …a `run --parent root` typed by hand is a third: refused, naming them.
+        let e = run("x", "root").unwrap_err();
+        assert!(e.contains("2 live children") && e.contains("a, b") && e.contains("max_children"), "{e}");
+        // The spawn's own `run` takes the reservation it was counted as.
+        run("b", "root").unwrap().create_meta(&Files::in_dir(&dir, 3), sample(3, Some(std::process::id() as u64)));
+        drop(b);
+        assert!(run("x", "root").is_err(), "a and b are live now");
+        // Depth binds a run too.
+        let deep = Caps { depth: 1, ..caps };
+        let e = claim_tag_in(&dir, Some("y"), Some("a"), Path::new("/p"), &none, &deep).unwrap_err();
+        assert!(e.contains("max_depth"), "{e}");
+        // A top-level run has no parent to count against.
+        assert!(claim_tag_in(&dir, Some("z"), None, Path::new("/p"), &none, &Caps { children: 0, ..caps }).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn caps_come_from_the_users_config_file_and_nothing_else() {
+        assert_eq!(Caps::parse("").unwrap(), Caps::default());
+        assert_eq!(Caps::parse("[spawn]\n").unwrap(), Caps::default());
+        let c = Caps::parse("[spawn]\nmax_children = 9\n").unwrap();
+        assert_eq!((c.depth, c.children, c.spawned), (3, 9, 12));
+        let c = Caps::parse("[spawn]\nmax_depth = 1\nmax_children = 2\nmax_spawned = 5\n").unwrap();
+        assert_eq!((c.depth, c.children, c.spawned), (1, 2, 5));
+        // A typo or a non-number is an error, not quietly the defaults.
+        assert!(Caps::parse("[spawn]\nmax_childs = 9\n").unwrap_err().contains("max_childs"));
+        assert!(Caps::parse("[spawn]\nmax_depth = \"lots\"\n").is_err());
+        assert!(Caps::parse("[spwan]\nmax_depth = 1\n").is_err());
+
+        let _env = crate::vendor::herdr_detect::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("seagents-caps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("seagents")).unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        // The environment variables that once set them do nothing.
+        std::env::set_var("SEAGENTS_MAX_CHILDREN", "999");
+        std::env::set_var("SEAGENTS_MAX_SPAWNED", "999");
+        std::env::set_var("SEAGENTS_MAX_DEPTH", "999");
+        assert_eq!(Caps::configured().unwrap(), Caps::default(), "no file: the defaults");
+        fs::write(root.join("seagents/config.toml"), "[spawn]\nmax_children = 1\n").unwrap();
+        assert_eq!(Caps::configured().unwrap().children, 1);
+        fs::write(root.join("seagents/config.toml"), "[spawn\n").unwrap();
+        assert!(Caps::configured().unwrap_err().contains("config.toml"));
+        for v in ["SEAGENTS_MAX_CHILDREN", "SEAGENTS_MAX_SPAWNED", "SEAGENTS_MAX_DEPTH"] {
+            std::env::remove_var(v);
+        }
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -929,9 +929,25 @@ something the caller can't casually change:
 2. **Caps and tag, under `tags.lock`** (`registry::claim_spawn`): for an
    agent caller the child is its child (`parent` = its tag, depth + 1), and
    depth ≤ 3, ≤ 4 live children per parent and ≤ 12 live agent-spawned
-   agents machine-wide (`SEAGENTS_MAX_DEPTH` / `_MAX_CHILDREN` /
-   `_MAX_SPAWNED`), counting other spawns' reservations; the refusal names the
-   children in the way. A human's spawn has no parent and no caps. A
+   agents machine-wide, counting other spawns' reservations; the refusal
+   names the children in the way. A human's spawn has no parent and no caps.
+   The caps are the user's, in `~/.config/seagents/config.toml` (beside the
+   adapter overrides; `Caps::configured()`):
+   ```toml
+   [spawn]
+   max_depth = 3
+   max_children = 4
+   max_spawned = 12
+   ```
+   each defaulting when absent; a file that doesn't parse or names an unknown
+   key is an error. **Never the environment**: the caller is the agent the
+   caps bound, and until 2026-09-30 `SEAGENTS_MAX_SPAWNED=999 seagents spawn`
+   lifted them. (`XDG_CONFIG_HOME` still moves the file — like editing it,
+   that is deliberate, not a confused agent's slip.) The caps are **one
+   check** (`registry::admit_child`) made by every claim that gives an agent
+   a parent: `spawn`'s reservation and `run --parent`'s `claim_tag` alike —
+   so a hand-typed `run --parent P` can't go round them (exit 2) — with a
+   spawn's own reservation not counted again when its `run` takes the tag. A
    requested `--tag` must be free of live agents, reservations **and the
    saved layout(s)** — unlike `run --tag`, which restore needs to reuse them.
 3. **Permission mode**: from an agent, always explicit — the parent's own

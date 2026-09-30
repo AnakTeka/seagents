@@ -56,7 +56,8 @@ enum Command {
         tag: Option<String>,
 
         /// The spawning agent's tag; must be live. Sets this agent's lineage
-        /// (depth = the parent's + 1).
+        /// (depth = the parent's + 1), within the same fan-out caps as `spawn`
+        /// (exit 2 past them).
         #[arg(long, value_name = "TAG")]
         parent: Option<String>,
 
@@ -83,9 +84,10 @@ enum Command {
     /// once the agent is registered (not once it has started working: follow
     /// with `seagents wait <tag> --after 0`). Run from inside an agent, the
     /// child is that agent's: its `parent` and depth come from the caller's
-    /// process ancestry, fan-out is capped (SEAGENTS_MAX_DEPTH=3,
-    /// SEAGENTS_MAX_CHILDREN=4, SEAGENTS_MAX_SPAWNED=12), and its permission
-    /// mode never ranks above the caller's. The window closes when the agent
+    /// process ancestry, fan-out is capped (depth 3, 4 live children per
+    /// parent, 12 spawned in all; the user sets them in
+    /// ~/.config/seagents/config.toml, [spawn] max_depth / max_children /
+    /// max_spawned), and its permission mode never ranks above the caller's. The window closes when the agent
     /// exits. Exit 1, with the reason on stderr, on any refusal.
     Spawn {
         /// Directory to run the agent in (default: this one)

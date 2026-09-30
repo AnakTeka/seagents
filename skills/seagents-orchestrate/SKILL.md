@@ -90,7 +90,8 @@ without `--after` first to get your bearings.
 ## Refusals and limits
 
 - `spawn` exits 1 with the reason on stderr. **Caps**: depth ≤ 3, ≤ 4 live
-  children per parent, ≤ 12 spawned agents in total. The message names the
+  children per parent, ≤ 12 spawned agents in total (the human's defaults;
+  they are the human's to change, not yours). The message names the
   children in the way: `wait` on one and `stop` it before spawning more.
   A taken `--tag`: pick another (or omit it; one is minted).
 - `send`/`stop` exit 5 (`forbidden`): you may only drive **your own

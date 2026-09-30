@@ -300,13 +300,34 @@ pass "a send into a human's draft was refused (rc 6, draft), --now too: $(echo "
 
 # 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
 #    (its parent reporting no mode) launched at the least privileged mode.
+#    The caps are the user's config file's — here one child per parent —
+#    and the environment can't lift them; a hand-typed `run --parent` is
+#    held to them too. And a caller that connects to a socket, forks and
+#    exits (its child sending) is refused as unidentifiable, not taken for a
+#    human (it once stopped any agent that way).
+mkdir -p "$HOME/.config/seagents"
+printf '[spawn]\nmax_children = 1\n' > "$HOME/.config/seagents/config.toml"
+ITA_SOCK="$XDG_RUNTIME_DIR/seagents/$(meta_of it-a | jq_ "d['wrapper_pid']").sock"
+[ -S "$ITA_SOCK" ] || fail "it-a's socket is not at $ITA_SOCK"
+cat > "$ROOT/forkstop.py" <<'PY'
+import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
+if os.fork():
+    os._exit(0)          # the connecting process exits (and is reaped)
+time.sleep(0.5)
+s.sendall(b'{"op":"stop","force":true}\n')
+open(sys.argv[2], "w").write(s.makefile().readline())
+PY
 "$SEA" run --tag boss -- sh -c "
   cd '$WORK'
   seagents spawn --tag kid ${HAIKU[*]} -- 'Reply with exactly: KID' > '$ROOT/kid.json' 2> '$ROOT/kid.err'
   seagents spawn --tag bad --arg --dangerously-skip-permissions -- 'never' > /dev/null 2> '$ROOT/bad.err'
   echo \$? > '$ROOT/bad.rc'
-  SEAGENTS_MAX_CHILDREN=1 seagents spawn --tag kid2 -- 'never' > /dev/null 2> '$ROOT/kid2.err'
+  SEAGENTS_MAX_CHILDREN=9 SEAGENTS_MAX_SPAWNED=99 seagents spawn --tag kid2 -- 'never' > /dev/null 2> '$ROOT/kid2.err'
   echo \$? > '$ROOT/kid2.rc'
+  seagents run --tag kid3 --parent boss -- true > /dev/null 2> '$ROOT/kid3.err'
+  echo \$? > '$ROOT/kid3.rc'
+  python3 '$ROOT/forkstop.py' '$ITA_SOCK' '$ROOT/forkstop.json'
   seagents wait kid --after 0 --timeout 90s > /dev/null
   seagents send kid 'Reply with exactly: KIDTWO' > '$ROOT/kidsend.json' 2>&1
   echo \$? > '$ROOT/kidsend.rc'
@@ -316,14 +337,21 @@ pass "a send into a human's draft was refused (rc 6, draft), --now too: $(echo "
   echo \$? > '$ROOT/kidstop.rc'
   sleep 60" < /dev/null > /dev/null 2>&1 &
 ND_PIDS="$ND_PIDS $!"
-for _ in $(seq 1 60); do [ -s "$ROOT/kid2.rc" ] && break; sleep 0.25; done
+for _ in $(seq 1 60); do [ -s "$ROOT/forkstop.json" ] && break; sleep 0.25; done
 [ "$(jq_ "d['tag'], d['parent'], d['depth']" < "$ROOT/kid.json" 2>/dev/null)" = "kid boss 1" ] \
   || fail "lineage: $(cat "$ROOT/kid.json" "$ROOT/kid.err")"
 meta_of kid | jq_ "d['argv']" | grep -q "'--permission-mode', 'plan'" \
   || fail "kid's mode: $(meta_of kid | jq_ "d['argv']")"
-[ "$(cat "$ROOT/kid2.rc")" = 1 ] && grep -q "kid" "$ROOT/kid2.err" && grep -q "SEAGENTS_MAX_CHILDREN" "$ROOT/kid2.err" \
+[ "$(cat "$ROOT/kid2.rc")" = 1 ] && grep -q "kid" "$ROOT/kid2.err" && grep -q "max_children" "$ROOT/kid2.err" \
   || fail "breadth cap: rc=$(cat "$ROOT/kid2.rc") $(cat "$ROOT/kid2.err")"
-pass "spawn under a wrapper records parent boss, depth 1, mode plan; a second child past the cap is refused: $(cat "$ROOT/kid2.err")"
+pass "spawn under a wrapper records parent boss, depth 1, mode plan; a second child past the configured cap is refused, SEAGENTS_MAX_* set or not: $(cat "$ROOT/kid2.err")"
+[ "$(cat "$ROOT/kid3.rc")" = 2 ] && grep -q "max_children" "$ROOT/kid3.err" \
+  || fail "run --parent past the cap: rc=$(cat "$ROOT/kid3.rc") $(cat "$ROOT/kid3.err")"
+pass "run --parent boss past the cap is refused too (rc 2): $(cat "$ROOT/kid3.err")"
+grep -q '"forbidden"' "$ROOT/forkstop.json" && grep -q "caller identity unknown" "$ROOT/forkstop.json" \
+  && "$SEA" status --json | grep -q '"tag": *"it-a"' \
+  || fail "connect, fork, exit, then stop --force: $(cat "$ROOT/forkstop.json")"
+pass "a stop --force from a peer that exited after connecting was refused, it-a lives: $(cat "$ROOT/forkstop.json")"
 [ "$(cat "$ROOT/bad.rc")" = 1 ] && grep -q -- "--dangerously-skip-permissions" "$ROOT/bad.err" \
   && [ ! -e "$CACHE/bad.pending" ] && ! "$SEA" status --json | grep -q '"tag": *"bad"' \
   || fail "a privileged --arg from an agent: rc=$(cat "$ROOT/bad.rc") $(cat "$ROOT/bad.err")"
@@ -337,6 +365,7 @@ for _ in $(seq 1 480); do [ -s "$ROOT/kidstop.rc" ] && break; sleep 0.25; done
   || fail "boss → it-a should be forbidden: rc=$(cat "$ROOT/stranger.rc") $(cat "$ROOT/stranger.json")"
 [ "$(cat "$ROOT/kidstop.rc" 2>/dev/null)" = 0 ] || fail "boss → kid stop: $(cat "$ROOT/kidstop.json")"
 pass "boss sent to and stopped its child kid; sending to it-a was forbidden (rc 5)"
+rm -f "$HOME/.config/seagents/config.toml"
 
 # 5. focus.
 "$SEA" focus it-a || fail "focus exited $?"
