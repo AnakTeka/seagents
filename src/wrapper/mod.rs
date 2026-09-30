@@ -39,12 +39,9 @@ pub(crate) fn run(
     parent: Option<String>,
     seed_file: Option<PathBuf>,
 ) -> i32 {
-    if let Some(t) = tag.as_deref().filter(|t| !registry::valid_tag(t)) {
-        eprintln!("seagents: invalid tag {t:?}: want [a-z0-9][a-z0-9-]{{0,31}}, not all digits");
-        return 2;
-    }
-    // Read and deleted first thing, whatever happens next: the prompt must
-    // not outlive `run`'s startup on disk.
+    // Read and deleted first thing, whatever happens next — a malformed or
+    // taken tag included (`claim_tag` judges it below): the prompt must not
+    // outlive `run`'s startup on disk.
     let seed = match seed_file.as_deref().map(take_seed).transpose() {
         Ok(s) => s,
         Err(e) => {
