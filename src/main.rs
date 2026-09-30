@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 mod adapter;
 mod clock;
 mod detect;
+mod fsutil;
 mod hook;
 mod hud;
 mod i3;

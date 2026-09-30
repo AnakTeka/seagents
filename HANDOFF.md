@@ -351,6 +351,9 @@ Source layout under `src/`:
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
   `parent_pid()`, `ancestors()` (the whole chain to init, or None),
   `Pinned` (a pidfd, and whether it is still alive), `live_pty_size()`.
+- **`src/fsutil.rs`** — `write_atomic()`, the one tmp+rename writer every
+  cache and state file goes through (`<path>.<pid>.tmp`, removed on failure):
+  the sidecars and tombstones, the transcript index, the layout.
 - **`src/clock.rs`** — `unix_now()` (seconds: `.meta`, `.state`, the
   snapshot) and `unix_now_ms()` (the `.agent` turn ledger).
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.

@@ -50,6 +50,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::fsutil::write_atomic;
 use crate::procfs;
 
 /// Directory holding this machine's seagents session files.
@@ -409,7 +410,7 @@ fn reap_in(dir: &Dirs) {
         if !s.meta.tag.is_empty() && !live_tags.contains(s.meta.tag.as_str()) {
             let stone = Tombstone::of(s, now);
             if let Ok(text) = serde_json::to_vec(&stone) {
-                write_atomic(&tombstone_path(dir, &s.meta.tag), &text);
+                let _ = write_atomic(&tombstone_path(dir, &s.meta.tag), &text);
             }
         }
         let f = &s.files;
@@ -1352,7 +1353,7 @@ fn backfill_tags_in(dir: &Dirs, sessions: &mut [Session], reserved: &HashSet<Str
 
 fn write_new_meta(files: &Files, meta: &Meta) {
     if let Ok(text) = serde_json::to_string_pretty(meta) {
-        write_atomic(&files.meta, text.as_bytes());
+        let _ = write_atomic(&files.meta, text.as_bytes());
     }
 }
 
@@ -1375,7 +1376,7 @@ pub(crate) fn update_meta(files: &Files, f: impl FnOnce(&mut Meta)) {
     f(&mut meta);
     if meta != before {
         if let Ok(text) = serde_json::to_string_pretty(&meta) {
-            write_atomic(&files.meta, text.as_bytes());
+            let _ = write_atomic(&files.meta, text.as_bytes());
         }
     }
 }
@@ -1407,7 +1408,7 @@ pub(crate) fn update_agent(files: &Files, f: impl FnOnce(&mut AgentRecord)) {
     f(&mut record);
     if record != before {
         if let Ok(text) = serde_json::to_string_pretty(&record) {
-            write_atomic(&files.agent, text.as_bytes());
+            let _ = write_atomic(&files.agent, text.as_bytes());
         }
     }
 }
@@ -1424,21 +1425,10 @@ pub(crate) fn update_state<R>(files: &Files, f: impl FnOnce(&mut Option<StateRec
     let out = f(&mut record);
     if record != before {
         if let Some(text) = record.as_ref().and_then(|r| serde_json::to_string(r).ok()) {
-            write_atomic(&files.state, text.as_bytes());
+            let _ = write_atomic(&files.state, text.as_bytes());
         }
     }
     out
-}
-
-/// Atomic tmp+rename so a concurrent reader never sees a half-written record;
-/// pid-suffixed so writers in different processes can't stomp each other's
-/// tmp file (writers within one process are serialized by the lock).
-fn write_atomic(path: &Path, bytes: &[u8]) {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let tmp = path.with_extension(format!("{ext}.tmp{}", std::process::id()));
-    if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
 }
 
 /// An exclusive `flock` on a session's `.lock` file, released on drop (closing

@@ -122,7 +122,8 @@ impl Index {
                 // Canonical, so the sweep (run from any cwd) finds the file
                 // a relative `read --transcript` named.
                 let path = fs::canonicalize(transcript).unwrap_or_else(|_| transcript.to_path_buf());
-                write_atomic(cache, &encode(&index, prefix_len, hash, &path));
+                // Failure is ignored: the cache only saves time.
+                let _ = crate::fsutil::write_atomic(cache, &encode(&index, prefix_len, hash, &path));
             } else {
                 // Read, not rewritten: mark it used for the sweep.
                 let _ = File::options()
@@ -307,15 +308,6 @@ fn decode(bytes: &[u8]) -> Option<(Index, u64, u64)> {
         .collect();
     let index = Index { nodes, indexed_len: u64_at(bytes, 8) };
     Some((index, u64_at(bytes, 16), u64_at(bytes, 24)))
-}
-
-/// tmp + rename, so a concurrent reader sees the old index or the new one.
-/// Failure is ignored: the cache only saves time.
-fn write_atomic(path: &Path, bytes: &[u8]) {
-    let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
-    if fs::write(&tmp, bytes).is_ok() && fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
 }
 
 /// `8-4-4-4-12` hex, either case → its 128 bits.

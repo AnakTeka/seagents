@@ -132,10 +132,8 @@ fn write_layout(dir: &Path, snapshot: &Value, boot: u64) -> Result<(), String> {
                 .map_err(|e| format!("setting aside {}: {e}", path.display()))?;
         }
     }
-    let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("writing {}: {e}", path.display()))
+    crate::fsutil::write_atomic(&path, text.as_bytes()).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// The layout `restore` works from: a previous boot's that no restore has used
