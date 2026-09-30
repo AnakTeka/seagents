@@ -438,6 +438,7 @@ fn reap_in(dir: &Dirs) {
         remove_prompts(&s.meta);
     }
     prune_tombstones(dir, now);
+    sweep_orphans(dir);
     let owned: HashSet<u64> = live.iter().map(|s| s.meta.wrapper_pid).collect();
     let Some(Ok(entries)) = dir.runtime.as_ref().ok().map(fs::read_dir) else {
         return;
@@ -451,6 +452,33 @@ fn reap_in(dir: &Dirs) {
             .and_then(|p| p.parse::<u64>().ok());
         if pid.is_some_and(|p| !owned.contains(&p) && sweepable(p)) {
             let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Delete the sidecars no `.meta` claims — `<pid>.state`, `.lock`, `.agent`,
+/// `.raw`, `.raw.tmp` — once that pid is dead. `reap` finds sessions by
+/// their `.meta`, so these were never its to find: left by a writer that
+/// raced a reap (before every update checked for the `.meta`), or by a
+/// wrapper from before `.meta`s existed. A live pid keeps them: a wrapper
+/// opens its tee before it writes its `.meta`.
+fn sweep_orphans(dir: &Dirs) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some((pid, ext)) = name.to_str().and_then(|n| n.split_once('.')) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u64>() else {
+            continue;
+        };
+        if matches!(ext, "state" | "lock" | "agent" | "raw" | "raw.tmp")
+            && !dir.join(&format!("{pid}.meta")).exists()
+            && !procfs::alive(pid)
+        {
+            let _ = fs::remove_file(e.path());
         }
     }
 }
@@ -1416,7 +1444,16 @@ pub(crate) fn update_agent(files: &Files, f: impl FnOnce(&mut AgentRecord)) {
 /// Locked read-modify-write of a session's `.state`. `f` sees the current
 /// record (None when there is none, or it does not parse) and may replace it;
 /// the file is rewritten only if it did. Returns what `f` returns.
+///
+/// Once the session's `.meta` is gone `f` still decides (its answer is the
+/// caller's), but nothing is written: an observer that detected the agent
+/// just before a reap would otherwise recreate a `.state` and `.lock` that
+/// no reap removes (it goes by `.meta`s), and that a later wrapper given the
+/// same pid would inherit as its own.
 pub(crate) fn update_state<R>(files: &Files, f: impl FnOnce(&mut Option<StateRecord>) -> R) -> R {
+    if !files.meta.exists() {
+        return f(&mut read_state(files));
+    }
     // A lock we could not take still leaves the tmp+rename write atomic; the
     // caller's observation is better recorded unlocked than dropped.
     let _lock = Lock::acquire(&files.lock);
@@ -1886,6 +1923,44 @@ mod tests {
         assert!(gone.agent.exists());
         reap_in(&dir);
         assert!(!gone.agent.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_recreates_a_reaped_sessions_state_and_reap_sweeps_orphans() {
+        let dir = scratch("orphans");
+        let dead = u32::MAX as u64;
+        let gone = Files::in_dir(&dir, dead);
+        write_new_meta(&gone, &sample(dead, Some(dead)));
+        reap_in(&dir);
+        // An observer that detected the agent a moment before the reap:
+        // it gets its answer, and writes nothing.
+        let seen = update_state(&gone, |r| {
+            *r = Some(StateRecord { state: "idle".into(), since: 1, seen: true, rule: None, screen: None });
+            7
+        });
+        assert_eq!(seen, 7);
+        update_agent(&gone, |r| r.stops = 1);
+        update_meta(&gone, |m| m.depth = 1);
+        for p in [&gone.state, &gone.lock, &gone.agent, &gone.meta] {
+            assert!(!p.exists(), "{} was recreated", p.display());
+        }
+        // Left over by an older binary: swept once their pid is dead. A live
+        // pid's (a wrapper that opened its tee and has not written its
+        // `.meta` yet) and names that are no pid's stay.
+        let me = std::process::id();
+        let stale = ["state", "lock", "agent", "raw", "raw.tmp"].map(|x| dir.join(&format!("{}.{x}", u32::MAX - 1)));
+        let kept = [dir.join(&format!("{me}.raw")), dir.join("tags.lock"), dir.join("x.pending")];
+        for p in stale.iter().chain(&kept) {
+            fs::write(p, b"").unwrap();
+        }
+        reap_in(&dir);
+        for p in &stale {
+            assert!(!p.exists(), "{} should be swept", p.display());
+        }
+        for p in &kept {
+            assert!(p.exists(), "{} should stay", p.display());
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

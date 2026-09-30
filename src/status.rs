@@ -601,6 +601,12 @@ mod tests {
         assert_eq!(conversation_title(""), "");
     }
 
+    /// A session to observe: `.state` is only ever written beside a `.meta`.
+    fn live_meta(files: &Files) {
+        let meta = crate::registry::Meta { wrapper_pid: 1, child_pid: Some(2), ..Default::default() };
+        std::fs::write(&files.meta, serde_json::to_string(&meta).unwrap()).unwrap();
+    }
+
     fn sc(state: State) -> Screen {
         Screen { state, rule: None }
     }
@@ -610,6 +616,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("seagents-gate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
+        live_meta(&files);
         let gate = |rule: &str| Screen { state: State::Blocked, rule: Some(rule.into()) };
         let r = observe_state(&files, gate("live_blocked_form"), State::Blocked, 100);
         assert_eq!((r.since, r.rule.as_deref()), (100, Some("live_blocked_form")));
@@ -626,6 +633,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("seagents-observe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
+        live_meta(&files);
 
         assert_eq!(observe_state(&files, sc(State::Idle), State::Idle, 100).since, 100);
         // A mid-repaint Unknown sample must not reset the idle clock…
@@ -671,6 +679,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("seagents-done-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let files = Files::in_dir(&dir, 1);
+        live_meta(&files);
 
         // Working, then idle → an unseen completion.
         assert!(observe_state(&files, sc(State::Working), State::Working, 100).seen);

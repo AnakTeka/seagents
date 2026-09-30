@@ -580,6 +580,17 @@ there is no `ended` state. `registry::list()` applies the same liveness rule but
 never deletes — the snapshot capture uses it, from inside wrappers' monitor
 threads, which have no business deleting other sessions.
 
+Reap finds sessions by their `.meta`, so nothing may write a sidecar once the
+`.meta` is gone: `update_meta`, `update_agent` and `update_state` all check
+for it first (`update_state` still runs its closure, so an observer gets its
+answer, and writes nothing). Until 2026-09-30 `update_state` did not, and an
+observer that detected an agent just before a reap recreated `<pid>.state`
+and `<pid>.lock` that no reap would ever remove — and that a later wrapper
+given the same pid inherited. `reap` also sweeps such orphans: a `<pid>.state`,
+`.lock`, `.agent`, `.raw` or `.raw.tmp` with no `<pid>.meta`, once that pid is
+dead (a live one may be a wrapper that has opened its tee and not yet written
+its `.meta`) — which also takes the pre-`.meta`-era `.raw` leftovers.
+
 ### 3. `seagents status` — detection
 
 Classification is **herdr's manifest engine, vendored** at
@@ -1469,7 +1480,6 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 - **README.md** for the repo landing page (not written yet).
 - ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
   locks AGPL-3.0-or-later; LICENSE file added.
-- Sweep **orphan `.raw`** files that have no `.meta` (only pre-`meta`-era leftovers).
 - Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once
   it has been through a real reboot, or keep running it by hand.
 - Optional: **eww** port of the HUD for a prettier always-on widget.
