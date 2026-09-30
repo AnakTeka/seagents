@@ -15,7 +15,6 @@ seed_prompt      = ["--", "{prompt}"]
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
-watch_dir        = ""
 # What Codex sets for the commands it runs (read off `env` inside a shell
 # tool call, and its source): the thread's identity, its sandbox and
 # approval state. Never CODEX_HOME, the user's own configuration.

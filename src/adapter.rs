@@ -32,9 +32,9 @@ use serde::Deserialize;
 pub(crate) enum Identity {
     /// Lifecycle hooks report it (Claude's `SessionStart`).
     Hook,
-    /// The first file created in `watch_dir` after launch.
-    Watch,
-    /// Not learned: state and send only.
+    /// Not learned: state and send only. (The spec's `watch` — the first
+    /// file created in a session directory — is not built; an adapter
+    /// asking for it is refused by [`parse`].)
     #[default]
     None,
 }
@@ -137,8 +137,9 @@ pub(crate) struct Read {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Launch {
     /// argv appended to the child's (never to the recorded argv), with
-    /// `{prompt}` substituted. Empty: the prompt is pasted instead, once the
-    /// agent first reaches idle.
+    /// `{prompt}` substituted. Empty: the agent cannot be seeded — `spawn`
+    /// and `run --seed-file` refuse ([`Launch::seed_args`]); seeding by
+    /// paste once idle is designed, not built.
     pub(crate) seed_prompt: Vec<String>,
     /// The permission modes, least privileged first — the order a child is
     /// checked against so it never outranks its parent. Named in Claude's
@@ -151,8 +152,6 @@ pub(crate) struct Launch {
     pub(crate) permission_argv: BTreeMap<String, Vec<String>>,
     pub(crate) identity: Identity,
     pub(crate) turns: Turns,
-    /// For `identity = "watch"`.
-    pub(crate) watch_dir: String,
     /// Variables a running agent of this kind sets for what it runs — its
     /// own session's identity and messaging channel — which a window
     /// seagents launches must not inherit when the launch comes from inside
@@ -451,6 +450,19 @@ const BUNDLED: &[(&str, &str)] = &[
 /// Parse one adapter file. Refuses a seed template with nowhere to put the
 /// prompt, which would otherwise launch the agent with the prompt dropped.
 fn parse(text: &str) -> Result<Adapter, String> {
+    // Options the spec designed and nothing implements: said so, rather
+    // than a bare "unknown variant" — or, as when they parsed, silently
+    // doing nothing.
+    if let Ok(raw) = toml::from_str::<toml::Table>(text) {
+        let launch = raw.get("launch").and_then(|l| l.as_table());
+        if launch.and_then(|l| l.get("identity")).and_then(|i| i.as_str()) == Some("watch")
+            || launch.is_some_and(|l| l.contains_key("watch_dir"))
+        {
+            return Err("launch.identity = \"watch\" (and watch_dir) is not built: no bundled agent needs \
+                        it; use \"hook\" or \"none\""
+                .to_string());
+        }
+    }
     let adapter: Adapter = toml::from_str(text).map_err(|e| e.to_string())?;
     let seed = &adapter.launch.seed_prompt;
     if !seed.is_empty() && !seed.iter().any(|a| a.contains("{prompt}")) {
@@ -858,6 +870,11 @@ mod tests {
         assert!(parse("[launch.privileged]\nflags = [\"x\"]\n").unwrap_err().contains("not a flag"));
         assert!(parse("[launch.privileged]\ncommands = [\"-x\"]\n").unwrap_err().contains("not a word"));
         assert!(parse("[launch.privileged]\nconfig_keys = [\"k\"]\n").unwrap_err().contains("config_flags"));
+        // The designed-but-unbuilt watch identity is refused by name, not
+        // accepted to do nothing.
+        for text in ["[launch]\nidentity = \"watch\"\n", "[launch]\nwatch_dir = \"/x\"\n", "[launch]\nwatch_dir = \"\"\n"] {
+            assert!(parse(text).unwrap_err().contains("not built"), "{text}");
+        }
         assert!(parse("[launch]\nconfig_flags = [\"-c\"]\n[launch.privileged]\nconfig_keys = [\"k\"]\n").is_ok());
     }
 

@@ -10,7 +10,6 @@ seed_prompt      = ["--", "{prompt}"]
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
-watch_dir        = ""
 # What a running Claude Code sets for its children: its session's identity
 # and messaging socket/token. A window launched from inside one (an agent
 # calling `spawn`) must not inherit them — with them, a Claude started

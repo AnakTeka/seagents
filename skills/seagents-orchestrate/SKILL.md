@@ -80,7 +80,7 @@ seagents wait review-auth --after 0 --timeout 100s
 | `idle` | 0 | (no `--after`) nothing running; `last_message` is its last result |
 | `timeout` | 2 | call the same `wait` again |
 | `blocked` | 3 | **stop and tell the human**: which child (tag), and the gate (`rule`, e.g. a permission prompt or the folder-trust dialog). Never answer it yourself. Then wait again with the same N |
-| `exit` | 4 | the child is gone (crashed, stopped, or someone closed it); `last_message` is its last turn's result. `wait` and `read` keep answering for an exited child for a day (until its tag is reused); `send`/`stop` exit 1 |
+| `exit` | 4 | the child is gone (crashed, stopped, or someone closed it); `last_message` is its last turn's result. `wait` and `read` keep answering for an exited child for a day (until its tag is reused); `send`/`stop` to it exit 1 (no live agent has that tag) |
 | `interrupted` | 5 | a human pressed Esc on that turn; it has no report. Ask the human, or `send` again |
 | `no_hooks` | 6 | seagents cannot see that child's turns (its hooks never reported); `message` says why. Tell the human; waiting again will not help |
 
@@ -99,7 +99,10 @@ without `--after` first to get your bearings.
   Reading (`wait`, `read`, `status`) works on anyone.
 - `send` exit 3 (`blocked`): the child waits at a gate; tell the human.
   Exit 2 (`busy_timeout`): it stayed busy for all of `--timeout`; nothing was
-  sent — wait for its turn, then send again. Exit 4: it exited. Exit 6
+  sent — wait for its turn, then send again. Exit 4: it exited while your
+  `send` was held waiting for it (a child that had already exited is exit 1:
+  no live agent has that tag). `stop` of a child that exits along the way
+  is success. Exit 6
   (`draft`): someone (the human) has text typed in the child's input box;
   nothing was sent, and `--now` won't help — tell the human, or try again
   later.

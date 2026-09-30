@@ -137,13 +137,17 @@ enum Command {
 
     /// Block until an agent ends a turn, is blocked, or exits; prints the outcome
     ///
-    /// Prints `{"tag","reason","stops","state","rule","last_message","transcript_path"}`.
+    /// Prints `{"tag","reason","stops","state","rule","last_message","transcript_path"}`,
+    /// plus `"message"` when the reason alone doesn't say what to do.
     /// `reason` and the exit code: `turn` 0 (stops passed N; `last_message` is
     /// that turn's final text), `idle` 0 (no --after and not in a turn: the last
     /// result, at once), `timeout` 2 (call again with the same N), `blocked` 3
-    /// (waiting on a human; `rule` names the gate), `exit` 4, `interrupted` 5
-    /// (the turn after N was cut short, with no final message); 1 is an error.
-    /// Never marks the agent's result as seen.
+    /// (waiting on a human; `rule` names the gate), `exit` 4 (also for an
+    /// agent that exited earlier, for a day), `interrupted` 5 (the turn after
+    /// N was cut short, with no final message), `no_hooks` 6 (the agent was
+    /// given a prompt at least 20 s ago and its hooks have never reported, so no turn
+    /// will be seen to end; `message` says which adapter and where to look);
+    /// 1 is an error. Never marks the agent's result as seen.
     Wait {
         /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
         target: String,
@@ -225,9 +229,13 @@ enum Command {
     /// Types the agent's exit command (Claude: `/exit`) and gives it 5 s;
     /// then SIGTERMs its process group, then SIGKILLs it, 5 s apart. A
     /// blocked agent skips the exit command (typed into a permission menu,
-    /// its Enter would pick an answer). Prints `{"ok":true,"tag"}` once the
-    /// agent is gone. From inside an agent, only its own descendants. Exit 5
-    /// forbidden, 1 any other failure.
+    /// its Enter would pick an answer), and so does one whose input box holds
+    /// a draft someone typed (the command would be submitted as part of it);
+    /// a prompt seagents sent that the agent put back is cleared first.
+    /// Prints `{"ok":true,"tag"}` once the agent is gone. From inside an
+    /// agent, only its own descendants. Exit 5 forbidden, 1 any other failure
+    /// — including an agent that had already exited (no live agent by that
+    /// name).
     Stop {
         /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
         target: String,

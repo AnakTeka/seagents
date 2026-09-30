@@ -26,19 +26,29 @@ jump straight to it.**
 
 ## Current status
 
-All four milestones are **code-complete and on `main`**:
+The observer (run / status / focus / HUD / snapshot+restore) is on `main`.
+**Orchestration** — agents driving agents (ORCHESTRATION-SPEC phases 0–5
+and the polish after them) — is complete on the branch `refactor/phase0`,
+not yet merged:
 
 | capability | command | state |
 |---|---|---|
-| transparent launcher (pty-tee) | `seagents run <cmd>` | done, verified feels native |
-| status detection | `seagents status` | done; blocked/working/idle verified live |
-| focus the agent's i3 window | `seagents focus <child_pid>` | done; con_id fix **committed but not yet live-verified** |
-| floating HUD | `seagents hud` | done; works, j/k preview + click-to-focus; lineage tree, tags, send/stop keys |
-| reboot survival | `seagents snapshot` / `restore` | done; round-trip verified in a nested X (`tools/test-restore.sh`) |
+| transparent launcher (pty-tee) | `seagents run <cmd>` | done, verified feels native; tags, lineage, seed prompts |
+| status detection | `seagents status` | done; blocked/working/idle verified live; the hook turn ledger (§6) |
+| focus the agent's i3 window | `seagents focus <target>` | done; exact handles only, con_id focus and healing verified live |
+| floating HUD | `seagents hud` | done; j/k preview + click-to-focus; lineage tree, tags, send/stop keys |
+| reboot survival | `seagents snapshot` / `restore` | done; round-trip verified in a nested X (`tools/test-restore.sh`, all three terminals) |
+| start an agent on a prompt | `seagents spawn` | done (§7): lineage from ancestry, caps from the user's config, permission mode bounded by the parent's |
+| wait for a turn | `seagents wait` | done (§8): turn / idle / timeout / blocked / exit / interrupted / no_hooks |
+| drive an agent | `seagents send` / `stop` | done (§9): the wrapper's socket, lineage rule, submit-when-idle, input-box check |
+| read the conversation | `seagents read` | done (§10): main line, cursor, index |
+| agents | Claude Code, Codex | both adapters verified live (Claude 2.1.28x, codex-cli 0.152.0) |
 
-Focus identity is exact-handle only (no title matching since 2026-07-14), so
-the old two-idle-claudes ambiguity concern is structurally gone; con_id focus
-and healing have been verified live.
+Verified end to end by `tools/test-orchestration.sh` (Claude, and `--codex`)
+in a nested desktop. Not built, by decision: the hookless-agent paths
+(`watch` identity, a screen-turn ledger) and seeding by paste — no bundled
+adapter needs them (ORCHESTRATION-SPEC *Phasing*). The agent-facing
+workflow is the skill, `skills/seagents-orchestrate/SKILL.md`.
 
 ---
 
@@ -332,7 +342,9 @@ Source layout under `src/`:
   turns come from, submit delay / pre-send / exit sequence. Keyed by the
   detection engine's agent id for `argv[0]`; `~/.config/seagents/agents/<agent>.toml`
   replaces the bundled file whole (an unparseable override is an error, not a
-  silent default); unknown agents get the generic state-only adapter. Bundled:
+  silent default — so is one asking for the designed-but-unbuilt `identity =
+  "watch"` / `watch_dir`, which until 2026-09-30 parsed and did nothing);
+  unknown agents get the generic state-only adapter. Bundled:
   `claude` and `codex` (§11). `run` reads it to decide on hook injection
   (`[hooks]`: how — `inject = "settings" | "config"` — the flag's spellings,
   the events, `hookless_flags`; and `identity`/`turns`) and to turn a
@@ -1475,7 +1487,7 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ## Open items / backlog / next steps
 
-- **Verify** the con_id focus fix live (see Current Status).
+- **Merge** `refactor/phase0` (orchestration) into `main`.
 - Decide the **mouse_warping** question for the HUD preview.
 - **README.md** for the repo landing page (not written yet).
 - ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
