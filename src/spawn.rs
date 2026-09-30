@@ -62,7 +62,7 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
         return Err("the prompt is empty".to_string());
     }
     // Everything that can refuse the prompt is checked before a window opens.
-    adapter.launch.seed_args(&prompt)?;
+    adapter.launch.check_seed(&prompt)?;
     if args.args.iter().any(|a| a == "--") {
         return Err("--arg --: the agent's arguments end where the seed prompt begins".to_string());
     }
@@ -75,6 +75,15 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("working directory: {e}"))?;
     if !cwd.is_dir() {
         return Err(format!("{} is not a directory", cwd.display()));
+    }
+    // The seed's file is written there by `run`, in the new window, where a
+    // failure would only show as a window that closed at once. (A worktree
+    // is made below, inside the repo, writable by construction.)
+    if adapter.launch.seed_by == crate::adapter::SeedBy::File && !args.worktree && !writable(&cwd) {
+        return Err(format!(
+            "{} is not writable, and this agent's seed prompt goes to a file there (.seagents/prompts/)",
+            cwd.display()
+        ));
     }
 
     // Unknown is not human: a human's spawn is uncapped and keeps its
@@ -233,6 +242,14 @@ fn privileged_check(launch: &Launch, args: &[String]) -> Result<(), String> {
              use --permission-mode (capped at your own)"
         )),
     }
+}
+
+fn writable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
 /// `$runtime/seed-<tag>`, 0600, holding the prompt for `run --seed-file`.

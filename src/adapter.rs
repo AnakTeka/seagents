@@ -51,6 +51,21 @@ pub(crate) enum LongPrompt {
     File,
 }
 
+/// How a seed prompt reaches the agent's command line.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SeedBy {
+    /// The prompt itself, in `seed_prompt`'s `{prompt}` — and so in the
+    /// agent's `/proc/<pid>/cmdline`, readable by any local user while it
+    /// runs, and limited to one argv string (`MAX_ARG_STRLEN`).
+    #[default]
+    Inline,
+    /// Written to a prompt file in the agent's cwd (0600, gone with the
+    /// session), with only the one line telling the agent to read it in
+    /// `{prompt}` — for a tool that reads a file in its cwd without asking.
+    File,
+}
+
 /// Where the turn ledger's edges come from.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -141,6 +156,8 @@ pub(crate) struct Launch {
     /// and `run --seed-file` refuse ([`Launch::seed_args`]); seeding by
     /// paste once idle is designed, not built.
     pub(crate) seed_prompt: Vec<String>,
+    /// What goes into `{prompt}`: the prompt, or a line pointing at its file.
+    pub(crate) seed_by: SeedBy,
     /// The permission modes, least privileged first — the order a child is
     /// checked against so it never outranks its parent. Named in Claude's
     /// vocabulary whatever the tool, because that is what every bundled
@@ -409,10 +426,22 @@ impl Launch {
         None
     }
 
-    /// The argv a seed prompt adds to the agent's command line, per
-    /// `seed_prompt`. Refused — the error is for the user — when the adapter
-    /// seeds by pasting (an empty template) or the prompt cannot be one argv
-    /// string: over `MAX_ARG_STRLEN`, or holding a NUL. Pasting such a seed
+    /// Whether `prompt` can seed this agent, as `spawn` checks before a
+    /// window opens: a template to carry it and, sent inline, one argv
+    /// string's worth ([`Launch::seed_args`]). By file, only the short line
+    /// pointing at it goes on the command line.
+    pub(crate) fn check_seed(&self, prompt: &str) -> Result<(), String> {
+        match self.seed_by {
+            SeedBy::File if !self.seed_prompt.is_empty() => Ok(()),
+            _ => self.seed_args(prompt).map(drop),
+        }
+    }
+
+    /// The argv a seed adds to the agent's command line, per `seed_prompt`:
+    /// `prompt` is what goes into `{prompt}` — the prompt, or under
+    /// `seed_by = "file"` the line pointing at its file. Refused — the error
+    /// is for the user — when the adapter has no template, or the text cannot
+    /// be one argv string: over `MAX_ARG_STRLEN`, or holding a NUL. Pasting such a seed
     /// through the wrapper's own PTY writer is the spec's answer to both; it
     /// is not built yet, as no bundled adapter needs it.
     pub(crate) fn seed_args(&self, prompt: &str) -> Result<Vec<String>, String> {

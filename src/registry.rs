@@ -435,7 +435,7 @@ fn reap_in(dir: &Dirs) {
         if let (Ok(sock), true) = (&f.sock, sweepable(s.meta.wrapper_pid)) {
             let _ = fs::remove_file(sock);
         }
-        remove_prompts(&s.meta);
+        remove_prompts(s.meta.wrapper_pid, &s.meta.cwd);
     }
     prune_tombstones(dir, now);
     sweep_orphans(dir);
@@ -1230,22 +1230,33 @@ fn prompts_dir(cwd: &Path) -> PathBuf {
     cwd.join(".seagents/prompts")
 }
 
-/// Write `body` to a new prompt file of session `meta`,
-/// `<wrapper_pid>-<stops>-<4 hex>.md` (0600, dirs 0700), and return its
-/// path. A body some tools would file as quoted data if pasted (see
-/// `adapter::Send::by_reference`) travels this way instead, and the agent is
-/// told to read it. In a git work tree `.seagents/` is excluded first, so
-/// the file never shows up as an untracked change another agent might
-/// commit; a work tree whose exclude cannot be written refuses the prompt.
-pub(crate) fn write_prompt(meta: &Meta, stops: u64, body: &str) -> Result<PathBuf, String> {
+/// Deliver `body` to session `wrapper_pid` (running in `cwd`) by
+/// reference: write it to a new prompt file and return the one line that
+/// stands in for it, telling the agent to read that file and who sent it
+/// (`@tag` or "the user") — for a `send` body the tool would file as quoted
+/// data if pasted (`adapter::Send::by_reference`, `stops` the ledger's count
+/// as it is sent), and for a seed prompt (`stops` 0), which would otherwise
+/// sit in the agent's `/proc/<pid>/cmdline` for anyone to read.
+pub(crate) fn by_reference(wrapper_pid: u64, cwd: &str, stops: u64, body: &str, who: &str) -> Result<String, String> {
+    let file = write_prompt(wrapper_pid, cwd, stops, body)?;
+    Ok(reference_line(&file, cwd, who))
+}
+
+/// Write `body` to a new prompt file of session `wrapper_pid`,
+/// `<cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md` (0600, dirs
+/// 0700), and return its path. In a git work tree `.seagents/` is excluded
+/// first, so the file never shows up as an untracked change another agent
+/// might commit; a work tree whose exclude cannot be written refuses the
+/// prompt.
+fn write_prompt(wrapper_pid: u64, cwd: &str, stops: u64, body: &str) -> Result<PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let cwd = Path::new(&meta.cwd);
-    if meta.cwd.is_empty() || !cwd.is_dir() {
-        return Err(format!("the agent's working directory {:?} is gone", meta.cwd));
+    let dir = Path::new(cwd);
+    if cwd.is_empty() || !dir.is_dir() {
+        return Err(format!("the agent's working directory {cwd:?} is gone"));
     }
-    exclude_seagents(cwd)?;
-    let dir = prompts_dir(cwd);
+    exclude_seagents(dir)?;
+    let dir = prompts_dir(dir);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1254,7 +1265,7 @@ pub(crate) fn write_prompt(meta: &Meta, stops: u64, body: &str) -> Result<PathBu
     // Two sends at one `stops` are serialized by the wrapper, but the suffix
     // is random; retry the rare collision rather than overwrite.
     for _ in 0..16 {
-        let path = dir.join(format!("{}-{stops}-{}.md", meta.wrapper_pid, tag_suffix()));
+        let path = dir.join(format!("{wrapper_pid}-{stops}-{}.md", tag_suffix()));
         match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
             Ok(mut f) => {
                 return f
@@ -1269,21 +1280,48 @@ pub(crate) fn write_prompt(meta: &Meta, stops: u64, body: &str) -> Result<PathBu
     Err(format!("{}: no free prompt file name", dir.display()))
 }
 
-/// Delete session `meta`'s prompt files — those named
-/// `<its wrapper_pid>-<stops>-<4 hex>.md`, nothing else — and the prompts
-/// dir and `.seagents/` when that leaves them empty. Called when the
-/// wrapper's agent exits and by [`reap`] for a wrapper that could not.
-pub(crate) fn remove_prompts(meta: &Meta) {
-    if meta.cwd.is_empty() {
+/// The one line that stands in for a body sent by reference: where the
+/// prompt file is — relative when it is under the agent's working directory,
+/// as it is written to be — and who sent it, so the agent can tell its
+/// parent's instructions from text it merely found.
+fn reference_line(file: &Path, cwd: &str, who: &str) -> String {
+    let at = match file.strip_prefix(cwd) {
+        Ok(rel) if !cwd.is_empty() => format!("{} (relative to your working directory)", rel.display()),
+        _ => file.display().to_string(),
+    };
+    format!(
+        "Read the file {at} and carry out the instructions in it. They were sent to you through \
+         seagents by {who}."
+    )
+}
+
+/// The inverse of [`reference_line`]: the prompt file a stand-in line
+/// names, as written there (relative to the agent's working directory, or
+/// absolute) — for `read`, which can show the words the agent was only told
+/// where to find.
+pub(crate) fn referenced_file(text: &str) -> Option<&str> {
+    let at = text
+        .strip_prefix("Read the file ")?
+        .split_once(" and carry out the instructions in it. They were sent to you through seagents by ")?
+        .0;
+    Some(at.strip_suffix(" (relative to your working directory)").unwrap_or(at))
+}
+
+/// Delete session `wrapper_pid`'s prompt files in `cwd` — those named
+/// `<wrapper_pid>-<stops>-<4 hex>.md`, nothing else — and the prompts dir
+/// and `.seagents/` when that leaves them empty. Called when the wrapper
+/// exits and by [`reap`] for a wrapper that could not.
+pub(crate) fn remove_prompts(wrapper_pid: u64, cwd: &str) {
+    if cwd.is_empty() {
         return;
     }
-    let cwd = Path::new(&meta.cwd);
+    let cwd = Path::new(cwd);
     let dir = prompts_dir(cwd);
     let Ok(entries) = fs::read_dir(&dir) else {
         return;
     };
     for e in entries.flatten() {
-        if e.file_name().to_str().is_some_and(|n| is_prompt_of(n, meta.wrapper_pid)) {
+        if e.file_name().to_str().is_some_and(|n| is_prompt_of(n, wrapper_pid)) {
             let _ = fs::remove_file(e.path());
         }
     }
@@ -2052,6 +2090,22 @@ mod tests {
     }
 
     #[test]
+    fn a_body_by_reference_is_one_line_naming_the_file_and_the_sender() {
+        let line = reference_line(Path::new("/w/proj/.seagents/prompts/7-2-beef.md"), "/w/proj", "@planner");
+        assert_eq!(
+            line,
+            "Read the file .seagents/prompts/7-2-beef.md (relative to your working directory) and carry \
+             out the instructions in it. They were sent to you through seagents by @planner."
+        );
+        assert!(!line.contains('\n'));
+        let abs = reference_line(Path::new("/elsewhere/p.md"), "/w/proj", "the user");
+        assert!(abs.starts_with("Read the file /elsewhere/p.md and") && abs.ends_with("by the user."), "{abs}");
+        assert_eq!(referenced_file(&line), Some(".seagents/prompts/7-2-beef.md"));
+        assert_eq!(referenced_file(&abs), Some("/elsewhere/p.md"));
+        assert_eq!(referenced_file("Read the file x.md please"), None);
+    }
+
+    #[test]
     fn prompt_files_are_private_excluded_from_git_and_go_with_their_session_only() {
         let dir = scratch("prompts");
         let root = dir.as_ref().to_path_buf();
@@ -2068,15 +2122,16 @@ mod tests {
             cwd: cwd.to_string_lossy().into_owned(),
             ..sample(pid, child)
         };
+        let at = cwd.to_str().unwrap();
 
-        let p = write_prompt(&meta(42, None), 3, "do\nthe\nthing").unwrap();
+        let p = write_prompt(42, at, 3, "do\nthe\nthing").unwrap();
         assert_eq!(p.parent().unwrap(), cwd.join(".seagents/prompts"));
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
         assert!(is_prompt_of(&name, 42) && name.starts_with("42-3-"), "{name}");
         assert_eq!(fs::read_to_string(&p).unwrap(), "do\nthe\nthing");
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_ne!(write_prompt(&meta(42, None), 3, "again").unwrap(), p, "never overwritten");
+        assert_ne!(write_prompt(42, at, 3, "again").unwrap(), p, "never overwritten");
         if git_ok {
             let ex = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
             assert_eq!(ex.lines().filter(|l| *l == ".seagents/").count(), 1);
@@ -2086,13 +2141,16 @@ mod tests {
 
         // Another session's files, and anything not named like a prompt
         // file, survive a removal.
-        let other = write_prompt(&meta(420, None), 0, "theirs").unwrap();
+        let line = by_reference(420, at, 0, "theirs", "@boss").unwrap();
+        let other = cwd.join(referenced_file(&line).unwrap());
+        assert_eq!(fs::read_to_string(&other).unwrap(), "theirs");
+        assert!(line.ends_with("by @boss."), "{line}");
         let stray = cwd.join(".seagents/prompts/42-notes.md");
         fs::write(&stray, "mine").unwrap();
         for bad in ["42-3-ABCD.md", "42--abcd.md", "42-3-abcde.md", "42-3-abcd.txt", "142-3-abcd.md", "4-3-abcd.md"] {
             assert!(!is_prompt_of(bad, 42), "{bad}");
         }
-        remove_prompts(&meta(42, None));
+        remove_prompts(42, at);
         assert!(!p.exists());
         assert!(other.exists() && stray.exists());
 
@@ -2103,9 +2161,8 @@ mod tests {
         assert!(!other.exists());
         assert!(!cwd.join(".seagents").exists());
         // Nowhere to write: an error, not a panic.
-        let mut gone = meta(7, None);
-        gone.cwd = root.join("missing").to_string_lossy().into_owned();
-        assert!(write_prompt(&gone, 0, "x").unwrap_err().contains("gone"));
+        let gone = root.join("missing");
+        assert!(write_prompt(7, gone.to_str().unwrap(), 0, "x").unwrap_err().contains("gone"));
         fs::remove_dir_all(&root).ok();
     }
 

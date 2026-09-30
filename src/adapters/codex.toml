@@ -7,6 +7,11 @@
 # first turn; clap takes `--`, so a prompt starting with `-` stays a prompt
 # (verified).
 seed_prompt      = ["--", "{prompt}"]
+# The prompt goes to a 0600 prompt file in the agent's cwd, and {prompt} is
+# only the line telling it to read that file: argv is readable by every
+# local user in /proc/<pid>/cmdline. Reading a file in its cwd takes no
+# permission, in any mode (verified 2026-09-30).
+seed_by          = "file"
 # Codex has no permission-mode flag: an approval policy (-a) and a sandbox
 # (-s) instead, mapped from Claude's mode words under
 # [launch.permission_argv] — those words because Codex's hooks report a

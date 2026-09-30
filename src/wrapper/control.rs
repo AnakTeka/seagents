@@ -28,8 +28,8 @@
 //!
 //! A body the agent would file as quoted data if pasted (the adapter's
 //! `long_prompt`, `adapter::Send::by_reference`) is written to a prompt file
-//! in its cwd (`registry::write_prompt`) and replaced by one line telling it
-//! to read that file and who sent it; the files go when the agent exits.
+//! in its cwd (`registry::by_reference`) and replaced by one line telling it
+//! to read that file and who sent it; the files go when the wrapper exits.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -86,8 +86,8 @@ pub(super) struct Wiring {
     pub(super) wake: Arc<super::monitor::Wake>,
     /// The agent's command, first word: which adapter, which ledger.
     pub(super) argv0: String,
-    /// The seed prompt it was started on, if any: submitted by seagents,
-    /// like a `send`.
+    /// What it was seeded with, if anything — the prompt, or the line
+    /// pointing at its file: submitted by seagents, like a `send`.
     pub(super) seed: Option<String>,
 }
 
@@ -165,7 +165,7 @@ pub(super) fn spawn(wiring: Wiring) -> Option<Control> {
 impl Control {
     /// The agent has exited: wake whatever waits on it, give in-flight
     /// requests a moment to reply (a `stop` is waiting to say it worked),
-    /// and remove the socket and the session's prompt files.
+    /// and remove the socket.
     pub(super) fn finish(self) {
         let deadline = Instant::now() + DRAIN;
         let mut life = self.shared.life();
@@ -185,10 +185,6 @@ impl Control {
         }
         drop(life);
         let _ = std::fs::remove_file(&self.sock);
-        // The agent is gone, so nothing will read them now.
-        if let Some(meta) = registry::read_meta(&self.shared.wiring.files) {
-            registry::remove_prompts(&meta);
-        }
     }
 }
 
@@ -500,33 +496,6 @@ fn framing(adapter: &adapter::Adapter) -> Framing<'_> {
     }
 }
 
-/// The one line that stands in for a body sent by reference: where the
-/// prompt file is — relative when it is under the agent's working directory,
-/// as it is written to be — and who sent it, so the agent can tell its
-/// parent's instructions from text it merely found.
-fn reference_line(file: &std::path::Path, cwd: &str, who: &str) -> String {
-    let at = match file.strip_prefix(cwd) {
-        Ok(rel) if !cwd.is_empty() => format!("{} (relative to your working directory)", rel.display()),
-        _ => file.display().to_string(),
-    };
-    format!(
-        "Read the file {at} and carry out the instructions in it. They were sent to you through \
-         seagents by {who}."
-    )
-}
-
-/// The inverse of [`reference_line`]: the prompt file a stand-in line
-/// names, as written there (relative to the agent's working directory, or
-/// absolute) — for `read`, which can show the words the agent was only told
-/// where to find.
-pub(crate) fn referenced_file(text: &str) -> Option<&str> {
-    let at = text
-        .strip_prefix("Read the file ")?
-        .split_once(" and carry out the instructions in it. They were sent to you through seagents by ")?
-        .0;
-    Some(at.strip_suffix(" (relative to your working directory)").unwrap_or(at))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn send(
     shared: &Shared,
@@ -564,9 +533,10 @@ fn send(
                     Paste(text) if adapter.send.by_reference(text) => {
                         let meta = registry::read_meta(&w.files)
                             .ok_or_else(|| Reply::refused(Refusal::Failed, "this agent's .meta is gone"))?;
-                        let file = registry::write_prompt(&meta, stops, text)
-                            .map_err(|e| Reply::refused(Refusal::Failed, format!("writing the prompt file: {e}")))?;
-                        Some(reference_line(&file, &meta.cwd, who))
+                        Some(
+                            registry::by_reference(meta.wrapper_pid, &meta.cwd, stops, text, who)
+                                .map_err(|e| Reply::refused(Refusal::Failed, format!("writing the prompt file: {e}")))?,
+                        )
                     }
                     _ => None,
                 };
@@ -903,26 +873,6 @@ mod tests {
         assert_eq!(g(Some("blocked"), true, false, true, false, true), Gate::Go { paired: false });
         assert_eq!(g(Some("unknown"), false, false, false, false, false), Gate::Unsupported);
         assert_eq!(g(Some("unknown"), false, false, false, true, false), Gate::Go { paired: false });
-    }
-
-    #[test]
-    fn a_body_by_reference_is_one_line_naming_the_file_and_the_sender() {
-        let line = reference_line(
-            std::path::Path::new("/w/proj/.seagents/prompts/7-2-beef.md"),
-            "/w/proj",
-            "@planner",
-        );
-        assert_eq!(
-            line,
-            "Read the file .seagents/prompts/7-2-beef.md (relative to your working directory) and carry \
-             out the instructions in it. They were sent to you through seagents by @planner."
-        );
-        assert!(!line.contains('\n'));
-        let abs = reference_line(std::path::Path::new("/elsewhere/p.md"), "/w/proj", "the user");
-        assert!(abs.starts_with("Read the file /elsewhere/p.md and") && abs.ends_with("by the user."), "{abs}");
-        assert_eq!(referenced_file(&line), Some(".seagents/prompts/7-2-beef.md"));
-        assert_eq!(referenced_file(&abs), Some("/elsewhere/p.md"));
-        assert_eq!(referenced_file("Read the file x.md please"), None);
     }
 
     #[test]

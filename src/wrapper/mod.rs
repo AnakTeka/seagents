@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::adapter::SeedBy;
 use crate::launch::handle_for;
 use crate::registry::{self, Files};
 use crate::window;
@@ -26,7 +27,6 @@ mod lead;
 mod monitor;
 mod pumps;
 
-pub(crate) use control::referenced_file;
 pub(crate) use lead::lead;
 
 /// `seagents run [--tag T] [--parent P] [--seed-file F] <cmd…>`. Exit 2 —
@@ -51,15 +51,8 @@ pub(crate) fn run(
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let (argv, hooked) = match child_argv(&cmd, &exe, &cwd, seed.as_deref()) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("seagents: {e}");
-            return 2;
-        }
-    };
     // Held from here until the `.meta` exists, so no other `run` can take the
-    // same tag in between. Only the pty and the fork happen under it.
+    // same tag in between. Only the argv, the pty and the fork happen under it.
     let claim = match registry::claim_tag(
         tag.as_deref(),
         parent.as_deref(),
@@ -67,6 +60,22 @@ pub(crate) fn run(
         &crate::snapshot::captured_tags(),
     ) {
         Ok(c) => c,
+        Err(e) => {
+            eprintln!("seagents: {e}");
+            return 2;
+        }
+    };
+    // Whatever becomes of this run from here — the agent exits, or it never
+    // starts — the session's prompt files go when it returns: a seed's,
+    // written just below, and every `send`'s by reference. (A wrapper killed
+    // outright leaves them to `reap`.)
+    let _prompts = Prompts {
+        wrapper_pid: u64::from(std::process::id()),
+        cwd: cwd.to_string_lossy().into_owned(),
+    };
+    let who = claim.parent.as_deref().map_or_else(|| "the user".to_string(), |p| format!("@{p}"));
+    let (argv, hooked, seeded) = match child_argv(&cmd, &exe, &cwd, seed.as_deref(), &who) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("seagents: {e}");
             return 2;
@@ -171,7 +180,7 @@ pub(crate) fn run(
     // observers disagree — better no monitor than a flapping one. The
     // control socket needs it too, to signal the agent on `stop`.)
     let control = child.process_id().map(u64::from).and_then(|anchor_pid| {
-        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd, seed.is_some(), Arc::clone(&wake));
+        monitor::spawn(files.clone(), anchor_pid, &cmd[0], &cwd, seeded.is_some(), Arc::clone(&wake));
         // After the `.meta`: `reap` sweeps a socket no live session owns.
         control::spawn(control::Wiring {
             files: files.clone(),
@@ -181,7 +190,7 @@ pub(crate) fn run(
             modes,
             wake,
             argv0: cmd[0].clone(),
-            seed: seed.clone(),
+            seed: seeded.clone(),
         })
     });
 
@@ -198,6 +207,18 @@ pub(crate) fn run(
     code
 }
 
+/// Removes a session's prompt files when `run` returns.
+struct Prompts {
+    wrapper_pid: u64,
+    cwd: String,
+}
+
+impl Drop for Prompts {
+    fn drop(&mut self) {
+        registry::remove_prompts(self.wrapper_pid, &self.cwd);
+    }
+}
+
 /// Read a seed prompt file and delete it. The file is written 0600 into the
 /// runtime dir by `spawn`, and its one reader is this.
 fn take_seed(path: &Path) -> Result<String, String> {
@@ -207,12 +228,25 @@ fn take_seed(path: &Path) -> Result<String, String> {
 }
 
 /// What the agent is actually started with: the user's `cmd`, plus our hooks
-/// when its adapter takes them, plus the seed prompt per the adapter's
-/// `seed_prompt` — and whether the hooks went in. Only the child sees this; `.meta` records `cmd` itself,
+/// when its adapter takes them, plus the seed per the adapter's
+/// `seed_prompt` — and whether the hooks went in, and the seed as the agent
+/// receives it. Only the child sees this; `.meta` records `cmd` itself,
 /// because `restore` relaunches from the recorded argv — it would otherwise
 /// stack a second `--settings`, and re-submit the seed into the resumed
 /// conversation, on every restore (and the prompt stays out of `.meta`).
-fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Result<(Vec<String>, bool), String> {
+///
+/// Under `seed_by = "file"` the prompt goes to the session's first prompt
+/// file (`registry::by_reference`, as a long `send` does; `who` sent it) and
+/// the command line carries only the line telling the agent to read it:
+/// anything in argv is in `/proc/<pid>/cmdline`, which every local user can
+/// read for as long as the agent runs.
+fn child_argv(
+    cmd: &[String],
+    exe: &Path,
+    cwd: &Path,
+    seed: Option<&str>,
+    who: &str,
+) -> Result<(Vec<String>, bool, Option<String>), String> {
     let adapter = match crate::adapter::for_command(&cmd[0]) {
         Ok(a) => a,
         // The agent still starts — a broken override must not take every
@@ -221,7 +255,7 @@ fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Res
         Err(e) if seed.is_some() => return Err(format!("agent adapter: {e}; cannot seed the prompt")),
         Err(e) => {
             eprintln!("seagents: agent adapter: {e}; launching without hooks");
-            return Ok((cmd.to_vec(), false));
+            return Ok((cmd.to_vec(), false, None));
         }
     };
     let (mut argv, warning) = crate::hook::inject(cmd, &adapter, exe, cwd);
@@ -231,10 +265,23 @@ fn child_argv(cmd: &[String], exe: &Path, cwd: &Path, seed: Option<&str>) -> Res
     // `inject` hands back the user's argv untouched exactly when it added
     // nothing (no hook support, a hookless flag, settings that won't merge).
     let hooked = argv != cmd;
-    if let Some(prompt) = seed {
-        argv.extend(adapter.launch.seed_args(prompt)?);
-    }
-    Ok((argv, hooked))
+    let seeded = match seed {
+        None => None,
+        Some(prompt) => {
+            let text = match adapter.launch.seed_by {
+                SeedBy::Inline => prompt.to_string(),
+                SeedBy::File => {
+                    // Refused before anything is written, as inline.
+                    adapter.launch.check_seed(prompt)?;
+                    registry::by_reference(u64::from(std::process::id()), &cwd.to_string_lossy(), 0, prompt, who)
+                        .map_err(|e| format!("writing the seed prompt's file: {e}"))?
+                }
+            };
+            argv.extend(adapter.launch.seed_args(&text)?);
+            Some(text)
+        }
+    };
+    Ok((argv, hooked, seeded))
 }
 
 /// Capture the i3 window this agent lives in, as (con_id, X window id).
@@ -414,7 +461,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let before = cmd.clone();
-        let (child, hooked) = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), None).unwrap();
+        let (child, hooked, _) = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), None, "the user").unwrap();
         assert!(hooked);
         assert_eq!(child[1], "--settings");
         assert!(child[2].contains("'/x/seagents' __hook"));
@@ -424,10 +471,10 @@ mod tests {
         assert_eq!(cmd, before);
         // A tool with no hook support is started exactly as typed.
         let bash = vec!["bash".to_string()];
-        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), (bash, false));
+        assert_eq!(child_argv(&bash, Path::new("/x/seagents"), Path::new("/"), None, "").unwrap(), (bash, false, None));
         // Nor is one run under a flag that skips its hooks.
         let bare: Vec<String> = ["claude", "--bare"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(child_argv(&bare, Path::new("/x/seagents"), Path::new("/"), None).unwrap(), (bare, false));
+        assert_eq!(child_argv(&bare, Path::new("/x/seagents"), Path::new("/"), None, "").unwrap(), (bare, false, None));
     }
 
     #[test]
@@ -439,12 +486,33 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (child, _) = child_argv(&cmd, Path::new("/x/seagents"), Path::new("/"), Some("-v: do it")).unwrap();
+        let cwd = std::env::temp_dir().join(format!("seagents-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let secret = "-v: do the secret thing";
+        let (child, _, seeded) = child_argv(&cmd, Path::new("/x/seagents"), &cwd, Some(secret), "@boss").unwrap();
         assert_eq!((child[1].as_str(), child.len()), ("--settings", 9));
-        assert_eq!(&child[3..], ["--permission-mode", "plan", "--model", "haiku", "--", "-v: do it"]);
+        assert_eq!(&child[3..8], ["--permission-mode", "plan", "--model", "haiku", "--"]);
+        // Claude reads a file in its cwd without asking, so its command line —
+        // anyone's to read in /proc — carries only where the prompt is.
+        let line = &child[8];
+        assert_eq!(seeded.as_deref(), Some(line.as_str()));
+        assert!(!child.iter().any(|a| a.contains("secret")), "{child:?}");
+        assert!(line.ends_with("by @boss."), "{line}");
+        let file = cwd.join(registry::referenced_file(line).unwrap());
+        let name = file.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with(&format!("{}-0-", std::process::id())), "{name}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), secret);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        drop(Prompts { wrapper_pid: u64::from(std::process::id()), cwd: cwd.to_string_lossy().into_owned() });
+        assert!(!file.exists() && !cwd.join(".seagents").exists());
+
+        // An adapter that seeds inline puts the prompt itself there.
         // A command with no way to take one is refused, not launched unseeded.
         let bash = vec!["bash".to_string()];
-        assert!(child_argv(&bash, Path::new("/x"), Path::new("/"), Some("hi")).is_err());
+        assert!(child_argv(&bash, Path::new("/x"), &cwd, Some("hi"), "").is_err());
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]

@@ -1033,13 +1033,21 @@ something the caller can't casually change:
    `registry::runtime_dir()`, §2, so `/tmp/seagents-<uid>` when that can't
    be used). `run --seed-file`
    reads and deletes it first thing and appends the adapter's `seed_prompt`
-   (Claude: `-- <prompt>`, submitted as the first turn) to the **child's** argv
-   only — never `.meta`'s, which `restore` replays. Adapters with no template,
-   and prompts of 128 KiB or more (one argv string's limit), are refused before
-   a window opens; the spec's paste-once-idle path for them isn't built, since
-   no bundled adapter needs it (when it is, it pastes through
-   `wrapper/inject.rs::deliver`, as `send` does). The prompt is visible in the agent's
-   `/proc/<pid>/cmdline` to anyone who can read it (single-user machine).
+   (Claude and Codex: `-- <text>`, submitted as the first turn) to the
+   **child's** argv only — never `.meta`'s, which `restore` replays. Under the
+   adapter's `seed_by = "file"` (both bundled adapters) `<text>` is **not the
+   prompt**: the prompt goes to the session's prompt file,
+   `<cwd>/.seagents/prompts/<wrapper_pid>-0-<hex>.md` (0600, the same mechanism
+   as a long `send`, deleted with the session), and `<text>` is the one line
+   telling the agent to read it and naming who sent it. The agent's
+   `/proc/<pid>/cmdline` is readable by every local user; the prompt must not
+   be there. Verified live 2026-09-30: Claude (default mode) and Codex
+   (read-only sandbox) read the file without a permission prompt and carry it
+   out. `seed_by = "inline"` (an override's choice) puts the prompt itself in
+   argv, with that exposure. Adapters with no template, and inline prompts of
+   128 KiB or more (one argv string's limit), are refused before a window
+   opens; the spec's paste-once-idle path isn't built, since no bundled adapter
+   needs it.
 6. **Launch** via `launch::spawn_terminal` with `keep_shell: false`, in the
    terminal class of the caller's own window (the focused one for a human;
    `SEAGENTS_TERMINAL` overrides), then **return** once the child's `.meta`

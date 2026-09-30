@@ -251,7 +251,7 @@ fn inline_references(records: &mut [Record], cwd: Option<&Path>) {
         let Kind::User { text } = &mut r.kind else {
             continue;
         };
-        let Some(named) = crate::wrapper::referenced_file(text) else {
+        let Some(named) = crate::registry::referenced_file(text) else {
             continue;
         };
         let file = match (Path::new(named).is_absolute(), cwd) {
