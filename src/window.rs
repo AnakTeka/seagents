@@ -180,7 +180,7 @@ pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
     let known: std::collections::HashSet<u64> =
         windows.iter().filter_map(|w| w.xid).collect();
 
-    for pid in crate::procfs::ancestors(std::process::id() as u64) {
+    for pid in crate::procfs::ancestors(std::process::id() as u64).unwrap_or_default() {
         let Ok(out) = Command::new("xdotool")
             .args(["search", "--pid", &pid.to_string()])
             .output()

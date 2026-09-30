@@ -77,7 +77,10 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
         return Err(format!("{} is not a directory", cwd.display()));
     }
 
-    let caller = registry::enclosing_session(u64::from(std::process::id()));
+    // Unknown is not human: a human's spawn is uncapped and keeps its
+    // `--arg`s, so it is never the fallback for an unreadable ancestry.
+    let caller = registry::enclosing_session(u64::from(std::process::id()), None)
+        .map_err(|e| format!("cannot tell who is calling ({e}); nothing was spawned"))?;
     let who = match &caller {
         None => Caller::Human,
         // The mode as the parent's own adapter reads it: its hooks' word,

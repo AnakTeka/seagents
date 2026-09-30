@@ -40,19 +40,74 @@ pub(crate) fn parent_pid(pid: u64) -> Option<u64> {
         .ok()
 }
 
-/// `pid`'s ancestry, nearest ancestor first, stopping at init.
-pub(crate) fn ancestors(mut pid: u64) -> Vec<u64> {
+/// `pid`'s whole ancestry, nearest ancestor first, up to (not including)
+/// init — or None when any link of it cannot be read: `pid` or an ancestor
+/// is gone (a parent that exits mid-walk), belongs to a pid namespace we
+/// can't see into, or the chain is implausibly deep. Complete or nothing,
+/// because "no wrapper among the ancestors" is what makes a caller a human
+/// (`registry::enclosing_session`): a walk that stopped at an unreadable
+/// link would call anything above it human for lack of data.
+pub(crate) fn ancestors(mut pid: u64) -> Option<Vec<u64>> {
     let mut out = Vec::new();
-    // Bounded: a /proc loop would otherwise hang the launch path.
-    for _ in 0..32 {
-        let Some(parent) = parent_pid(pid) else { break };
-        if parent <= 1 {
-            break;
+    // Bounded: a /proc loop would otherwise hang the caller. Real chains are
+    // a dozen deep.
+    for _ in 0..1024 {
+        // 1 is init (or a namespace's), 0 a kernel thread's or a process
+        // whose parent is outside our pid namespace: the top either way.
+        match parent_pid(pid)? {
+            0 | 1 => return Some(out),
+            parent => {
+                out.push(parent);
+                pid = parent;
+            }
         }
-        out.push(parent);
-        pid = parent;
     }
-    out
+    None
+}
+
+/// A process pinned by a pidfd: unlike its pid number, which the kernel
+/// hands to the next process once this one is reaped, the descriptor goes
+/// on naming this process alone. `SO_PEERCRED`'s pid is a number fixed at
+/// `connect`; the control socket pins it so that a peer which exits (and
+/// whose pid is reused) is noticed rather than mistaken for another process.
+#[derive(Debug)]
+pub(crate) struct Pinned {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl Pinned {
+    /// Pin `pid` now (`pidfd_open`). Already gone: None. Racy on its own —
+    /// if `pid` died and was reused before this call it pins the newcomer —
+    /// so prefer [`Pinned::from_fd`] with a pidfd the kernel took earlier.
+    pub(crate) fn open(pid: u64) -> Option<Pinned> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        (fd >= 0).then(|| Pinned {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) },
+        })
+    }
+
+    /// A pidfd the kernel handed us (`SO_PEERPIDFD`).
+    pub(crate) fn from_fd(fd: std::os::fd::OwnedFd) -> Pinned {
+        Pinned { fd }
+    }
+
+    /// Whether the pinned process still exists (signal 0 through the pidfd:
+    /// no signal sent, only the check). A zombie still holds its pid, so it
+    /// counts — its `/proc` entry and parentage are still its own.
+    pub(crate) fn alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        r == 0
+    }
 }
 
 /// When this boot began, in Unix seconds: the `btime` line of `/proc/stat`.
@@ -103,10 +158,26 @@ mod tests {
         assert!(alive(me));
         assert!(!alive(u32::MAX as u64));
         let parent = parent_pid(me).expect("our own stat is readable");
-        assert_eq!(
-            ancestors(me).first().copied(),
-            Some(parent).filter(|p| *p > 1)
-        );
+        let chain = ancestors(me).expect("our own ancestry is readable");
+        assert_eq!(chain.first().copied(), Some(parent).filter(|p| *p > 1));
+        assert!(!chain.contains(&1) && !chain.contains(&0));
+        // A pid with no process has no ancestry to speak of: not an empty
+        // one, which would read as "no wrapper above it".
+        assert_eq!(ancestors(u32::MAX as u64), None);
+    }
+
+    #[test]
+    fn a_pinned_process_is_alive_until_it_exits() {
+        let me = Pinned::open(std::process::id() as u64).expect("pidfd_open on ourselves");
+        assert!(me.alive());
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let pinned = Pinned::open(u64::from(child.id())).unwrap();
+        assert!(pinned.alive());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Reaped: the pidfd still names that process, which is gone.
+        assert!(!pinned.alive());
+        assert!(Pinned::open(u32::MAX as u64).is_none());
     }
 
     #[test]

@@ -641,17 +641,38 @@ fn final_agent_in(dir: &Dirs, session: &Session) -> AgentRecord {
 /// ancestors that is a wrapper with a live `.meta` (for a hook: sh → the agent
 /// → `__lead` → the wrapper). This is "who is calling" for every command that
 /// cares — a hook finding its ledger, `spawn` deriving lineage, and
-/// the control socket judging an `SO_PEERCRED` pid. None is a human caller.
+/// the control socket judging an `SO_PEERCRED` pid. `Ok(None)` is a human
+/// caller; Err says why the caller cannot be told at all.
+///
+/// Human is a finding, never a default: it takes the whole ancestry, read up
+/// to init, with no wrapper in it. A link that can't be read (the caller or
+/// an ancestor already gone) is Err, and so is a caller that is no longer
+/// the process that was walked — `pinned`, when given, must still be alive
+/// once the walk is done (a pid read by number may have been reused), and a
+/// second walk must find the same chain (an ancestor that died mid-walk
+/// reparents its children, and its number could have been reused too). A
+/// caller that connected, forked and exited used to read as a human here,
+/// with a human's rights on the control socket.
 ///
 /// Derived from ancestry rather than an environment variable, which
 /// everything the agent runs inherits and can rewrite: unforgeable by
-/// accident, though an agent that deliberately escapes its tree (`setsid`,
-/// `systemd-run`) will look human — the line the threat model draws.
-pub(crate) fn enclosing_session(pid: u64) -> Option<Session> {
-    enclosing_session_in(&Dirs::live(), &procfs::ancestors(pid))
+/// accident, though an agent that deliberately escapes its tree (double
+/// fork, `systemd-run`) will look human — the line the threat model draws.
+pub(crate) fn enclosing_session(pid: u64, pinned: Option<&procfs::Pinned>) -> Result<Option<Session>, String> {
+    enclosing_session_in(&Dirs::live(), pid, || pinned.is_none_or(procfs::Pinned::alive))
 }
 
-fn enclosing_session_in(dir: &Dirs, ancestors: &[u64]) -> Option<Session> {
+fn enclosing_session_in(dir: &Dirs, pid: u64, still_there: impl Fn() -> bool) -> Result<Option<Session>, String> {
+    let chain = procfs::ancestors(pid).ok_or_else(|| format!("the ancestry of pid {pid} cannot be read"))?;
+    let found = nearest_session_in(dir, &chain);
+    if !still_there() || procfs::ancestors(pid).as_ref() != Some(&chain) {
+        return Err(format!("pid {pid} exited or changed parents while it was being identified"));
+    }
+    Ok(found)
+}
+
+/// The first session of `ancestors` (nearest first) with a live `.meta`.
+fn nearest_session_in(dir: &Dirs, ancestors: &[u64]) -> Option<Session> {
     ancestors.iter().find_map(|&pid| {
         let files = Files::in_dirs(dir, pid);
         let meta = read_meta(&files).filter(|m| m.wrapper_pid == pid && is_alive(m))?;
@@ -1960,13 +1981,19 @@ mod tests {
         write_new_meta(&Files::in_dir(&dir, 10), &sample(10, Some(me)));
         write_new_meta(&Files::in_dir(&dir, 20), &sample(20, Some(me)));
         write_new_meta(&Files::in_dir(&dir, 30), &sample(30, Some(dead)));
-        let found = |chain: &[u64]| enclosing_session_in(&dir, chain).map(|s| s.meta.wrapper_pid);
+        let found = |chain: &[u64]| nearest_session_in(&dir, chain).map(|s| s.meta.wrapper_pid);
         // sh → claude → __lead → wrapper 10 → … → wrapper 20: the nearest wins
         // (an agent running inside another agent's session belongs to its own).
         assert_eq!(found(&[500, 501, 502, 10, 600, 20]), Some(10));
         // A dead session is skipped, not matched.
         assert_eq!(found(&[500, 30, 20]), Some(20));
         assert_eq!(found(&[500, 501]), None);
+        // Our own ancestry holds no wrapper of this scratch cache: a human,
+        // positively. A pid with no ancestry to read, or a caller that is
+        // gone by the end of the walk, is nobody in particular.
+        assert!(matches!(enclosing_session_in(&dir, me, || true), Ok(None)));
+        assert!(enclosing_session_in(&dir, dead, || true).unwrap_err().contains("cannot be read"));
+        assert!(enclosing_session_in(&dir, me, || false).unwrap_err().contains("exited"));
         fs::remove_dir_all(&dir).ok();
     }
 

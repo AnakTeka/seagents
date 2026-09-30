@@ -247,8 +247,9 @@ Source layout under `src/`:
   or not seagents) /
   `resolve_exited()` + `final_agent()` (an agent that may have exited, for
   `wait`/`read`) /
-  `by_child_pid()` / `enclosing_session(pid)` (the session a process runs
-  inside, by `/proc` ancestry — "who is calling"), the locked `update_meta()` / `update_state()` / `update_agent()`;
+  `by_child_pid()` / `enclosing_session(pid, pinned)` (the session a process runs
+  inside, by `/proc` ancestry — "who is calling"; Ok(None) is a human, Err
+  is unknown), the locked `update_meta()` / `update_state()` / `update_agent()`;
   tags (`valid_tag()`,
   `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
   `claim_spawn()` with its `Caps`; `backfill_tags()`), `runtime_dir()`, and
@@ -348,7 +349,8 @@ Source layout under `src/`:
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
 - **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
-  `parent_pid()`, `ancestors()`, `live_pty_size()`.
+  `parent_pid()`, `ancestors()` (the whole chain to init, or None),
+  `Pinned` (a pidfd, and whether it is still alive), `live_pty_size()`.
 - **`src/clock.rs`** — `unix_now()` (seconds: `.meta`, `.state`, the
   snapshot) and `unix_now_ms()` (the `.agent` turn ledger).
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
@@ -918,7 +920,9 @@ caller is another agent (ORCHESTRATION-SPEC), so every bound is derived from
 something the caller can't casually change:
 
 1. **Who is calling** = `registry::enclosing_session(own pid)`: the first
-   `/proc` ancestor that is a live wrapper. None → a human. (Not an
+   `/proc` ancestor that is a live wrapper. None, with the whole ancestry
+   read up to init → a human; a link that can't be read refuses the spawn
+   rather than treating it as uncapped (§9). (Not an
    environment variable: everything an agent runs inherits and can edit
    those. An agent that deliberately escapes its tree — `setsid`,
    `systemd-run` — looks human; that is the threat model's line.)
@@ -1060,8 +1064,20 @@ that speaks it is treated like the CLI).
 
 **Authorization is the wrapper's**, per request, from `SO_PEERCRED`: the
 connecting pid's `/proc` ancestry names the calling agent
-(`registry::enclosing_session`, as for `spawn`). A human (no wrapper among its
-ancestors) may send to and stop anyone and answer gates. An agent may act only
+(`registry::enclosing_session`, as for `spawn`). A human may send to and stop
+anyone and answer gates — and "human" is a finding, never the absence of
+one: the whole ancestry read up to init with no wrapper in it, by a peer
+still alive once it was read. The pid is a number fixed at `connect`, so the
+wrapper pins the peer the moment it takes the connection (`SO_PEERPIDFD`, the
+kernel's own pidfd from `connect`; `pidfd_open` only on a kernel without it),
+walks, then checks the pidfd is still live and a second walk finds the same
+chain. A peer that exited (or whose pid was reused), or any link that can't be
+read, is `caller identity unknown` → `forbidden`. Until 2026-09-30 an
+unreadable ancestry read as "no wrapper", i.e. human: a process that connected,
+forked and exited let its child `stop --force` any agent (reproduced: an
+unrelated agent `evil` stopped `top`; now refused — the unit test
+`a_peer_that_exited_after_connecting_is_unknown_not_human` does the same
+fork-and-exit, and so did a live tmux run). An agent may act only
 on its own descendants — walking the target's `parent` chain by tag, over live
 `.meta`s, must reach the caller — so never on itself, its parent, a sibling or
 a stranger (and A→B→A ping-pong can't happen), and may never

@@ -8,12 +8,15 @@
 //! request line and gets one reply line (`crate::send` has the format).
 //!
 //! **Every request is authorized here**, from the connecting process's
-//! `SO_PEERCRED` pid: its `/proc` ancestry names the calling agent
+//! `SO_PEERCRED` pid, pinned as a pidfd the moment the connection is taken:
+//! its `/proc` ancestry names the calling agent
 //! (`registry::enclosing_session`), and an agent may drive only its own
 //! descendants — walking this agent's `parent` chain by tag must reach the
-//! caller — and may never answer a gate. No wrapper among the caller's
-//! ancestors is a human, who may do anything. The CLI's own checks are
-//! convenience; this is the gate.
+//! caller — and may never answer a gate. A human, who may do anything, is a
+//! whole ancestry read up to init with no wrapper in it, by a caller still
+//! alive once it was read; a caller that can't be identified that way (it
+//! exited after connecting, an unreadable link) may do nothing. The CLI's own
+//! checks are convenience; this is the gate.
 //!
 //! A `send` is written into an **idle** agent by default, so the next turn to
 //! end is the one it started: the thread waits (up to the request's timeout)
@@ -252,8 +255,11 @@ fn handle(shared: &Shared, stream: UnixStream) {
 }
 
 fn serve(shared: &Shared, stream: &UnixStream) -> Result<Reply, Reply> {
-    let (pid, uid) = peer(stream).ok_or_else(|| Reply::refused(Refusal::Failed, "cannot identify the caller"))?;
-    if uid != unsafe { libc::getuid() } {
+    // Pinned first, before anything waits on the client: the pid is a number
+    // fixed at `connect`, and only the pidfd says later whether it still
+    // names the process that connected.
+    let peer = peer(stream).ok_or_else(|| Reply::refused(Refusal::Failed, "cannot identify the caller"))?;
+    if peer.uid != unsafe { libc::getuid() } {
         return Err(Reply::refused(Refusal::Forbidden, "another user's process"));
     }
     let request = read_request(stream)?;
@@ -261,14 +267,26 @@ fn serve(shared: &Shared, stream: &UnixStream) -> Result<Reply, Reply> {
     let me = registry::read_meta(&shared.wiring.files)
         .map(|m| m.tag)
         .ok_or_else(|| Reply::refused(Refusal::Failed, "this agent's .meta is gone"))?;
-    let caller = registry::enclosing_session(pid).map(|s| s.meta.tag);
+    // Identified after the request is read, so a caller that connects and
+    // then hands the connection to a child and exits (or dies and has its
+    // pid reused) is caught: its pidfd reads dead, and unknown is refused.
+    let found = match &peer.pinned {
+        Some(pinned) => registry::enclosing_session(peer.pid, Some(pinned)).map(|s| s.map(|s| s.meta.tag)),
+        None => Err("no pidfd for the caller".to_string()),
+    };
+    let caller = match &found {
+        Ok(None) => Caller::Human,
+        Ok(Some(tag)) => Caller::Agent(tag),
+        Err(why) => Caller::Unknown(why),
+    };
     let answer = matches!(request, Request::Send { answer_permission: true, .. });
     let parents: std::collections::HashMap<String, Option<String>> = registry::list()
         .into_iter()
         .map(|s| (s.meta.tag, s.meta.parent))
         .collect();
-    authorize(caller.as_deref(), &me, answer, |t| parents.get(t).cloned().flatten())
+    authorize(caller, &me, answer, |t| parents.get(t).cloned().flatten())
         .map_err(|e| Reply::refused(Refusal::Forbidden, e))?;
+    let caller = found.ok().flatten();
 
     match request {
         Request::Send {
@@ -309,8 +327,17 @@ impl Owned {
     }
 }
 
-/// `SO_PEERCRED`: the connecting process's pid and uid, as of `connect`.
-fn peer(stream: &UnixStream) -> Option<(u64, u32)> {
+/// Who connected: `SO_PEERCRED`'s pid and uid, as of `connect`, and that
+/// process pinned.
+struct Peer {
+    pid: u64,
+    uid: u32,
+    /// None: it could not be pinned — already gone, or a kernel without
+    /// pidfds — which leaves it unidentifiable.
+    pinned: Option<crate::procfs::Pinned>,
+}
+
+fn peer(stream: &UnixStream) -> Option<Peer> {
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let r = unsafe {
@@ -322,7 +349,42 @@ fn peer(stream: &UnixStream) -> Option<(u64, u32)> {
             &mut len,
         )
     };
-    (r == 0 && cred.pid > 0).then_some((cred.pid as u64, cred.uid))
+    if r != 0 || cred.pid <= 0 {
+        return None;
+    }
+    let pid = cred.pid as u64;
+    Some(Peer {
+        pid,
+        uid: cred.uid,
+        pinned: peer_pidfd(stream, pid),
+    })
+}
+
+/// The connecting process as a pidfd: `SO_PEERPIDFD` (Linux 6.5) is the
+/// kernel's own, taken at `connect`, so it can never name a process that
+/// reused the pid since. Only where the kernel doesn't know the option is
+/// `pidfd_open` on the pid the fallback — racy by the time between
+/// `connect` and now. Any other failure (the peer already reaped) is None.
+fn peer_pidfd(stream: &UnixStream, pid: u64) -> Option<crate::procfs::Pinned> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut fd as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if r == 0 && fd >= 0 {
+        return Some(crate::procfs::Pinned::from_fd(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOPROTOOPT) => crate::procfs::Pinned::open(pid),
+        _ => None,
+    }
 }
 
 fn read_request(stream: &UnixStream) -> Result<Request, Reply> {
@@ -337,18 +399,33 @@ fn read_request(stream: &UnixStream) -> Result<Request, Reply> {
     serde_json::from_str(&line).map_err(|e| Reply::refused(Refusal::BadRequest, format!("bad request: {e}")))
 }
 
-/// The lineage rule. A human (`caller` None) may do anything. An agent may
-/// act on `target` only when walking `target`'s parent chain reaches it — so
-/// never on itself, its parent, a sibling or a stranger, which is also what
-/// makes an A→B→A ping-pong impossible — and may never answer a gate.
+/// Who is on the other end of a request, as far as authorization goes.
+#[derive(Clone, Copy, Debug)]
+enum Caller<'a> {
+    /// Its whole ancestry was read, and holds no wrapper.
+    Human,
+    /// The tag of the nearest live wrapper among its ancestors.
+    Agent(&'a str),
+    /// It could not be told — gone before it was identified, an ancestry
+    /// that can't be read — and why. Never taken for a human.
+    Unknown(&'a str),
+}
+
+/// The lineage rule. A human may do anything. An agent may act on `target`
+/// only when walking `target`'s parent chain reaches it — so never on
+/// itself, its parent, a sibling or a stranger, which is also what makes an
+/// A→B→A ping-pong impossible — and may never answer a gate. A caller that
+/// could not be identified may do nothing.
 fn authorize(
-    caller: Option<&str>,
+    caller: Caller<'_>,
     target: &str,
     answer_permission: bool,
     parent_of: impl Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
-    let Some(caller) = caller else {
-        return Ok(());
+    let caller = match caller {
+        Caller::Human => return Ok(()),
+        Caller::Unknown(why) => return Err(format!("caller identity unknown: {why}")),
+        Caller::Agent(tag) => tag,
     };
     if answer_permission {
         return Err(format!(
@@ -715,6 +792,7 @@ mod tests {
 
     fn may(caller: Option<&str>, target: &str, answer: bool) -> bool {
         let t = tree();
+        let caller = caller.map_or(Caller::Human, Caller::Agent);
         authorize(caller, target, answer, |x| t.get(x).copied().flatten().map(str::to_string)).is_ok()
     }
 
@@ -735,10 +813,74 @@ mod tests {
         assert!(!may(Some("planner"), "stranger", false));
         assert!(!may(Some("stranger"), "planner", false));
         // Never answers a gate, even its own child's.
-        let e = authorize(Some("planner"), "reviewer", true, |_| Some("planner".into())).unwrap_err();
+        let e = authorize(Caller::Agent("planner"), "reviewer", true, |_| Some("planner".into())).unwrap_err();
         assert!(e.contains("only a human"), "{e}");
         // A parent cycle ends the walk instead of hanging it.
-        assert!(authorize(Some("x"), "a", false, |t| Some(if t == "a" { "b" } else { "a" }.into())).is_err());
+        assert!(authorize(Caller::Agent("x"), "a", false, |t| Some(if t == "a" { "b" } else { "a" }.into())).is_err());
+        // A caller nobody could identify does nothing — not even what any
+        // agent could — and above all is not a human.
+        for (target, answer) in [("planner", false), ("fixer", false), ("stranger", false), ("planner", true)] {
+            let e = authorize(Caller::Unknown("gone"), target, answer, |_| None).unwrap_err();
+            assert!(e.starts_with("caller identity unknown"), "{e}");
+        }
+    }
+
+    /// The review's reproduction, in-process: a client connects, the
+    /// connecting process exits, and the connection lives on (there, in a
+    /// forked child that sends the request). The peer's pid now names nothing
+    /// — or, once reused, someone else — so it must be refused, where it used
+    /// to read as a human.
+    #[test]
+    fn a_peer_that_exited_after_connecting_is_unknown_not_human() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("sg-peer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // A live peer (ourselves): pinned, and our ancestry holds no wrapper
+        // of the (scratch or real) cache we'd look in only if we were one.
+        let _me = UnixStream::connect(&path).unwrap();
+        let (live, _) = listener.accept().unwrap();
+        let p = peer(&live).unwrap();
+        assert_eq!(p.pid, u64::from(std::process::id()));
+        assert!(p.pinned.as_ref().is_some_and(crate::procfs::Pinned::alive));
+
+        // A peer that connects and exits. Everything the child needs is made
+        // before the fork; it only calls socket/connect/_exit.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (d, b) in addr.sun_path.iter_mut().zip(path.as_os_str().as_encoded_bytes()) {
+            *d = *b as libc::c_char;
+        }
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let ok = libc::connect(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                );
+                libc::_exit(if ok == 0 { 0 } else { 1 });
+            }
+        }
+        let (dead, _) = listener.accept().unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status, 0, "the child connected");
+        let p = peer(&dead).unwrap();
+        assert_eq!(p.pid, child as u64);
+        // Either the kernel would not pin a reaped peer, or it did and the
+        // pin reads dead; either way the identification fails.
+        let found = match &p.pinned {
+            Some(pinned) => registry::enclosing_session(p.pid, Some(pinned)),
+            None => Err("no pidfd".into()),
+        };
+        assert!(found.is_err(), "a reaped peer was identified: {:?}", found.map(|s| s.map(|s| s.meta.tag)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn st(word: &str) -> StateRecord {
