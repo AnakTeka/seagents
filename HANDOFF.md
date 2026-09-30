@@ -405,6 +405,24 @@ continues the agent's group and nudges a repaint with SIGWINCH.
 
 ### 2. Data model — `~/.cache/seagents/`
 
+**Private.** The cache holds everything each agent put on screen (`.raw`),
+its last message (`.agent`, the tombstones) and where its conversations are,
+so the directory is 0700 and every file in it is created 0600 — the
+sidecars and tombstones (`fsutil::write_atomic`), the tee and its rotation
+tmp, `.pending`, the locks, `hook.log`, and `sessions/` (0700) with its
+indexes. The state dir (`~/.local/state/seagents`: the layout, HUD prefs)
+is 0700 too, its layout and prefs 0600. One helper decides every such
+directory, `fsutil::private_dir`: made 0700, then `lstat`ed — a real
+directory owned by us, a loosened mode tightened (so a cache made 0755 by an
+older binary is fixed by the first command that uses it; its older files
+become 0600 as they are next rewritten). Under `HOME` a symlink or someone
+else's directory is left as the user arranged it; in `/tmp` it is refused.
+With no `HOME` the cache is `/tmp/seagents-<uid>/cache` (inside the checked
+runtime fallback, below; it was a shared `/tmp/seagents` until 2026-09-30),
+and where that is refused, a path nothing can be written under — the agent
+runs untracked rather than tee its screen into another user's directory.
+Until 2026-09-30 all of it was 0755/0644, readable by any local user.
+
 Per session, keyed by the wrapper's pid:
 
 - **`<wrapper_pid>.raw`** — the teed output byte stream (for detection);
@@ -516,8 +534,9 @@ Per session, keyed by the wrapper's pid:
   unset, can't be created, or is too long for a socket path (`sun_path` holds
   108 bytes with its NUL; room is kept for a 10-digit pid) — then
   `/tmp/seagents-<uid>`, made 0700 and used only if `lstat` says it is a real
-  directory owned by us (a loosened mode is tightened; a symlink or someone
-  else's directory is refused, and then there is no socket and no `send` —
+  directory owned by us (`fsutil::private_dir`, as for the cache: a loosened
+  mode is tightened; a symlink or someone else's directory is refused, and
+  then there is no socket and no `send` —
   the agent still runs, and `send` says why). Verified with a 119-byte
   `XDG_RUNTIME_DIR`: the socket went to `/tmp/seagents-1000`, `send` and `stop`
   worked.

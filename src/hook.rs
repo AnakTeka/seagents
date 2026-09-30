@@ -91,11 +91,7 @@ pub(crate) fn run() -> i32 {
         Err(_) => "panicked".to_string(),
     };
     if std::env::var_os("SEAGENTS_DEBUG").is_some() {
-        if let Ok(mut log) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(registry::cache_dir().join("hook.log"))
-        {
+        if let Ok(mut log) = crate::fsutil::create_private(&registry::cache_dir().join("hook.log"), true) {
             let _ = writeln!(log, "{} pid {}: {err}", crate::clock::unix_now(), std::process::id());
         }
     }

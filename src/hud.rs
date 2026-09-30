@@ -674,11 +674,9 @@ fn read_pref(name: &str) -> Option<String> {
 }
 
 fn write_pref(name: &str, value: &str) {
-    let path = crate::vendor::herdr_detect::config::state_dir().join(name);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, value);
+    let dir = crate::vendor::herdr_detect::config::state_dir();
+    let _ = crate::fsutil::private_dir(&dir);
+    let _ = crate::fsutil::write_atomic(&dir.join(name), value.as_bytes());
 }
 
 fn load_sort() -> status::Sort {

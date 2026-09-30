@@ -53,28 +53,43 @@ use serde_json::{Map, Value};
 use crate::fsutil::write_atomic;
 use crate::procfs;
 
-/// Directory holding this machine's seagents session files.
+/// Directory holding this machine's seagents session files:
+/// `~/.cache/seagents`, private (`fsutil::private_dir`: 0700, a loosened mode
+/// on ours tightened). Under `HOME` a symlink or a directory that isn't ours
+/// is the user's own arrangement and is used as it is. With no `HOME` it is
+/// `/tmp/seagents-<uid>/cache` — the checked directory the runtime dir falls
+/// back to — and if `/tmp` holds someone else's directory or a symlink by
+/// that name, a path nothing can be written under (`/dev/null/…`): the
+/// agent still runs, untracked, rather than tee its screen into a directory
+/// another user controls.
 pub(crate) fn cache_dir() -> PathBuf {
-    let base = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache/seagents"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp/seagents"));
-    let _ = fs::create_dir_all(&base);
-    base
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(home) => {
+            let dir = PathBuf::from(home).join(".cache/seagents");
+            let _ = crate::fsutil::private_dir(&dir);
+            dir
+        }
+        None => crate::fsutil::tmp_dir_in(Path::new("/tmp"))
+            .map(|d| d.join("cache"))
+            .and_then(|d| crate::fsutil::private_dir(&d).map(|()| d))
+            .unwrap_or_else(|_| PathBuf::from("/dev/null/seagents-cache")),
+    }
 }
 
-/// `~/.cache/seagents/sessions/`, created on demand: per-transcript caches
-/// (`transcript::index`'s `.idx` files) — about conversations, not live
-/// agents, so nothing here is reaped with a session. None when it cannot be
-/// created.
+/// `~/.cache/seagents/sessions/`, created on demand (0700): per-transcript
+/// caches (`transcript::index`'s `.idx` files) — about conversations, not
+/// live agents, so nothing here is reaped with a session. None when it cannot
+/// be created.
 pub(crate) fn sessions_dir() -> Option<PathBuf> {
     let dir = cache_dir().join("sessions");
-    fs::create_dir_all(&dir).ok().map(|_| dir)
+    crate::fsutil::private_dir(&dir).ok().map(|_| dir)
 }
 
 /// Where sessions live: the cache (every sidecar) and the runtime dir (their
 /// control sockets, [`runtime_dir`]). Two roots because a socket belongs on
-/// tmpfs, private and gone at logout, while `.meta` & co. must be readable by
-/// whoever looks. A test puts both in one scratch directory.
+/// tmpfs and gone at logout, while `.meta` & co. must outlive a logout long
+/// enough to be reaped into tombstones. Both are private (0700). A test puts
+/// both in one scratch directory.
 #[derive(Clone, Debug)]
 pub(crate) struct Dirs {
     cache: PathBuf,
@@ -1060,7 +1075,7 @@ fn claim_spawn_in(
         spawner: u64::from(spawner),
     };
     let text = serde_json::to_string(&record).map_err(|e| e.to_string())?;
-    fs::write(&file, text).map_err(|e| format!("reserving tag {tag}: {e}"))?;
+    write_atomic(&file, text.as_bytes()).map_err(|e| format!("reserving tag {tag}: {e}"))?;
     Ok(SpawnClaim { tag, parent, file })
 }
 
@@ -1155,35 +1170,20 @@ const SOCK_NAME_MAX: usize = "4294967295.sock".len();
 const SUN_PATH: usize = 108;
 
 fn runtime_dir_in(xdg: Option<std::ffi::OsString>, tmp: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     // A socket path that does not fit `sun_path` cannot be bound at all, so
     // an XDG_RUNTIME_DIR that deep (a nested test desktop, a container's
     // bind mount) is as unusable as none.
     let fits = |dir: &Path| dir.as_os_str().len() + 1 + SOCK_NAME_MAX < SUN_PATH;
     if let Some(base) = xdg.filter(|v| !v.is_empty()) {
         let dir = PathBuf::from(base).join("seagents");
-        if fits(&dir) && fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).is_ok() {
+        if fits(&dir) && crate::fsutil::private_dir(&dir).is_ok() {
             return Ok(dir);
         }
     }
     // `/tmp` is shared: anyone may have made this name first. Only a real
     // directory of ours will do — a symlink or another user's directory
     // would hand them our sockets and seed prompts.
-    let uid = unsafe { libc::getuid() };
-    let dir = tmp.join(format!("seagents-{uid}"));
-    let _ = fs::DirBuilder::new().mode(0o700).create(&dir);
-    let meta = fs::symlink_metadata(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    if !meta.file_type().is_dir() {
-        return Err(format!("{} is not a directory (a symlink?); refusing it", dir.display()));
-    }
-    if meta.uid() != uid {
-        return Err(format!("{} belongs to uid {}, not us; refusing it", dir.display(), meta.uid()));
-    }
-    // Ours, so a loosened mode (a umask, a hand chmod) is ours to tighten.
-    if meta.mode() & 0o077 != 0 {
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
+    let dir = crate::fsutil::tmp_dir_in(tmp)?;
     if !fits(&dir) {
         return Err(format!("{} is too long for a socket path", dir.display()));
     }
@@ -1443,10 +1443,12 @@ pub(crate) struct Lock {
 
 impl Lock {
     pub(crate) fn acquire(path: &Path) -> Option<Lock> {
+        use std::os::unix::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(0o600)
             .open(path)
             .ok()?;
         loop {

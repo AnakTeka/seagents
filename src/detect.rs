@@ -188,6 +188,8 @@ pub(crate) fn spawn_manifest_update() {
         if fresh_attempt {
             return;
         }
+        // The state dir holds the layout too: private before anything in it.
+        let _ = crate::fsutil::private_dir(&vendor::herdr_detect::config::state_dir());
         if let Some(parent) = stamp.parent() {
             let _ = fs::create_dir_all(parent);
         }

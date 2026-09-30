@@ -11,7 +11,6 @@
 //! through, writing with [`inject`]'s framing), and the in-PTY job-control
 //! anchor in [`lead`].
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -135,7 +134,8 @@ pub(crate) fn run(
 
     // Open the tee target and write the identity sidecar. Both best-effort.
     let files = Files::of(u64::from(std::process::id()));
-    let tee = File::create(&files.raw).ok();
+    // Owner-only: it is everything the agent puts on screen.
+    let tee = crate::fsutil::create_private(&files.raw, false).ok();
     write_meta(claim, &files, child.process_id(), &cwd, &cmd, &size, hooked);
     // Only now, with the agent registered, is its window looked for: the
     // handle path polls i3 for up to 5 s (all of it where there is no i3),

@@ -187,7 +187,7 @@ fn sweep_daily(dir: &Path, now: SystemTime) {
     if matches!(last.map(|t| now.duration_since(t)), Ok(Ok(age)) if age < SWEEP_EVERY) {
         return;
     }
-    if fs::write(&stamp, b"").is_ok() {
+    if crate::fsutil::create_private(&stamp, false).is_ok() {
         sweep(dir, now);
     }
 }

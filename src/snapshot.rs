@@ -80,9 +80,11 @@ const PREV_BOOT: &str = "layout.prev-boot.json";
 /// working from (`mv` it back to retry).
 const RESTORED: &str = "layout.restored.json";
 
+/// The state dir, private (`fsutil::private_dir`): the layout names every
+/// agent's directory and conversation.
 fn layout_dir() -> PathBuf {
     let dir = crate::vendor::herdr_detect::config::state_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::fsutil::private_dir(&dir);
     dir
 }
 

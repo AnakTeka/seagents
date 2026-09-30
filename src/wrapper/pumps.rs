@@ -272,7 +272,7 @@ fn input_capture_eligible(chunk: &[u8]) -> bool {
 /// the next full repaint converges the grid.
 fn rotate_tee(files: &Files) -> Option<File> {
     let tail = crate::status::read_tail(&files.raw, 1024 * 1024)?;
-    fs::write(&files.raw_tmp, &tail).ok()?;
+    crate::fsutil::create_private(&files.raw_tmp, false).and_then(|mut f| f.write_all(&tail)).ok()?;
     fs::rename(&files.raw_tmp, &files.raw).ok()?;
     fs::OpenOptions::new().append(true).open(&files.raw).ok()
 }
