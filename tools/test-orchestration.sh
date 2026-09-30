@@ -479,7 +479,10 @@ python3 -c "print('\n'.join(['Line %d: filler for the paste test' % i for i in r
 out=$("$SEA" send it-c --prompt-file "$body"); n=$(echo "$out" | jq_ "d['stops']")
 out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "codex long send: rc=$rc $out"
-[ -z "$(ls "$CODEX_WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "a codex paste went by reference"
+# The seed's own file (`<wpid>-0-*`, seed_by = "file") is expected; a send
+# must not have added one — Codex takes any paste as the user's words.
+[ -z "$(ls "$CODEX_WORK/.seagents/prompts/$wpid-"* 2>/dev/null | grep -v "/$wpid-0-")" ] \
+  || fail "a codex paste went by reference"
 pass "a 41-line send was pasted whole (no prompt file) and answered LONGOK"
 
 # Esc mid-turn: Codex records turn_aborted, and no Stop comes.
