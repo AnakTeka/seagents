@@ -22,6 +22,37 @@ you, and jump straight to it.
   `herdr --remote ssh <host>` from another machine shows the same agents and
   drives them, while the i3 windows keep showing them.
 
+![The seagents HUD: moving through the list previews each agent's window, Enter jumps to the blocked one](docs/demo.gif)
+
+## Why
+
+If you live in i3, your muscle memory is already in your i3 keybindings:
+focus, move, split, workspaces. Terminal multiplexers built for coding agents
+(tmux, herdr) put every agent in a pane or tab inside one terminal, with their
+own layouts and their own keys — a second window manager inside the first.
+seagents keeps i3 in charge: every agent is a real i3 window, driven with the
+keys you already tuned.
+
+One terminal window per agent has its own problems once you run more than a
+couple, and seagents covers those too:
+
+- **Agents wait on you without telling you.** One stops at a permission
+  prompt, another finished ten minutes ago, and you only find out when you
+  happen to visit their workspace. The HUD shows which one needs you.
+- **A terminal window is stuck on its machine.** Agents started in plain
+  windows on the laptop can't be checked or answered from the desktop.
+  Through herdr, they can.
+- **A reboot loses the arrangement.** Which conversation was in which window,
+  on which workspace, in which directory. `seagents restore` brings it back.
+- **Agents can't hand work to agents you can see.** Delegating to a
+  background subprocess hides the work; `seagents spawn` opens it in a window
+  you can watch, and the first agent can still wait for it and read its
+  answer.
+
+herdr does the hard parts underneath: it owns the agents' terminals, knows
+whether each one is working, blocked or done, and serves them to other
+machines. seagents is the i3 side of it.
+
 ## Requirements
 
 - Linux with X11 **i3**. It is not tested on sway or Wayland.
@@ -78,6 +109,8 @@ at once.
 JSON with `--json`.
 
 ## The HUD
+
+![The seagents HUD: agents listed as blocked, working, done and idle](docs/hud.png)
 
 `seagents hud` (or plain `seagents`) opens the panel. Bind it to a key and
 float it in `~/.config/i3/config`. The HUD's window must carry the role or
