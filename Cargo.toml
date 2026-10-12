@@ -2,8 +2,13 @@
 name = "seagents"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "run coding agents in herdr, each in its own i3 window"
 license = "Apache-2.0"
+repository = "https://github.com/AnakTeka/seagents"
+homepage = "https://github.com/AnakTeka/seagents"
+readme = "README.md"
+include = ["/src", "/skills", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 keywords = ["i3", "herdr", "claude-code", "codex", "agents"]
 categories = ["command-line-utilities"]
 

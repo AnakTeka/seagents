@@ -73,14 +73,22 @@ machines. seagents is the i3 side of it.
 
 ## Install
 
-From a checkout:
+With Rust installed:
+
+```sh
+cargo install seagents
+```
+
+Or take a prebuilt binary (x86_64 or aarch64 Linux) from
+[Releases](https://github.com/AnakTeka/seagents/releases) and put `seagents`
+on your `PATH`, e.g. in `~/.local/bin`.
+
+Or from a checkout:
 
 ```sh
 cargo build --release
 install -Dm755 target/release/seagents ~/.local/bin/seagents
 ```
-
-`~/.local/bin` has to be on your `PATH`.
 
 ## Quick start
 

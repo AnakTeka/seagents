@@ -43,6 +43,10 @@ Conventions:
   it, and don't propose a smaller, staged or flag-gated version to avoid a big
   change. When unsure whether to keep or delete something superseded, delete
   it. Name the notable deletions in the summary so they are visible.
+- **Releases**: bump `version` in `Cargo.toml`, commit, push a tag `vX.Y.Z`;
+  `.github/workflows/release.yml` builds the Linux binaries, makes the GitHub
+  Release and publishes to crates.io. CI (`ci.yml`) runs fmt, clippy
+  `-D warnings` and a build on every push.
 - **Commits: do NOT add a Claude/AI co-author or "Generated with" trailer.** The
   user authors commits solely. Conventional-commit style (`fix(...)`, `feat(...)`).
 - Default branch `main`.
