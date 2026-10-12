@@ -3,7 +3,7 @@
 //! It waits on the **turn ledger**, not the screen. "Poll until idle" returns
 //! at once in exactly the cases that matter — right after `spawn` (the agent
 //! paints an idle input box before it takes the seed) and right after a
-//! prompt (the detector ticks every 2 s) — and a turn shorter than a tick is
+//! prompt (`.state` is re-stamped every 2 s) — and a turn shorter than a tick is
 //! never seen working at all. The ledger's `stops` counter is exact: the
 //! caller holds a baseline N (0 from `spawn`, the `stops` `send` returns)
 //! and the turn it cares about has ended when `stops > N`. Nothing
@@ -19,7 +19,6 @@
 
 use std::time::{Duration, Instant};
 
-use crate::adapter::Turns;
 use crate::registry::{self, AgentRecord, Found, StateRecord};
 use crate::turn::Ledger;
 
@@ -137,16 +136,16 @@ fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
 
 /// The state to report. `.state` is re-stamped by `run`'s monitor every 2 s
 /// at most, while the hook ledger `wait` returns on is exact, so at the
-/// moment a turn ends `.state` still says `working`. For hook adapters the
+/// moment a turn ends `.state` still says `working`. With hooks the
 /// ledger decides working-or-not (as `status` fuses it): a dialog still shows
 /// as `blocked`, a turn as `working`, and a stale `working` outside a turn as
 /// `idle`, which the screen will say too within a tick.
-fn state_word(turns: Turns, state: Option<&StateRecord>, blocked: bool, in_turn: bool) -> Option<&str> {
+fn state_word(hooks: bool, state: Option<&StateRecord>, blocked: bool, in_turn: bool) -> Option<&str> {
     if blocked {
         return Some("blocked");
     }
     let word = state.map(|s| s.state.as_str());
-    if turns != Turns::Hook {
+    if !hooks {
         // A `blocked` herdr no longer reads is stale: not known yet.
         return word.filter(|w| *w != "blocked");
     }
@@ -295,7 +294,7 @@ fn report(tag: &str, reason: Reason, ledger: &Ledger, seen: &Look, message: Opti
         "tag": tag,
         "reason": reason.word(),
         "stops": agent.stops,
-        "state": state_word(ledger.turns, seen.state.as_ref(), seen.blocked, seen.in_turn),
+        "state": state_word(ledger.hooks, seen.state.as_ref(), seen.blocked, seen.in_turn),
         "rule": seen.rule.as_deref().filter(|_| seen.blocked),
         "last_message": agent.last_message,
         "transcript_path": agent.transcript_path,

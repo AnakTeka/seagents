@@ -1,7 +1,7 @@
 //! "Is this agent in a turn?" — the one definition `status`, `wait` and
 //! `send` share, over the `.agent` turn ledger.
 //!
-//! **Hook adapters** (Claude, Codex): in a turn = prompted after the last
+//! Only an agent with hooks (Claude, Codex) has a ledger: in a turn = prompted after the last
 //! `Stop`, **and** the transcript holds no interrupt record since that
 //! prompt, **and** the turn was not dropped before it began (below). An
 //! Esc-interrupted turn fires `UserPromptSubmit` and no `Stop` (verified
@@ -9,8 +9,8 @@
 //! agent's own interrupt record is the exact edge it leaves. The screen
 //! does not end a turn otherwise: Claude 2.1.284 shows no spinner and an
 //! idle title while it streams a plain-text answer, so a screen clause ended
-//! turns mid-answer — and missed interrupts the detector never happened to
-//! see as `working`.
+//! turns mid-answer — and missed interrupts the screen never happened to
+//! read as `working`.
 //!
 //! **A turn dropped before it began.** An Esc that lands before Claude's
 //! first response puts the prompt back in the input box and leaves no trace
@@ -30,12 +30,11 @@
 //! this (it records `turn_aborted` even then) and never meets it: its
 //! running-turn timer repaints every second.
 //!
-//! **Screen adapters** have neither hook nor transcript, so the screen is all
-//! there is: prompted after the last `Stop`, and not seen `idle` since.
+//! An agent without hooks is never in a turn here: nothing reports its
+//! prompts, so herdr's reading of its screen is all there is of its state.
 
 use std::path::Path;
 
-use crate::adapter::Turns;
 use crate::registry::{AgentRecord, StateRecord};
 use crate::transcript::Format;
 
@@ -47,94 +46,53 @@ const DROPPED_AFTER: u64 = 10_000;
 /// its command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ledger {
-    pub(crate) turns: Turns,
+    /// The agent's adapter gives it hooks: an exact ledger.
+    pub(crate) hooks: bool,
     /// The format of the transcript the agent writes, per its adapter.
     transcript: Option<Format>,
 }
 
-/// What [`in_turn_with`] asks the transcript, about the records since a
-/// prompt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ask {
-    /// Did the agent record that the user interrupted it?
-    Interrupted,
-    /// Did it write anything of its own (text, reasoning, a tool call)?
-    Responded,
-}
-
-/// The screen's last change and the time now, Unix ms.
-#[derive(Clone, Copy, Debug)]
-struct Output {
-    last_ms: Option<u64>,
-    now_ms: u64,
-}
-
 impl Ledger {
     /// For the command whose first word is `argv0`. An adapter override that
-    /// does not parse reads as the screen rule: the ledger is only as exact
-    /// as the adapter that says where it comes from.
+    /// does not parse reads as one without hooks: the ledger is only as
+    /// exact as the adapter that says where it comes from.
     pub(crate) fn for_command(argv0: &str) -> Ledger {
         let adapter = crate::adapter::for_command(argv0).unwrap_or_default();
         Ledger {
-            turns: adapter.launch.turns,
+            hooks: adapter.hooks.enabled(),
             transcript: adapter.read.transcript,
         }
     }
 
     /// Is the agent in a turn? `state` is the session's `.state`.
     pub(crate) fn in_turn(&self, agent: &AgentRecord, state: Option<&StateRecord>) -> bool {
-        let output = Output {
-            last_ms: state.and_then(|s| s.screen_changed_ms),
-            now_ms: crate::clock::unix_now_ms(),
-        };
-        in_turn_with(self.turns, agent, state, output, |ask, path, since| {
-            let Some(format) = self.transcript else {
-                return false;
-            };
-            let path = Path::new(path);
-            match ask {
-                Ask::Interrupted => crate::transcript::interrupted_since(format, path, since),
-                Ask::Responded => crate::transcript::responded_since(format, path, since),
-            }
-        })
-    }
-}
-
-/// [`Ledger::in_turn`] with the clock, the screen's age and the transcript
-/// passed in.
-fn in_turn_with(
-    turns: Turns,
-    agent: &AgentRecord,
-    state: Option<&StateRecord>,
-    output: Output,
-    ask: impl Fn(Ask, &str, u64) -> bool,
-) -> bool {
-    let Some(prompted) = agent.prompted_at else {
-        return false;
-    };
-    if prompted <= agent.stopped_at.unwrap_or(0) {
-        return false;
-    }
-    match turns {
-        Turns::Hook => {
-            // No transcript known yet (no hook has reported one): nothing
-            // can say the prompt was interrupted, so it stands.
-            let Some(path) = agent.transcript_path.as_deref() else {
-                return true;
-            };
-            if ask(Ask::Interrupted, path, prompted) {
-                return false;
-            }
-            // Cheapest clauses first: the transcript is read only for a
-            // turn that already looks dropped.
-            let dropped = state.is_some_and(|s| s.screen() == "idle")
-                && output.now_ms >= output.last_ms.unwrap_or(0).max(prompted) + DROPPED_AFTER
-                && !ask(Ask::Responded, path, prompted);
-            !dropped
+        if !self.hooks {
+            return false;
         }
-        // `.state` is stamped in seconds: an idle observation in the same
-        // second as the prompt counts as after it. Blocked is still in a turn
-        // — a permission prompt interrupts a turn, it does not end one.
-        Turns::Screen => !state.is_some_and(|s| s.state == "idle" && s.since >= prompted / 1000),
+        let Some(prompted) = agent.prompted_at else {
+            return false;
+        };
+        if prompted <= agent.stopped_at.unwrap_or(0) {
+            return false;
+        }
+        // No transcript known yet (no hook has reported one): nothing can
+        // say the prompt was interrupted, so it stands.
+        let Some(path) = agent.transcript_path.as_deref() else {
+            return true;
+        };
+        let path = Path::new(path);
+        // What the transcript says since the prompt — nothing, when this
+        // adapter names no format to parse it with.
+        let ask = |f: fn(Format, &Path, u64) -> bool| self.transcript.is_some_and(|format| f(format, path, prompted));
+        if ask(crate::transcript::interrupted_since) {
+            return false;
+        }
+        // Cheapest clauses first: the transcript is read only for a turn
+        // that already looks dropped.
+        let last_change = state.and_then(|s| s.screen_changed_ms).unwrap_or(0);
+        let dropped = state.is_some_and(|s| s.screen() == "idle")
+            && crate::clock::unix_now_ms() >= last_change.max(prompted) + DROPPED_AFTER
+            && !ask(crate::transcript::responded_since);
+        !dropped
     }
 }

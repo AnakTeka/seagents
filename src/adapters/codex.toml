@@ -3,13 +3,6 @@
 # measured on codex-cli 0.152.0 (2026-09-29), live in tmux.
 
 [launch]
-# Codex has no permission-mode flag: an approval policy (-a) and a sandbox
-# (-s) instead, mapped from Claude's mode words under
-# [launch.permission_argv], so `spawn --permission-mode` reads the same for
-# either tool.
-permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
-identity         = "hook"
-turns            = "hook"
 # What Codex sets for the commands it runs (read off `env` inside a shell
 # tool call, and its source): the thread's identity, its sandbox and
 # approval state. Never CODEX_HOME, the user's own configuration.
@@ -27,13 +20,12 @@ session_env      = [
 # Codex keeps its config (and auth) is passed on to its pane.
 pass_env         = ["CODEX_HOME"]
 
-# `-a` takes on-request | never (0.152 refuses untrusted/on-failure); `-s`
-# read-only | workspace-write | danger-full-access. What the hooks then
-# report as `permission_mode` (measured, every pair, 2026-09-29) follows the
-# approval policy alone: on-request → "default", never →
-# "bypassPermissions", whatever the sandbox (and no flags, the configured
-# on-request, → "default"). So nothing short of bypass uses `-a never`.
-# No mode has an exact twin, and each takes the nearest that is not more
+# Codex has no permission-mode flag: an approval policy (-a) and a sandbox
+# (-s) instead, mapped from Claude's mode words under
+# [launch.permission_argv], so `spawn --permission-mode` reads the same for
+# either tool. `-a` takes on-request | never (0.152 refuses
+# untrusted/on-failure); `-s` read-only | workspace-write |
+# danger-full-access. Nothing short of bypass uses `-a never`. No mode has an exact twin, and each takes the nearest that is not more
 # privileged:
 #   plan, default — read-only sandbox; any write, and anything the sandbox
 #     stops, is an approval request to a human, as Claude's edits are in

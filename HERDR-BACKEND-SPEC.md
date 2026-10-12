@@ -9,8 +9,7 @@ merged or installed. Written the same day, the approach proven by hand first
 *Decisions D1–D7* during it. Where this and the code disagree, the code and
 [`HANDOFF.md`](./HANDOFF.md) win.
 
-Related: [`HANDOFF.md`](./HANDOFF.md) (what is built), [`ORCHESTRATION-SPEC.md`](./ORCHESTRATION-SPEC.md)
-(spawn / wait / send / stop / read, which this reshapes).
+Related: [`HANDOFF.md`](./HANDOFF.md) (what is built).
 
 ---
 
@@ -201,8 +200,9 @@ So the alias keeps working and the window looks as it does today.
   unprompted `claude` instead.
 - **D4 — tags start with a letter** (herdr's agent-name rule
   `[a-z][a-z0-9_-]{0,31}`; the tag is the herdr agent name). A directory
-  whose name starts otherwise mints `d<name>-<hex>`, and `restore` folds a
-  captured old tag the same way, for the placeholder and the launch.
+  whose name starts otherwise mints `d<name>-<hex>`. (`restore` folded tags
+  captured before this rule the same way until 2026-10-12; that shim is
+  gone.)
 - **D5 — Claude's hook settings by file**: `<runtime dir>/hooks-<key>.json`
   (0600, removed with the session), passed as `--settings <path>`, since
   herdr types the agent's command line into the pane's shell (and its

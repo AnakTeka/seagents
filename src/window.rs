@@ -1,6 +1,6 @@
 //! Window identity: which i3 window an agent lives in, and focusing it.
 //!
-//! (Milestone 3.) The `seagents focus` command and the HUD's preview/jump live
+//! The `seagents focus` command and the HUD's preview/jump live
 //! here, next to the identity-capture strategies they depend on.
 //!
 //! X11 offers no query for "the window hosting this pty" (Terminator shares

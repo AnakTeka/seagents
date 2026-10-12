@@ -151,15 +151,14 @@ fn permission_args(launch: &crate::adapter::Launch, requested: Option<&str>) -> 
     let Some(mode) = requested else {
         return Ok(Vec::new());
     };
-    let modes = &launch.permission_modes;
+    let modes = &launch.permission_argv;
     if modes.is_empty() {
         return Err("this agent has no permission modes".to_string());
     }
-    launch
-        .permission_argv
-        .get(mode)
-        .cloned()
-        .ok_or_else(|| format!("unknown permission mode {mode:?}; one of: {}", modes.join(", ")))
+    modes.get(mode).cloned().ok_or_else(|| {
+        let known: Vec<&str> = modes.keys().map(String::as_str).collect();
+        format!("unknown permission mode {mode:?}; one of: {}", known.join(", "))
+    })
 }
 
 fn writable(dir: &Path) -> bool {

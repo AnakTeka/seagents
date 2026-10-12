@@ -244,8 +244,7 @@ fn tail(t: &Transcript, nodes: &[usize], n: usize) -> Vec<Record> {
 }
 
 /// A user message that only points at a prompt file (`send` by reference)
-/// gets the file's words under it, while the file still exists (the
-/// wrapper deletes them when its agent exits).
+/// gets the file's words under it, while the file still exists.
 fn inline_references(records: &mut [Record], cwd: Option<&Path>) {
     for r in records {
         let Kind::User { text } = &mut r.kind else {

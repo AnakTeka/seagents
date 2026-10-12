@@ -90,12 +90,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl From<Error> for String {
-    fn from(e: Error) -> String {
-        e.to_string()
-    }
-}
-
 /// An agent's lifecycle state as herdr detects it from its screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
@@ -128,6 +122,8 @@ impl Status {
 /// One agent, as `agent list` / `agent get` report it.
 #[derive(Clone, Debug)]
 pub(crate) struct Agent {
+    /// Its herdr name — the tag of an agent seagents started.
+    pub(crate) name: String,
     pub(crate) status: Status,
     pub(crate) terminal_id: String,
     pub(crate) pane_id: String,
@@ -140,6 +136,7 @@ impl Agent {
     fn from(v: &Value) -> Agent {
         let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
         Agent {
+            name: s("name"),
             status: Status::parse(v["agent_status"].as_str().unwrap_or("unknown")),
             terminal_id: s("terminal_id"),
             pane_id: s("pane_id"),
@@ -252,19 +249,16 @@ fn call(args: &[&str]) -> Result<Value, Error> {
     Ok(v["result"].clone())
 }
 
-/// Whether a herdr server is up for this environment.
-pub(crate) fn server_running() -> bool {
-    text(&["status", "--json"])
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .is_some_and(|v| v["server"]["running"].as_bool() == Some(true))
-}
-
 /// The API socket of the server this environment names — what an agent's
 /// hooks see as `HERDR_SOCKET_PATH`. None when no server is running.
 pub(crate) fn server_socket() -> Option<String> {
     let v: Value = serde_json::from_str(&text(&["status", "--json"]).ok()?).ok()?;
     (v["server"]["running"].as_bool() == Some(true)).then(|| v["server"]["socket"].as_str().map(str::to_string))?
+}
+
+/// Whether a herdr server is up for this environment.
+pub(crate) fn server_running() -> bool {
+    server_socket().is_some()
 }
 
 /// Make sure a herdr server is running, starting one if not: `herdr server`,
@@ -309,16 +303,6 @@ pub(crate) fn ensure_server(strip: &[String]) -> Result<(), String> {
 pub(crate) fn agents() -> Result<Vec<Agent>, Error> {
     let v = call(&["agent", "list"])?;
     Ok(v["agents"].as_array().map(|a| a.iter().map(Agent::from).collect()).unwrap_or_default())
-}
-
-/// The names herdr's agents go by — unique among them, so a tag one holds
-/// cannot be another's.
-pub(crate) fn agent_names() -> Result<Vec<String>, Error> {
-    let v = call(&["agent", "list"])?;
-    Ok(v["agents"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|x| x["name"].as_str().map(str::to_string)).collect())
-        .unwrap_or_default())
 }
 
 /// The agent hosted by terminal `terminal_id`, if herdr sees one there now

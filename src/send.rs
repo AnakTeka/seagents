@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::adapter::{self, Turns};
+use crate::adapter;
 use crate::herdr;
 use crate::registry::{self, Session};
 use crate::turn::Ledger;
@@ -41,7 +41,7 @@ pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(200);
 
 /// After a submission, how long the next one waits for the agent's prompt
-/// hook to confirm it landed. Screen adapters have no hook, so for them this
+/// hook to confirm it landed. An agent without hooks has none, so for it this
 /// is simply a pause long enough for herdr to see the turn start.
 const LANDING_GRACE: Duration = Duration::from_secs(5);
 
@@ -308,7 +308,7 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
         let agent = registry::read_agent(files);
         let in_turn = ledger.in_turn(&agent, registry::read_state(files).as_ref());
         let meta = registry::read_meta(files).unwrap_or_else(|| session.meta.clone());
-        let landing = landing(&meta, ledger.turns, agent.prompted_at);
+        let landing = landing(&meta, ledger.hooks, agent.prompted_at);
         match gate(status, in_turn, landing, opts.now, answer) {
             Gate::Go { paired } => return deliver(session, &adapter, &pane, body, paired, status, agent.stops),
             Gate::Blocked => {
@@ -332,12 +332,12 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
 
 /// Whether the last prompt seagents submitted is still landing: within the
 /// grace, and (with hooks) no prompt event since it was written.
-fn landing(meta: &registry::Meta, turns: Turns, prompted_at: Option<u64>) -> bool {
+fn landing(meta: &registry::Meta, hooks: bool, prompted_at: Option<u64>) -> bool {
     let Some(at) = meta.submitted_ms else {
         return false;
     };
     let within = crate::clock::unix_now_ms() < at + LANDING_GRACE.as_millis() as u64;
-    within && !(turns == Turns::Hook && prompted_at.is_some_and(|p| p >= at))
+    within && !(hooks && prompted_at.is_some_and(|p| p >= at))
 }
 
 /// Write the body, now that the gate is open.
@@ -389,7 +389,7 @@ fn deliver(
             });
             // A prompt: from here its hooks owe a report (`hook::health`).
             registry::note_engaged(files);
-            if Ledger::for_command(session.meta.agent()).turns == Turns::Hook {
+            if adapter.hooks.enabled() {
                 // Reply once the agent has announced it (≤ LANDING_GRACE), so
                 // a `wait --after <stops>` called the moment this returns sees
                 // this turn open — not the ledger as the last turn left it,

@@ -1,7 +1,7 @@
 //! The agent's own lifecycle events, as `seagents __hook` receives them, and
 //! the settings that make the agent run it.
 //!
-//! For an adapter with `identity`/`turns = "hook"` (Claude Code, Codex),
+//! For an adapter with hooks (`[hooks] inject`: Claude Code, Codex),
 //! `run` hands the agent one flag carrying three hooks — `SessionStart`,
 //! `UserPromptSubmit`, `Stop` — each running `<this binary> __hook`, which
 //! writes what the event reports into the session's `.agent`
@@ -32,7 +32,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::adapter::{Adapter, Identity, Inject, Turns};
+use crate::adapter::{Adapter, Inject};
 use crate::registry::{self, AgentRecord, Files};
 
 /// The events [`record`] folds into the ledger — what an adapter may hook.
@@ -101,29 +101,19 @@ pub(crate) fn run() -> i32 {
 }
 
 /// The session this hook's agent runs in, by the herdr pane it inherited.
-/// `run` writes the `.meta` before it starts the agent, so a miss is rare (a
-/// hook of an agent seagents did not start, or one from before herdr); it is
-/// retried briefly all the same, and the common path pays nothing.
+/// `run` writes the `.meta` before it starts the agent, so it is there by
+/// the first hook.
 fn find_session() -> Option<registry::Session> {
     let pane = std::env::var("HERDR_PANE_ID").ok().filter(|p| !p.is_empty())?;
     let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
-    for attempt in 0..10 {
-        if let Some(s) = registry::by_pane(&pane, &socket) {
-            return Some(s);
-        }
-        if attempt < 9 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-    None
+    registry::by_pane(&pane, &socket)
 }
 
 /// Fold one hook payload into the session's `.agent`.
 ///
 /// Every event carries the current `session_id` and `transcript_path`, so all
 /// of them refresh identity, not only `SessionStart`: a `SessionStart` lost to
-/// a startup race (or to a wrapper that was not yet recording) heals on the
-/// next prompt. `source` only comes with `SessionStart`. `now` is Unix
+/// a startup race heals on the next prompt. `now` is Unix
 /// milliseconds, the ledger's unit (see [`AgentRecord::prompted_at`]).
 fn record(files: &Files, payload: &Value, now: u64) -> Result<(), String> {
     let event = payload["hook_event_name"]
@@ -138,16 +128,11 @@ fn record(files: &Files, payload: &Value, now: u64) -> Result<(), String> {
             r.session_id = Some(id);
         }
         match event {
-            "SessionStart" => r.source = text("source").or(r.source.take()),
-            "UserPromptSubmit" => {
-                r.prompted_at = Some(now);
-                r.permission_mode = text("permission_mode").or(r.permission_mode.take());
-            }
+            "UserPromptSubmit" => r.prompted_at = Some(now),
             "Stop" => {
                 r.stops += 1;
                 r.stopped_at = Some(now);
                 r.last_message = text("last_assistant_message");
-                r.permission_mode = text("permission_mode").or(r.permission_mode.take());
             }
             _ => {}
         }
@@ -197,12 +182,8 @@ pub(crate) fn inject(
     settings_file: &Path,
 ) -> (Vec<String>, Option<String>) {
     let hooks = &adapter.hooks;
-    let launch = &adapter.launch;
-    let wanted = hooks.inject != Inject::None
-        && !hooks.flags.is_empty()
-        && (launch.identity == Identity::Hook || launch.turns == Turns::Hook);
     let flags_end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    if !wanted || argv.is_empty() || argv[1..flags_end].iter().any(|a| hooks.hookless_flags.contains(a)) {
+    if !hooks.enabled() || argv.is_empty() || argv[1..flags_end].iter().any(|a| hooks.hookless_flags.contains(a)) {
         return (argv.to_vec(), None);
     }
     let command = format!("{} __hook", crate::launch::shell_quote(&exe.to_string_lossy()));

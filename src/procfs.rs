@@ -8,7 +8,7 @@ pub(crate) fn alive(pid: u64) -> bool {
 }
 
 /// `pid`'s parent, from `/proc/<pid>/stat`.
-pub(crate) fn parent_pid(pid: u64) -> Option<u64> {
+fn parent_pid(pid: u64) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm can hold spaces and parens; ppid is the 2nd field after the last ')'.
     stat.rsplit_once(") ")?

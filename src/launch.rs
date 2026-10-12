@@ -83,7 +83,6 @@ fn terminal(handle: &str, cwd: &str, inner: &str, class: &str) -> Result<Termina
             .split_whitespace()
             .map(|w| {
                 w.replace("{handle}", handle)
-                    .replace("{role}", handle)
                     .replace("{cwd}", cwd)
                     .replace("{cmd}", inner)
             })
@@ -205,7 +204,7 @@ pub(crate) struct Run<'a> {
 /// it in the window.
 ///
 /// `SEAGENTS_TERMINAL_CMD` overrides the whole invocation for terminals without
-/// a built-in recipe; `{handle}` (alias `{role}`), `{cwd}` and `{cmd}` are
+/// a built-in recipe; `{handle}`, `{cwd}` and `{cmd}` are
 /// substituted.
 ///
 /// The window starts as a user's shell would, not as a child of whoever

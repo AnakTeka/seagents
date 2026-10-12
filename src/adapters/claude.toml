@@ -2,11 +2,6 @@
 # at ~/.config/seagents/agents/claude.toml replaces this file whole.
 
 [launch]
-# What `spawn --permission-mode` takes; each one's argv is under
-# [launch.permission_argv].
-permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
-identity         = "hook"
-turns            = "hook"
 # What a running Claude Code sets for its children: its session's identity
 # and messaging socket/token. A window launched from inside one (an agent
 # calling `spawn`, or a herdr server it starts) must not inherit them — with
@@ -32,6 +27,7 @@ session_env      = [
 # Claude Code keeps its config (and auth) is passed on to its pane.
 pass_env         = ["CLAUDE_CONFIG_DIR"]
 
+# What `spawn --permission-mode` takes, and the argv for each.
 [launch.permission_argv]
 plan              = ["--permission-mode", "plan"]
 default           = ["--permission-mode", "default"]

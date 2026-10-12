@@ -1,4 +1,4 @@
-//! Milestone 5: survive a reboot.
+//! Surviving a reboot.
 //!
 //! `seagents restore` rebuilds the i3 workspaces the agents were living on and
 //! relaunches each window on its *own* conversation (`claude --resume <id>`),
@@ -7,8 +7,8 @@
 //! Three problems, three answers:
 //!
 //! 1. **The layout must outlive the processes.** `~/.cache/seagents/` is
-//!    self-reaping — the first `status` after a boot deletes every `.meta`
-//!    whose child pid is gone, which is precisely all of them. So the snapshot
+//!    self-reaping — the first `status` after a boot deletes every session
+//!    whose `run` is gone, which is precisely all of them. So the snapshot
 //!    lives in `state_dir()/layout.json`, written *continuously* (each
 //!    `run`'s monitor thread offers a capture every tick, globally throttled
 //!    to one write per [`SNAPSHOT_INTERVAL_SECS`]). An unplanned reboot loses
@@ -403,34 +403,6 @@ fn leaf_tag(node: &Value) -> Option<String> {
     node["tag"].as_str().map(str::to_string)
 }
 
-/// Every tag a snapshot records, folded into today's charset
-/// (`registry::fold_tag`): a layout captured before tags had to start with a
-/// letter is restored under the folded tag, the same one for the
-/// placeholder and the launch.
-fn fold_tags(snapshot: &mut Value) {
-    fn fold_nodes(nodes: &mut Value) {
-        for node in nodes.as_array_mut().into_iter().flatten() {
-            if let Some(tag) = node["tag"].as_str().map(crate::registry::fold_tag) {
-                node["tag"] = json!(tag);
-            }
-            fold_nodes(&mut node["nodes"]);
-        }
-    }
-    for ws in snapshot["workspaces"].as_array_mut().into_iter().flatten() {
-        for a in ws["agents"].as_array_mut().into_iter().flatten() {
-            if let Some(tag) = a["tag"].as_str().map(crate::registry::fold_tag) {
-                a["tag"] = json!(tag);
-            }
-        }
-        fold_nodes(&mut ws["layout"]);
-    }
-    for a in snapshot["unplaced"].as_array_mut().into_iter().flatten() {
-        if let Some(tag) = a["tag"].as_str().map(crate::registry::fold_tag) {
-            a["tag"] = json!(tag);
-        }
-    }
-}
-
 /// Turn the stored layout into what i3's `append_layout` expects: every leaf's
 /// `tag` becomes a swallow criterion on whichever property this terminal
 /// actually sets.
@@ -462,14 +434,13 @@ fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<
 
 /// Every agent tag the snapshots on disk record — the live one and a previous
 /// boot's still awaiting restore: the names a pending restore will relaunch
-/// under (folded, [`fold_tags`]), which a newly minted tag must not take.
+/// under, which a newly minted tag must not take.
 pub(crate) fn captured_tags() -> HashSet<String> {
     let dir = layout_dir();
     [LAYOUT, PREV_BOOT]
         .iter()
         .filter_map(|name| read_layout(&dir.join(name)))
-        .flat_map(|mut snapshot| {
-            fold_tags(&mut snapshot);
+        .flat_map(|snapshot| {
             snapshot["workspaces"]
                 .as_array()
                 .into_iter()
@@ -566,14 +537,8 @@ fn capture() -> Result<Value, String> {
     let mut unplaced: Vec<Value> = Vec::new();
 
     for s in &sessions {
-        let Some(con_id) = located.get(&s.meta.key).copied().filter(|_| !s.meta.tag.is_empty()) else {
-            unplaced.push(json!({
-                "tag": s.meta.tag,
-                "cwd": s.meta.cwd,
-                "dir": s.meta.dir(),
-                "argv": s.meta.argv,
-                "session_id": session_ids[s.meta.key.as_str()],
-            }));
+        let Some(con_id) = located.get(&s.meta.key).copied() else {
+            unplaced.push(json!({ "tag": s.meta.tag, "dir": s.meta.dir() }));
             continue;
         };
         let place = &places[&con_id];
@@ -615,7 +580,6 @@ fn capture() -> Result<Value, String> {
     }
 
     let snapshot = json!({
-        "version": 1,
         "captured": crate::clock::unix_now(),
         "focused_workspace": focused_workspace(&tree),
         "workspaces": workspaces,
@@ -743,12 +707,10 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
         );
         return 1;
     };
-    let Ok(mut snapshot) = serde_json::from_str::<Value>(&text) else {
+    let Ok(snapshot) = serde_json::from_str::<Value>(&text) else {
         eprintln!("seagents: {} is not readable as a snapshot", path.display());
         return 1;
     };
-    fold_tags(&mut snapshot);
-
     if prev_boot {
         println!("from the previous boot's layout ({})", path.display());
     }
@@ -760,14 +722,13 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
     let live: HashSet<String> = crate::registry::list()
         .into_iter()
         .map(|s| s.meta.tag)
-        .filter(|t| !t.is_empty())
         .collect();
     // An agent herdr runs under one of the captured tags without a seagents
     // window — herdr resumed it itself after its server restarted (its own
     // Codex resume, or its Claude integration) — holds the name, and `run
     // --tag` would be refused after its window had opened. Left to herdr,
     // and said so.
-    let in_herdr: HashSet<String> = crate::herdr::agent_names().unwrap_or_default().into_iter().collect();
+    let in_herdr: HashSet<String> = crate::herdr::agents().unwrap_or_default().into_iter().map(|a| a.name).collect();
 
     let empty = Vec::new();
     let mut skipped = 0usize;
@@ -786,14 +747,6 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
                 eprintln!(
                     "seagents: {}: herdr already runs an agent named {tag} (resumed by herdr itself?); \
                      not restored — find it in herdr, or stop it there and restore again",
-                    a["dir"].as_str().unwrap_or("?")
-                );
-            } else if !crate::registry::valid_tag(tag) {
-                // Folding makes every tag valid but an empty one (a session
-                // captured before it had a tag), which `run` would refuse
-                // after the window had already opened.
-                eprintln!(
-                    "seagents: {}: captured tag {tag:?} is not a valid tag; not restored",
                     a["dir"].as_str().unwrap_or("?")
                 );
             } else {
@@ -929,25 +882,17 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
 /// adapter can't resume — or with no captured id — comes back on a fresh
 /// conversation.
 fn resume_argv(agent: &Value) -> Vec<String> {
-    let argv = argv_of(agent);
-    let restore = crate::adapter::for_command(&argv[0]).unwrap_or_default().restore;
+    let argv: Vec<String> = serde_json::from_value(agent["argv"].clone()).unwrap_or_default();
+    let Some(cmd) = argv.first() else {
+        return argv;
+    };
+    let restore = crate::adapter::for_command(cmd).unwrap_or_default().restore;
     let mut out = argv_without_resume(&argv, &restore.drop);
     if let Some(id) = agent["session_id"].as_str().filter(|_| !restore.resume.is_empty()) {
         let resume = restore.resume.iter().map(|a| a.replace("{session}", id));
         out.splice(1..1, resume);
     }
     out
-}
-
-fn argv_of(agent: &Value) -> Vec<String> {
-    agent["argv"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["claude".to_string()])
 }
 
 fn is_uuid(s: &str) -> bool {

@@ -131,7 +131,7 @@ impl Files {
 /// one. Everything defaults when missing, and fields this binary does not
 /// know are carried in `extra` and written back untouched, so an update from
 /// here never strips what another version added. A `.meta` with no `key` is
-/// not one of ours (a pty-wrapper session from before herdr) and is ignored.
+/// not a session and is ignored.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub(crate) struct Meta {
     /// The herdr terminal the agent runs in — the session's key.
@@ -152,9 +152,6 @@ pub(crate) struct Meta {
     /// None until it has started.
     #[serde(default)]
     pub(crate) pid: Option<u64>,
-    /// The herdr agent kind (`claude`, `codex`): which adapter.
-    #[serde(default)]
-    pub(crate) kind: String,
     /// Launch cwd — the grouping key.
     #[serde(default)]
     pub(crate) cwd: String,
@@ -268,10 +265,6 @@ pub(crate) struct AgentRecord {
     pub(crate) transcript_path: Option<String>,
     /// The conversation id — what `restore` resumes with.
     pub(crate) session_id: Option<String>,
-    /// Why the current conversation began: startup | resume | clear | compact.
-    pub(crate) source: Option<String>,
-    /// The agent's permission mode, as last reported.
-    pub(crate) permission_mode: Option<String>,
     /// Turn ends seen, +1 at every `Stop`.
     pub(crate) stops: u64,
     /// When the last prompt was submitted, and the last turn ended — Unix
@@ -362,8 +355,8 @@ fn all_in(dir: &Path) -> Vec<Session> {
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("meta"))
         .filter_map(|e| {
             let meta: Meta = serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok()?;
-            // The file must be the key's own: a `.meta` named otherwise
-            // (a pty-wrapper session's `<pid>.meta`) is not a session here.
+            // The file must be the key's own: a `.meta` named otherwise is
+            // not a session here.
             (!meta.key.is_empty() && e.file_name().to_str() == Some(&format!("{}.meta", meta.key)))
                 .then(|| Session { files: Files::in_dir(dir, &meta.key), meta })
         })
@@ -422,7 +415,7 @@ pub(crate) fn finish(s: &Session) {
 fn finish_in(dir: &Path, s: &Session, tombstone: bool) {
     // Written before anything goes, so a reader that finds the `.agent` gone
     // finds this ([`final_agent`]).
-    if tombstone && !s.meta.tag.is_empty() {
+    if tombstone {
         let stone = Tombstone::of(s, crate::clock::unix_now());
         if let Ok(text) = serde_json::to_vec(&stone) {
             let _ = write_atomic(&tombstone_path(dir, &s.meta.tag), &text);
@@ -439,9 +432,7 @@ fn finish_in(dir: &Path, s: &Session, tombstone: bool) {
 }
 
 /// Delete sidecars no `.meta` claims: a session's `.state`, `.agent`,
-/// `.lock` or `.send.lock` left by a writer that raced its end, and the
-/// files of pty-wrapper sessions (`<pid>.*`, from before herdr) once their
-/// pid is gone.
+/// `.lock` or `.send.lock` left by a writer that raced its end.
 fn sweep_orphans(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -454,16 +445,9 @@ fn sweep_orphans(dir: &Path) {
         if ext.ends_with(".tmp") {
             continue;
         }
-        let gone = match stem.parse::<u64>() {
-            // A pty-wrapper session's (`.raw`, `.meta`, … too): its wrapper
-            // pid is the stem.
-            Ok(pid) => !procfs::alive(pid),
-            Err(_) => {
-                matches!(ext, "state" | "agent" | "lock" | "send.lock")
-                    && stem.starts_with("term_")
-                    && !dir.join(format!("{stem}.meta")).exists()
-            }
-        };
+        let gone = matches!(ext, "state" | "agent" | "lock" | "send.lock")
+            && stem.starts_with("term_")
+            && !dir.join(format!("{stem}.meta")).exists();
         if gone {
             let _ = fs::remove_file(e.path());
         }
@@ -674,27 +658,6 @@ pub(crate) fn valid_tag(tag: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
-/// A tag from before tags had to start with a letter (`20260612-sme-3f2a`),
-/// as it is today: a `d` in front, the noise suffix kept when shortening.
-/// `restore` reads every captured tag through this, for the placeholder and
-/// the launch alike. A valid tag is returned as it is.
-pub(crate) fn fold_tag(tag: &str) -> String {
-    if valid_tag(tag) || tag.is_empty() {
-        return tag.to_string();
-    }
-    let folded: String = format!("d{tag}")
-        .chars()
-        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '-' })
-        .collect();
-    if folded.len() <= TAG_MAX {
-        return folded;
-    }
-    match folded.rsplit_once('-').filter(|(_, hex)| hex.len() == 4) {
-        Some((base, hex)) => format!("{}-{hex}", &base[..TAG_MAX - 5].trim_end_matches('-')),
-        None => folded[..TAG_MAX].trim_end_matches('-').to_string(),
-    }
-}
-
 /// The name part of a minted tag: the cwd's basename folded into the tag
 /// charset (runs of anything else become one `-`), a `d` in front when it
 /// would not start with a letter, short enough to leave room for the `-xxxx`
@@ -761,7 +724,7 @@ pub(crate) fn minted_from(tag: &str, cwd: &Path) -> bool {
 /// herdr already has (an agent somebody started in herdr directly), and
 /// `reserved` (the snapshot's — a pending restore will want those back).
 fn taken_tags(dir: &Path, reserved: &HashSet<String>) -> HashSet<String> {
-    let herdr = crate::herdr::agent_names().unwrap_or_default();
+    let herdr = crate::herdr::agents().unwrap_or_default().into_iter().map(|a| a.name).filter(|n| !n.is_empty());
     list_in(dir).into_iter().map(|s| s.meta.tag).chain(herdr).chain(reserved.iter().cloned()).collect()
 }
 
@@ -780,14 +743,9 @@ pub(crate) struct TagClaim {
 impl TagClaim {
     /// Write the new session's `.meta` under the claimed tag, and release the
     /// claim. Atomic but not per-session locked: until this file exists
-    /// nobody else can find the session, so there is nothing to race. A dead
-    /// session that held the same key (herdr reused a terminal id) is
-    /// finished first.
+    /// nobody else can find the session, so there is nothing to race.
     pub(crate) fn create_meta(self, mut meta: Meta) -> Files {
         let files = Files::of(&meta.key);
-        if let Some(old) = by_key(&meta.key) {
-            finish(&old);
-        }
         meta.tag = self.tag;
         if let Ok(text) = serde_json::to_string_pretty(&meta) {
             let _ = write_atomic(&files.meta, text.as_bytes());

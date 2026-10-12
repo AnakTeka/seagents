@@ -1,8 +1,8 @@
-//! Milestone 4: the floating HUD.
+//! The floating HUD.
 //!
 //! A ratatui panel meant to run in an i3 floating window. It polls the same
 //! session data as `seagents status`, colour-codes each agent by state, and on
-//! Enter or left-click focuses that agent's i3 window (milestone 3). The
+//! Enter or left-click focuses that agent's i3 window (`window`). The
 //! selected row can be sent a prompt or stopped, through the same code
 //! `seagents send` / `stop` run.
 
@@ -108,7 +108,7 @@ impl Label {
 /// fleet alike. `@` because that is how a target is spelled on the command
 /// line.
 fn name_of(s: &Session) -> String {
-    if s.tag.is_empty() || crate::registry::minted_from(&s.tag, Path::new(&s.cwd)) {
+    if crate::registry::minted_from(&s.tag, Path::new(&s.cwd)) {
         s.dir.clone()
     } else {
         format!("@{}", s.tag)
@@ -122,11 +122,6 @@ fn label_of(s: &Session, labels: Label) -> String {
         Label::Title if !s.title.is_empty() => s.title.clone(),
         _ => name_of(s),
     }
-}
-
-/// How a row is addressed: its tag (the one resolver takes it).
-fn target_of(s: &Session) -> String {
-    s.tag.clone()
 }
 
 /// A keystroke-owning footer: while one is up, keys edit it instead of
@@ -309,7 +304,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
                     KeyCode::Char('x') => {
                         if let Some(s) = app.selected() {
                             app.input = Some(Input::ConfirmStop {
-                                target: target_of(s),
+                                target: s.tag.clone(),
                                 name: name_of(s),
                             });
                         }
@@ -377,7 +372,7 @@ fn open_prompt(app: &mut App) {
         return;
     }
     app.input = Some(Input::Prompt {
-        target: target_of(s),
+        target: s.tag.clone(),
         name,
         text: String::new(),
     });

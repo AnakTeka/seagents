@@ -306,7 +306,7 @@ out=$("$SEA" send it-a --now 'never'); rc=$?
 "$SEA" send it-a --now --keys 'ctrl+u ctrl+u ctrl+u' > /dev/null
 pass "a send into a human's draft was refused (rc 6, draft), --now too: $(echo "$out" | jq_ "d['error']")"
 
-# 5. focus.
+# 4. focus.
 "$SEA" focus it-a || fail "focus exited $?"
 sleep 0.5
 focused=$(nd_tree | python3 -c "
@@ -318,7 +318,7 @@ walk(json.load(sys.stdin))")
 [ "$focused" = "$got" ] || fail "focus: focused is $focused, it-a is $got"
 pass "focus it-a focused con_id $got"
 
-# 5b. A gate before any turn: Claude in a never-trusted directory opens on
+# 4b. A gate before any turn: Claude in a never-trusted directory opens on
 #     the folder-trust dialog before its first prompt (spawn still returns:
 #     the agent is up, waiting there). A plain wait (no baseline, no turn
 #     open) says blocked, as --after would — not idle. No model call is made;
@@ -332,7 +332,7 @@ out=$("$SEA" wait it-t --timeout 5s); rc=$?
 rm -rf "$UNTRUSTED"
 pass "a plain wait on an agent at the trust dialog, no turn open, is blocked (rc 3, $(echo "$out" | jq_ "d['rule']"))"
 
-# 6. stop: the agent exits (Claude's /exit), a waiter on its exit (already
+# 5. stop: the agent exits (Claude's /exit), a waiter on its exit (already
 #    waiting, as a caller would be) says so, its herdr tab is gone, and the
 #    window closes with it — a spawned window keeps no shell behind.
 "$SEA" wait it-a --for exit --timeout 30s > "$ROOT/exit.json" &
@@ -350,7 +350,7 @@ herdr pane list | grep -q "\"terminal_id\":\"$key\"" && fail "it-a's herdr pane 
 [ -z "$(ls "$WORK/.seagents/prompts/$key-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
 pass "stop it-a: wait --for exit returned exit (rc 4), its herdr pane and prompt files are gone, the window closed"
 
-# 6a. Closing the window stops the agent: the window and its agent live and
+# 5a. Closing the window stops the agent: the window and its agent live and
 #     die together.
 (cd "$WORK" && "$SEA" spawn --tag it-w "${HAIKU[@]}" -- 'Reply with exactly: WINDOW' > /dev/null) || fail "it-w spawn"
 wpid=$(meta_of it-w | jq_ "d['pid']"); wkey=$(meta_of it-w | jq_ "d['key']")
@@ -361,7 +361,7 @@ for _ in $(seq 1 40); do [ -d "/proc/$wpid" ] || break; sleep 0.25; done
 herdr pane list | grep -q "\"terminal_id\":\"$wkey\"" && fail "it-w's herdr pane outlived its window"
 pass "closing it-w's window ended its agent and its herdr pane"
 
-# 6b. After the reap (any status does it), it-a is a tombstone: wait still
+# 5b. After the reap (any status does it), it-a is a tombstone: wait still
 #     answers for it — exit, or the turn it was asked about — and read still
 #     reads its transcript; driving it needs a live agent.
 "$SEA" status > /dev/null
@@ -376,7 +376,7 @@ out=$("$SEA" wait it-a --after 5 --timeout 5s); rc=$?
 [ $rc -eq 1 ] || fail "send to a reaped agent: rc=$rc"
 pass "reaped it-a: wait says exit (rc 4, last_message AFTERDROP), --after 5 still gets its turn, read works, send refuses"
 
-# 7. Codex: the same loop through its adapter — hooks injected as one trusted
+# 6. Codex: the same loop through its adapter — hooks injected as one trusted
 #    `-c hooks=…` (no "hooks need review" dialog, or no turn would land), the
 #    rollout read as the transcript, an Esc read as an interrupt, pastes of
 #    any size as the user's words, `/exit` to stop.
@@ -470,7 +470,7 @@ wait $waiter; rc=$?
 [ $rc -eq 4 ] || fail "codex exit wait: rc=$rc $(cat "$ROOT/cexit.json")"
 pass "stop it-c: codex exited on /exit (wait --for exit rc 4)"
 
-# 7b. Codex's folder-trust question in a never-trusted directory, which herdr
+# 6b. Codex's folder-trust question in a never-trusted directory, which herdr
 #     reads as idle: the adapter's `[screen] dialogs` make it blocked, so the
 #     seed is held back (its Enter would trust the folder), `wait` says
 #     blocked, and `stop` closes the pane rather than type /exit. The scratch

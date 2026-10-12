@@ -14,7 +14,8 @@
 //!    the bundled file whole;
 //! 2. the bundled file compiled in from `src/adapters/`;
 //! 3. [`Adapter::default`] — the generic adapter for any other herdr kind: no
-//!    hooks, no identity; turns from the screen only.
+//!    hooks, so no conversation identity and no turn ledger; its state is
+//!    herdr's reading of the screen alone.
 //!
 //! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
 //! `spawn`, `send` and `stop` are its other consumers, and `[read]` names the
@@ -24,19 +25,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-
-/// How an adapter learns which transcript its agent is writing.
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Identity {
-    /// Lifecycle hooks report it (Claude's `SessionStart`).
-    Hook,
-    /// Not learned: state and send only. (The spec's `watch` — the first
-    /// file created in a session directory — is not built; an adapter
-    /// asking for it is refused by [`parse`].)
-    #[default]
-    None,
-}
 
 /// How a `send` body too long to pass as the user's own words is delivered.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,17 +36,6 @@ pub(crate) enum LongPrompt {
     /// Written to a prompt file in the agent's cwd, and a one-line
     /// instruction to read it is pasted instead.
     File,
-}
-
-/// Where the turn ledger's edges come from.
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Turns {
-    /// Exact, from prompt-submit / stop hooks.
-    Hook,
-    /// Approximate, from herdr seeing the agent go idle.
-    #[default]
-    Screen,
 }
 
 /// How a tool takes the hooks seagents adds to its command line — the one
@@ -94,7 +71,10 @@ pub(crate) struct Adapter {
     pub(crate) restore: Restore,
 }
 
-/// The lifecycle hooks `run` adds, each running `<this binary> __hook`.
+/// The lifecycle hooks `run` adds, each running `<this binary> __hook`. An
+/// adapter with hooks (`inject` other than `none`) is one whose agent reports
+/// which conversation it is writing and keeps the exact turn ledger
+/// ([`Hooks::enabled`]); one without has neither.
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Hooks {
@@ -109,6 +89,14 @@ pub(crate) struct Hooks {
     /// Flags under which the tool skips hooks altogether (Claude's `--bare`):
     /// nothing is injected, and `.agent` stays empty.
     pub(crate) hookless_flags: Vec<String>,
+}
+
+impl Hooks {
+    /// Whether this adapter's agents get our hooks — and so report their
+    /// conversation and keep the exact turn ledger.
+    pub(crate) fn enabled(&self) -> bool {
+        self.inject != Inject::None
+    }
 }
 
 /// How `restore` puts a window back on the conversation it was showing.
@@ -138,14 +126,10 @@ pub(crate) struct Read {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Launch {
     /// The permission modes `spawn --permission-mode` takes, in one
-    /// vocabulary (Claude's) whatever the tool. Empty: no modes.
-    pub(crate) permission_modes: Vec<String>,
-    /// The argv that starts the tool in each of `permission_modes` (every
-    /// one, and nothing else): Claude's `--permission-mode <m>`, Codex's
-    /// `-a`/`-s` pair.
+    /// vocabulary (Claude's) whatever the tool, and the argv that starts the
+    /// tool in each: Claude's `--permission-mode <m>`, Codex's `-a`/`-s`
+    /// pair. Empty: no modes.
     pub(crate) permission_argv: BTreeMap<String, Vec<String>>,
-    pub(crate) identity: Identity,
-    pub(crate) turns: Turns,
     /// Variables a running agent of this kind sets for what it runs — its
     /// own session's identity and messaging channel — which a window
     /// seagents launches, and a herdr server it starts, must not inherit when
@@ -232,29 +216,8 @@ const BUNDLED: &[(&str, &str)] = &[
 
 /// Parse one adapter file, refusing what could only half work.
 fn parse(text: &str) -> Result<Adapter, String> {
-    // Options the spec designed and nothing implements: said so, rather
-    // than a bare "unknown variant" — or, as when they parsed, silently
-    // doing nothing.
-    if let Ok(raw) = toml::from_str::<toml::Table>(text) {
-        let launch = raw.get("launch").and_then(|l| l.as_table());
-        if launch.and_then(|l| l.get("identity")).and_then(|i| i.as_str()) == Some("watch")
-            || launch.is_some_and(|l| l.contains_key("watch_dir"))
-        {
-            return Err("launch.identity = \"watch\" (and watch_dir) is not built: no bundled agent needs \
-                        it; use \"hook\" or \"none\""
-                .to_string());
-        }
-    }
     let adapter: Adapter = toml::from_str(text).map_err(|e| e.to_string())?;
-    // A mode with no argv could not be launched.
     let launch = &adapter.launch;
-    let listed: std::collections::BTreeSet<&String> = launch.permission_modes.iter().collect();
-    if listed.len() != launch.permission_modes.len() {
-        return Err("launch.permission_modes lists a mode twice".to_string());
-    }
-    if !listed.iter().copied().eq(launch.permission_argv.keys()) {
-        return Err("launch.permission_argv must give argv for each of permission_modes, and only those".to_string());
-    }
     if let Some((mode, _)) = launch.permission_argv.iter().find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-'))) {
         return Err(format!("launch.permission_argv.{mode} does not start with a flag"));
     }
@@ -265,7 +228,7 @@ fn parse(text: &str) -> Result<Adapter, String> {
         return Err(format!("launch.pass_env: {bad:?} is not a variable name"));
     }
     let hooks = &adapter.hooks;
-    if hooks.inject != Inject::None && (hooks.flags.is_empty() || hooks.events.is_empty()) {
+    if hooks.enabled() && (hooks.flags.is_empty() || hooks.events.is_empty()) {
         return Err("hooks.inject needs flags and events".to_string());
     }
     if let Some(bad) = hooks.flags.iter().find(|f| !f.starts_with('-') || f.contains('=')) {
@@ -362,14 +325,14 @@ pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
         caps.push("state");
     }
     caps.push("wait");
-    if adapter.launch.turns == Turns::Hook && adapter.hooks.inject != Inject::None {
+    if adapter.hooks.enabled() {
         caps.push("turns");
     }
     if known {
         caps.extend(["spawn", "send"]);
     }
     caps.push("stop");
-    if adapter.read.transcript.is_some() && adapter.launch.identity != Identity::None {
+    if adapter.read.transcript.is_some() && adapter.hooks.enabled() {
         caps.push("read");
     }
     caps

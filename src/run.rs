@@ -141,7 +141,6 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
         pane_id: pane.pane_id.clone(),
         socket: herdr::server_socket().unwrap_or_default(),
         run_pid: u64::from(std::process::id()),
-        kind: kind.to_string(),
         cwd: cwd.to_string_lossy().into_owned(),
         argv: cmd.to_vec(),
         started: crate::clock::unix_now(),
@@ -153,6 +152,9 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
     // reap if this `run` dies — finds all of it.
     let tag = claim.tag.clone();
     let files = claim.create_meta(meta);
+    // The window is named after the agent from here on, not after the
+    // command line the shell put in its title.
+    set_title(&tag);
     let session = || registry::by_key(&key);
     let finish = || {
         if let Some(s) = session() {
@@ -211,7 +213,7 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
     record_pid(&files, &pane.pane_id);
 
     let gone = Arc::new(AtomicBool::new(false));
-    monitor(files.clone(), key.clone(), cmd[0].clone(), Arc::clone(&gone));
+    monitor(files.clone(), key.clone(), tag.clone(), cmd[0].clone(), Arc::clone(&gone));
     if let Some(seed) = seed {
         deliver_seed(key.clone(), seed);
     }
@@ -479,7 +481,7 @@ fn agent_alive(key: &str) -> bool {
 /// "idle for / waiting for" truthful even when no HUD or status poll is
 /// watching. When the agent exits it closes its pane — the attach ends, and
 /// with it the window — and says so through `gone`.
-fn monitor(files: Files, key: String, cmd: String, gone: Arc<AtomicBool>) {
+fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<AtomicBool>) {
     let cmd0 = Path::new(&cmd).file_name().and_then(|s| s.to_str()).unwrap_or(&cmd).to_string();
     std::thread::spawn(move || {
         // In-memory previous state for transition notifications — kept apart
@@ -488,16 +490,11 @@ fn monitor(files: Files, key: String, cmd: String, gone: Arc<AtomicBool>) {
         // observations.
         let mut prev: Option<status::State> = None;
         let mut screen_hash: Option<u64> = None;
+        let mut title = tag.clone();
         loop {
-            // A `.meta` gone is a session ended under us (someone finished
-            // it): end with it — close the pane, let the window go.
-            let Some(meta) = registry::read_meta(&files) else {
-                if let Ok(Some(p)) = herdr::pane_of(&key) {
-                    let _ = herdr::close_pane(&p.pane_id);
-                }
-                gone.store(true, Ordering::Relaxed);
-                return;
-            };
+            // Only this `run` finishes its session while it lives, so the
+            // `.meta` is there.
+            let meta = registry::read_meta(&files).unwrap_or_default();
             let pid = match meta.pid {
                 Some(pid) => Some(pid),
                 None => herdr::pane_of(&key).ok().flatten().and_then(|p| record_pid(&files, &p.pane_id)),
@@ -510,6 +507,16 @@ fn monitor(files: Files, key: String, cmd: String, gone: Arc<AtomicBool>) {
                 return;
             }
             let agent = herdr::agent_on(&key).ok().flatten();
+            // The agent's own title (Claude's conversation name), which
+            // herdr's attach does not pass on to the window; the tag until
+            // it has one.
+            if let Some(a) = &agent {
+                let want = if a.title.is_empty() { &tag } else { &a.title };
+                if *want != title {
+                    title = want.clone();
+                    set_title(&title);
+                }
+            }
             let (state, seen, in_turn) = status::track(&files, &cmd0, agent.as_ref());
             if let Some(prev) = prev {
                 notify_transition(prev, state, meta.dir(), &cmd0, meta.con_id);
@@ -548,6 +555,19 @@ fn monitor(files: Files, key: String, cmd: String, gone: Arc<AtomicBool>) {
             std::thread::sleep(TICK);
         }
     });
+}
+
+/// Set this window's title: `ESC ] 2 ; <title> BEL` to its terminal, in one
+/// `write`, so it cannot land inside a sequence the attach is drawing.
+/// herdr's `terminal attach` does not forward the agent's own title (only
+/// its full UI shows it), so `run` does. Control characters are dropped from
+/// `title` — an ESC, BEL or C1 ST in it would end the sequence early.
+fn set_title(title: &str) {
+    use std::io::Write;
+    let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write(format!("\x1b]2;{clean}\x07").as_bytes());
+    }
 }
 
 /// How long the agent must have read idle before its seed goes in: right

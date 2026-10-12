@@ -312,8 +312,7 @@ pub(crate) fn agent_status(agent: Option<&herdr::Agent>, cmd: &str) -> Option<(h
 /// screen is not, so: blocked (screen) wins; else in a turn → working; else
 /// the screen's verdict. Recording the fused state (rather than the raw one)
 /// is what keeps the done marker and the "finished" notification from firing
-/// mid-answer. Screen adapters record the screen, and their turn rule then
-/// reads it back.
+/// mid-answer. An agent without hooks has no ledger: the screen is its state.
 pub(crate) fn settle(
     files: &Files,
     cmd: &str,
@@ -322,7 +321,7 @@ pub(crate) fn settle(
 ) -> (State, StateRecord, crate::registry::AgentRecord, bool) {
     let agent = crate::registry::read_agent(files);
     let ledger = crate::turn::Ledger::for_command(cmd);
-    if ledger.turns == crate::adapter::Turns::Hook {
+    if ledger.hooks {
         // The ledger's rule reads the screen only for a turn dropped before
         // it began, and this pass's verdict is the freshest there is; the
         // screen's clock is the one `.state` keeps.
@@ -346,9 +345,7 @@ pub(crate) fn settle(
         (state, observe_state(files, shown, seen, now), agent, in_turn)
     } else {
         let state = screen.state;
-        let record = observe_state(files, screen, state, now);
-        let in_turn = ledger.in_turn(&agent, Some(&record));
-        (state, record, agent, in_turn)
+        (state, observe_state(files, screen, state, now), agent, false)
     }
 }
 
