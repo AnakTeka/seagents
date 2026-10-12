@@ -269,7 +269,7 @@ const TAIL: u64 = 256 * 1024;
 /// `since_ms`? Newest line first, stopping at the first one older than
 /// that: everything before belongs to an earlier turn.
 pub(super) fn interrupted_since(transcript: &Path, since_ms: u64) -> bool {
-    crate::status::read_tail(transcript, TAIL).is_some_and(|tail| scan(&tail, since_ms))
+    crate::fsutil::read_tail(transcript, TAIL).is_some_and(|tail| scan(&tail, since_ms))
 }
 
 fn scan(tail: &[u8], since_ms: u64) -> bool {

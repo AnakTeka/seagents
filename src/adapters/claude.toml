@@ -2,26 +2,19 @@
 # at ~/.config/seagents/agents/claude.toml replaces this file whole.
 
 [launch]
-# Appended to the child's argv (never to the argv recorded in .meta). After
-# `--`, so a prompt starting with `-` is never parsed as a flag; interactive
-# mode still submits it (verified 2026-09-29).
-seed_prompt      = ["--", "{prompt}"]
-# The prompt goes to a 0600 prompt file in the agent's cwd, and {prompt} is
-# only the line telling it to read that file: argv is readable by every
-# local user in /proc/<pid>/cmdline. Reading a file in its cwd takes no
-# permission, in any mode (verified 2026-09-30).
-seed_by          = "file"
-# Least to most privileged; each one's argv is under [launch.permission_argv].
+# What `spawn --permission-mode` takes; each one's argv is under
+# [launch.permission_argv].
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
 # What a running Claude Code sets for its children: its session's identity
 # and messaging socket/token. A window launched from inside one (an agent
-# calling `spawn`) must not inherit them — with them, a Claude started
-# outside tmux never writes its transcript (bisected 2026-09-29), and the
-# socket and token are that session's alone. Listed one by one: the user's
-# own configuration (CLAUDE_CONFIG_DIR, CLAUDE_CODE_USE_BEDROCK,
-# CLAUDE_CODE_MAX_OUTPUT_TOKENS, …) must pass through.
+# calling `spawn`, or a herdr server it starts) must not inherit them — with
+# them, a Claude started outside tmux never writes its transcript (bisected
+# 2026-09-29), and the socket and token are that session's alone. Listed one
+# by one: the user's own configuration (CLAUDE_CONFIG_DIR,
+# CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_MAX_OUTPUT_TOKENS, …) must pass
+# through.
 session_env      = [
   "CLAUDECODE",
   "CLAUDE_CODE_ENTRYPOINT",
@@ -35,51 +28,21 @@ session_env      = [
   "CLAUDE_EFFORT",
   "AI_AGENT",
 ]
+# The agent runs under the herdr server's environment, not `run`'s: where
+# Claude Code keeps its config (and auth) is passed on to its pane.
+pass_env         = ["CLAUDE_CONFIG_DIR"]
 
 [launch.permission_argv]
 plan              = ["--permission-mode", "plan"]
 default           = ["--permission-mode", "default"]
 acceptEdits       = ["--permission-mode", "acceptEdits"]
 bypassPermissions = ["--permission-mode", "bypassPermissions"]
-# No [launch.argv_mode]: the hooks report the mode whole, and it is the
-# current one — Shift+Tab changes it after launch, so argv would be stale.
-
-# What an agent calling `spawn` may not pass with `--arg`: its child's mode
-# comes from `spawn --permission-mode`, capped at its own, and each of these
-# reaches past that cap. A human may pass anything (they could type it into a
-# terminal). From `claude --help` (2.1.28x), one reason each. Not listed, as
-# they only narrow what the child may do or touch no permission:
-# --disallowedTools, --tools, --restricted, --strict-mcp-config, --model,
-# --effort, --name, --system-prompt, --append-system-prompt, --worktree,
-# --resume/--continue (an explicit mode still applies to a resumed session).
-[launch.privileged]
-flags = [
-  "--permission-mode",                     # the mode itself: spawn --permission-mode is the capped way
-  "--dangerously-skip-permissions",        # bypassPermissions
-  "--allow-dangerously-skip-permissions",  # puts bypass one Shift+Tab away
-  "--settings",                            # permissions.defaultMode / allow rules, hooks, sandbox settings
-  "--setting-sources",                     # can drop the user's settings, and their deny rules with them
-  "--allowedTools", "--allowed-tools",     # pre-approves tools
-  "--add-dir",                             # file tools beyond the working directory
-  "--mcp-config",                          # an MCP server is a command started with no approval
-  "--plugin-dir", "--plugin-url",          # a plugin brings hooks and MCP servers, run with no approval
-  "--agent", "--agents",                   # an agent definition carries its own tools and permissionMode
-  "--bare", "--safe-mode",                 # skip hooks: the user's PreToolUse guards, and seagents' own
-  "-p", "--print",                         # skips the folder-trust dialog
-  "--chrome",                              # drives the user's logged-in browser
-  "--remote-control",                      # hands the session to a remote driver
-  "--bg", "--background", "--cloud", "--teleport", "--environment",  # runs where no cap or lineage reaches
-]
-# Subcommands that change the user's configuration or act on sessions that
-# are not the child's (another's lineage): never an interactive child.
-commands = [
-  "mcp", "plugin", "plugins", "install", "update", "upgrade", "auth", "setup-token",
-  "auto-mode", "import", "project", "agents", "attach", "respawn", "rm", "stop", "kill", "logs",
-]
 
 [hooks]
-# One --settings JSON carrying the hooks. Repeated --settings flags replace
-# each other (verified 2026-09-28), so `run` merges a user's own into one.
+# One --settings carrying the hooks. Repeated --settings flags replace each
+# other (verified 2026-09-28), so `run` merges a user's own into one — and
+# passes it as a path, to a 0600 file in the runtime dir, since herdr types
+# the agent's command line into the pane's shell (and its history).
 inject           = "settings"
 flags            = ["--settings"]
 events           = ["SessionStart", "UserPromptSubmit", "Stop"]
@@ -87,32 +50,32 @@ events           = ["SessionStart", "UserPromptSubmit", "Stop"]
 hookless_flags   = ["--bare"]
 
 [send]
-submit_delay_ms  = 300
-pre_send         = ""
-exit_sequence    = "/exit"
 # A paste Claude Code (2.1.284) takes as the user's words lands in its
 # transcript inline; a longer one is wrapped in <pasted_content>, which the
 # model treats as data that may carry instructions the user did not write, and
-# can decline to act on. Measured with bracketed paste + 300 ms + Enter: one
-# line of 700 chars and 2 short lines stay inline; 900 chars on one line, or
-# 7 short lines, are wrapped. So past either limit the body is written to
-# <cwd>/.seagents/prompts/ and the agent is sent one line telling it to read
-# the file — a Read inside its cwd needs no permission, in any mode
-# (verified in `default`, 2026-09-29). A seed prompt on the command line is
-# never wrapped (verified: 50 lines, ~5000 chars), so seeds stay as they are.
+# can decline to act on. Measured with bracketed paste + 300 ms + Enter (what
+# herdr's `agent prompt` sends): one line of 700 chars and 2 short lines stay
+# inline; 900 chars on one line, or 7 short lines, are wrapped. So past either
+# limit the body is written to <cwd>/.seagents/prompts/ and the agent is sent
+# one line telling it to read the file — a Read inside its cwd needs no
+# permission, in any mode (verified in `default`, 2026-09-29). A seed prompt
+# always goes this way.
 long_prompt      = "file"
 inline_max_chars = 700
 inline_max_lines = 2
-# The input box: the row starting with `❯` (after the placeholder-dim
-# `Try "…"` when empty) and the rows under it, between two rules. A prompt
-# Esc'd before its first response is put back there, and a human may have a
-# draft in it; a paste would land after either (verified: one prompt
-# `…about the seaReply with exactly: …`). Ctrl+U deletes to the start of
-# the line, and at a line's start the newline before it (so a box of N
-# lines empties in 2N-1 presses, the cursor at its end). Never Ctrl+C: on
-# an empty box it starts exiting.
+# The input box: the row starting with `❯` (the dim placeholder `Try "…"`
+# when empty) and the rows under it, between two rules. A prompt Esc'd
+# before its first response is put back there, and a human may have a draft
+# in it; a paste would land after either (verified: one prompt `…about the
+# seaReply with exactly: …`). Ctrl+U deletes to the start of the line, and
+# at a line's start the newline before it (so a box of N lines empties in
+# 2N-1 presses, the cursor at its end). Never Ctrl+C: on an empty box it
+# starts exiting.
 input_glyph      = "❯"
-input_clear      = "\\x15"
+input_clear      = ["ctrl+u"]
+
+[stop]
+exit_sequence    = "/exit"
 
 [read]
 # JSONL under $CLAUDE_CONFIG_DIR/projects, path reported by the hooks. Also

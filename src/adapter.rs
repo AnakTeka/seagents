@@ -2,20 +2,19 @@
 //! tool, as data.
 //!
 //! The core (tags, the launcher, the turn ledger, `wait`, `send`) is written
-//! once; how a tool takes a seed prompt, whether it has hooks, what its
-//! permission modes are and how it is asked to exit live here, one TOML file
+//! once; whether a tool has hooks, how its permission modes are spelled, how
+//! its input box looks and how it is asked to exit live here, one TOML file
 //! per agent. Claude Code is the first adapter, not the design.
 //!
-//! Keyed by the id the vendored detection engine derives from `argv[0]`
-//! (`identify_agent` → `agent_label`), so detection and orchestration always
-//! agree on what a session is. Lookup, strongest first:
+//! Keyed by the herdr agent kind of `argv[0]` (`herdr::kind_for`), so herdr's
+//! detection and seagents' orchestration always agree on what a session is.
+//! Lookup, strongest first:
 //!
 //! 1. `~/.config/seagents/agents/<agent>.toml` — the user's override, replacing
-//!    the bundled file whole (as `agent-detection/<agent>.toml` does for
-//!    detection manifests);
+//!    the bundled file whole;
 //! 2. the bundled file compiled in from `src/adapters/`;
-//! 3. [`Adapter::default`] — the generic adapter for any other command: no
-//!    seed flag, no hooks, no identity; state from the screen only.
+//! 3. [`Adapter::default`] — the generic adapter for any other herdr kind: no
+//!    hooks, no identity; turns from the screen only.
 //!
 //! `run` reads it to decide whether to inject hooks ([`crate::hook`]);
 //! `spawn`, `send` and `stop` are its other consumers, and `[read]` names the
@@ -51,28 +50,13 @@ pub(crate) enum LongPrompt {
     File,
 }
 
-/// How a seed prompt reaches the agent's command line.
-#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum SeedBy {
-    /// The prompt itself, in `seed_prompt`'s `{prompt}` — and so in the
-    /// agent's `/proc/<pid>/cmdline`, readable by any local user while it
-    /// runs, and limited to one argv string (`MAX_ARG_STRLEN`).
-    #[default]
-    Inline,
-    /// Written to a prompt file in the agent's cwd (0600, gone with the
-    /// session), with only the one line telling the agent to read it in
-    /// `{prompt}` — for a tool that reads a file in its cwd without asking.
-    File,
-}
-
 /// Where the turn ledger's edges come from.
 #[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Turns {
     /// Exact, from prompt-submit / stop hooks.
     Hook,
-    /// Approximate, from the detector seeing the agent go idle.
+    /// Approximate, from herdr seeing the agent go idle.
     #[default]
     Screen,
 }
@@ -89,7 +73,7 @@ pub(crate) enum Inject {
     None,
     /// A settings JSON object whose `hooks` holds the event arrays, inline
     /// or as a path (Claude's `--settings`). Repeated flags replace each
-    /// other.
+    /// other. seagents passes it as a path, to a file of its own.
     Settings,
     /// A config override `hooks=<TOML>` (Codex's `-c`): every override of
     /// `hooks` or `hooks.*` contributes, and each hook we add is marked
@@ -104,6 +88,8 @@ pub(crate) struct Adapter {
     pub(crate) launch: Launch,
     pub(crate) hooks: Hooks,
     pub(crate) send: Send,
+    pub(crate) stop: Stop,
+    pub(crate) screen: Screen,
     pub(crate) read: Read,
     pub(crate) restore: Restore,
 }
@@ -151,17 +137,8 @@ pub(crate) struct Read {
 #[derive(Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Launch {
-    /// argv appended to the child's (never to the recorded argv), with
-    /// `{prompt}` substituted. Empty: the agent cannot be seeded — `spawn`
-    /// and `run --seed-file` refuse ([`Launch::seed_args`]); seeding by
-    /// paste once idle is designed, not built.
-    pub(crate) seed_prompt: Vec<String>,
-    /// What goes into `{prompt}`: the prompt, or a line pointing at its file.
-    pub(crate) seed_by: SeedBy,
-    /// The permission modes, least privileged first — the order a child is
-    /// checked against so it never outranks its parent. Named in Claude's
-    /// vocabulary whatever the tool, because that is what every bundled
-    /// tool's hooks report a parent's mode in. Empty: no modes.
+    /// The permission modes `spawn --permission-mode` takes, in one
+    /// vocabulary (Claude's) whatever the tool. Empty: no modes.
     pub(crate) permission_modes: Vec<String>,
     /// The argv that starts the tool in each of `permission_modes` (every
     /// one, and nothing else): Claude's `--permission-mode <m>`, Codex's
@@ -171,67 +148,23 @@ pub(crate) struct Launch {
     pub(crate) turns: Turns,
     /// Variables a running agent of this kind sets for what it runs — its
     /// own session's identity and messaging channel — which a window
-    /// seagents launches must not inherit when the launch comes from inside
-    /// such an agent. Names, or a prefix ending in `*`. Never the user's own
-    /// configuration (Claude's `CLAUDE_CONFIG_DIR`).
+    /// seagents launches, and a herdr server it starts, must not inherit when
+    /// the launch comes from inside such an agent. Names, or a prefix ending
+    /// in `*`. Never the user's own configuration (Claude's
+    /// `CLAUDE_CONFIG_DIR`).
     pub(crate) session_env: Vec<String>,
-    /// The flag's spellings that set one configuration key on the command
-    /// line, `key=value` (Codex's `-c` / `--config`); what
-    /// `privileged.config_keys` is checked against.
-    pub(crate) config_flags: Vec<String>,
-    /// What an agent calling `spawn` may not pass through `--arg`.
-    pub(crate) privileged: Privileged,
-    /// When present, a running agent's mode is also read off its own argv
-    /// ([`Launch::bound_mode`]), for a tool whose hooks report less than its
-    /// mode (Codex's follow its approval policy alone).
-    pub(crate) argv_mode: Option<ArgvMode>,
-}
-
-/// How a running agent's own command line names its mode, beyond
-/// `permission_argv` read in reverse.
-#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ArgvMode {
-    /// Other spellings of the flags `permission_argv` uses (`--sandbox` →
-    /// `-s`).
-    pub(crate) aliases: BTreeMap<String, String>,
-    /// Configuration keys (behind `config_flags`) that set what one of those
-    /// flags sets (`sandbox_mode` → `-s`).
-    pub(crate) config_keys: BTreeMap<String, String>,
-    /// Flags that are a whole mode on their own.
-    pub(crate) flags: BTreeMap<String, String>,
-}
-
-/// Arguments that would give a child more than the permission mode `spawn`
-/// chose for it — refused from an agent caller, whose child's mode is
-/// capped at its own ([`Launch::privileged_arg`]); a human may pass anything,
-/// as they could type it into a terminal themselves.
-#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct Privileged {
-    /// Flags refused whatever their value: `--flag`, `--flag=value`, and for
-    /// a one-letter `-f` also `-fVALUE` and a cluster holding it (`-cp`).
-    pub(crate) flags: Vec<String>,
-    /// Subcommands, refused as a bare word anywhere in the arguments.
-    pub(crate) commands: Vec<String>,
-    /// Configuration keys refused after one of `config_flags`: the key
-    /// itself, or anything under it (`sandbox_workspace_write` covers
-    /// `sandbox_workspace_write.network_access`).
-    pub(crate) config_keys: Vec<String>,
+    /// Variables of `run`'s own environment the agent's pane is given, when
+    /// set: where the tool keeps its configuration (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`). The agent runs under the herdr server's environment,
+    /// not `run`'s, so without this `CODEX_HOME=… seagents run codex` would
+    /// not reach Codex. Paths only, never secrets: they travel on herdr's
+    /// command line, which `/proc` shows every local user.
+    pub(crate) pass_env: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Send {
-    /// Body, then this long, then the submit key: the TUI has to consume a
-    /// paste before Enter arrives (herdr's value).
-    pub(crate) submit_delay_ms: u64,
-    /// A nudge written before the body (e.g. `focus_gained` for Copilot);
-    /// empty for none.
-    pub(crate) pre_send: String,
-    /// Sent as a prompt to ask the agent to exit; empty goes straight to
-    /// SIGTERM.
-    pub(crate) exit_sequence: String,
     /// What happens to a body over `inline_max_chars` characters or
     /// `inline_max_lines` lines. A tool that files a large paste as quoted
     /// data rather than as the user's words (Claude) takes it by reference.
@@ -240,24 +173,21 @@ pub(crate) struct Send {
     pub(crate) inline_max_lines: usize,
     /// The glyph the input box's first row starts with, so a `send` can see
     /// what is already typed there before pasting after it
-    /// ([`crate::detect::input_box`]). Empty: the box is not looked at.
+    /// ([`crate::screen::input_box`]). Empty: the box is not looked at.
     pub(crate) input_glyph: String,
-    /// Keys, in `send --keys` syntax, that clear one line of the input box;
+    /// Keys, by herdr's names, that clear one line of the input box;
     /// pressed until it reads empty.
-    pub(crate) input_clear: String,
+    pub(crate) input_clear: Vec<String>,
 }
 
 impl Default for Send {
     fn default() -> Send {
         Send {
-            submit_delay_ms: 300,
-            pre_send: String::new(),
-            exit_sequence: String::new(),
             long_prompt: LongPrompt::Paste,
             inline_max_chars: 0,
             inline_max_lines: 0,
             input_glyph: String::new(),
-            input_clear: String::new(),
+            input_clear: Vec::new(),
         }
     }
 }
@@ -268,216 +198,39 @@ impl Send {
     /// counted as the paste carries them, so a trailing newline is one more.
     pub(crate) fn by_reference(&self, body: &str) -> bool {
         self.long_prompt == LongPrompt::File
-            && (body.chars().count() > self.inline_max_chars
-                || body.split('\n').count() > self.inline_max_lines)
+            && (body.chars().count() > self.inline_max_chars || body.split('\n').count() > self.inline_max_lines)
     }
 }
 
-/// The longest single argv string the kernel accepts (`MAX_ARG_STRLEN`, 32
-/// pages), terminating NUL included.
-const MAX_ARG_STRLEN: usize = 128 * 1024;
-
-/// Whether `arg` is `flag` as a command line may spell it, and the value
-/// glued to it if any: `--flag` (None) or `--flag=v`; for a one-letter `-f`,
-/// `-f` or `-fv`.
-fn spelled<'a>(arg: &'a str, flag: &str) -> Option<Option<&'a str>> {
-    if !flag.starts_with("--") && arg.starts_with("--") {
-        return None;
-    }
-    let rest = arg.strip_prefix(flag)?;
-    if rest.is_empty() {
-        return Some(None);
-    }
-    if flag.starts_with("--") {
-        return rest.strip_prefix('=').map(Some);
-    }
-    (flag.len() == 2).then_some(Some(rest))
+/// How `stop` asks the agent to go.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Stop {
+    /// Submitted as a prompt to ask the agent to exit; empty goes straight
+    /// to closing its pane.
+    pub(crate) exit_sequence: String,
 }
 
-/// The key of a `key=value` configuration override, as the tool reads it:
-/// surrounding blanks and quotes dropped.
-fn config_key(kv: &str) -> &str {
-    kv.split('=').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'')
+/// What seagents reads off the agent's screen itself.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Screen {
+    /// Screen text that means the agent waits at a dialog herdr does not
+    /// read as one (Codex's folder-trust question drawn over an update
+    /// notice). While one shows the agent is blocked, to seagents, whatever
+    /// herdr says: nothing is pasted or typed into it — its Enter would
+    /// answer it (and trust the folder) — `wait` returns `blocked`, and
+    /// `stop` closes the pane rather than type its exit sequence.
+    pub(crate) dialogs: Vec<String>,
 }
 
-/// A value as a command line or a TOML override writes it: blanks and
-/// quotes dropped.
-fn unquoted(v: &str) -> &str {
-    v.trim().trim_matches(|c| c == '"' || c == '\'')
-}
-
-impl Launch {
-    /// The mode a running agent of this kind may pass on: the one its hooks
-    /// `reported`, unless its own command line (`argv`, as `.meta` records
-    /// it) says it has less — the lesser of the two. Only for an adapter with
-    /// `argv_mode`; the others' hooks report their mode whole. None: no mode
-    /// is known (the child then gets the least privileged).
-    pub(crate) fn bound_mode(&self, reported: Option<String>, argv: &[String]) -> Option<String> {
-        let reported = reported?;
-        let Some(ceiling) = self.argv_mode.as_ref().and_then(|am| self.argv_rank(am, argv)) else {
-            return Some(reported);
-        };
-        match self.permission_modes.iter().position(|m| *m == reported) {
-            Some(r) if r > ceiling => Some(self.permission_modes[ceiling].clone()),
-            _ => Some(reported),
-        }
-    }
-
-    /// The highest mode `argv` (a whole command line, the tool's name first)
-    /// allows, by its permission flags; None when it has none. A flag's value
-    /// ranks as the most privileged mode whose `permission_argv` uses it —
-    /// the value grants no more than that mode does (Codex's `-s read-only`
-    /// is `default`, since `plan` and `default` share it) — and a value no
-    /// mode uses as the least privileged. The last of a repeated flag
-    /// counts; every flag present bounds.
-    fn argv_rank(&self, am: &ArgvMode, argv: &[String]) -> Option<usize> {
-        // (flag, value) → the highest rank using it; flags that take a value.
-        let mut value_rank: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-        let mut valued: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for (rank, mode) in self.permission_modes.iter().enumerate() {
-            let words = &self.permission_argv[mode];
-            for (i, w) in words.iter().enumerate() {
-                if let Some(v) = words.get(i + 1).filter(|_| w.starts_with('-')).filter(|v| !v.starts_with('-')) {
-                    valued.insert(w);
-                    let r = value_rank.entry((w, v)).or_insert(rank);
-                    *r = (*r).max(rank);
-                }
-            }
-        }
-        let canonical = |f: &str| -> Option<String> {
-            let f = am.aliases.get(f).map_or(f, String::as_str);
-            valued.contains(f).then(|| f.to_string())
-        };
-        let spellings: Vec<&str> = valued.iter().copied().chain(am.aliases.keys().map(String::as_str)).collect();
-        let mut last: BTreeMap<String, String> = BTreeMap::new();
-        let mut whole: Vec<usize> = Vec::new();
-        let mut it = argv.iter().skip(1);
-        while let Some(arg) = it.next() {
-            if arg == "--" {
-                break;
-            }
-            if let Some(mode) = am.flags.get(arg.as_str()) {
-                whole.push(self.permission_modes.iter().position(|m| m == mode).unwrap_or(0));
-                continue;
-            }
-            if let Some(glued) = self.config_flags.iter().find_map(|cf| spelled(arg, cf)) {
-                let kv = match glued {
-                    Some(kv) => kv.to_string(),
-                    None => it.next().cloned().unwrap_or_default(),
-                };
-                let key = config_key(&kv);
-                if let Some(flag) = am.config_keys.get(key).and_then(|f| canonical(f)) {
-                    let value = kv.split_once('=').map_or("", |(_, v)| unquoted(v));
-                    last.insert(flag, value.to_string());
-                }
-                continue;
-            }
-            if let Some((flag, glued)) = spellings.iter().find_map(|f| spelled(arg, f).map(|g| (*f, g))) {
-                let value = match glued {
-                    Some(v) => v.to_string(),
-                    None => it.next().cloned().unwrap_or_default(),
-                };
-                if let Some(flag) = canonical(flag) {
-                    last.insert(flag, unquoted(&value).to_string());
-                }
-            }
-        }
-        last.iter()
-            .map(|(f, v)| value_rank.get(&(f.as_str(), v.as_str())).copied().unwrap_or(0))
-            .chain(whole)
-            .min()
-    }
-
-    /// The first of `args` an agent caller may not pass (`privileged`), as
-    /// written — with its value, for a configuration override. Matching errs
-    /// toward refusing: a one-letter flag is found inside any cluster of
-    /// letters (`-cp` holds `-p`), and a refused word is refused even where
-    /// it is some other flag's value.
-    pub(crate) fn privileged_arg(&self, args: &[String]) -> Option<String> {
-        let p = &self.privileged;
-        let short_in_cluster = |arg: &str, flag: &str| {
-            let letters = arg.strip_prefix('-').filter(|l| !l.starts_with('-') && l.len() > 1);
-            flag.len() == 2
-                && !flag.starts_with("--")
-                && letters.is_some_and(|l| l.chars().all(|c| c.is_ascii_alphabetic()) && l.contains(&flag[1..]))
-        };
-        let mut it = args.iter().peekable();
-        while let Some(arg) = it.next() {
-            for cf in &self.config_flags {
-                let Some(glued) = spelled(arg, cf) else { continue };
-                let kv = match glued {
-                    Some(kv) => kv.to_string(),
-                    None => it.peek().map(|v| v.to_string()).unwrap_or_default(),
-                };
-                let key = config_key(&kv);
-                if p.config_keys.iter().any(|k| key == k || key.strip_prefix(k.as_str()).is_some_and(|r| r.starts_with('.'))) {
-                    return Some(match glued {
-                        Some(_) => arg.clone(),
-                        None => format!("{arg} {kv}"),
-                    });
-                }
-            }
-            if p.flags.iter().any(|f| spelled(arg, f).is_some() || short_in_cluster(arg, f))
-                || p.commands.iter().any(|c| c == arg)
-            {
-                return Some(arg.clone());
-            }
-        }
-        None
-    }
-
-    /// Whether `prompt` can seed this agent, as `spawn` checks before a
-    /// window opens: a template to carry it and, sent inline, one argv
-    /// string's worth ([`Launch::seed_args`]). By file, only the short line
-    /// pointing at it goes on the command line.
-    pub(crate) fn check_seed(&self, prompt: &str) -> Result<(), String> {
-        match self.seed_by {
-            SeedBy::File if !self.seed_prompt.is_empty() => Ok(()),
-            _ => self.seed_args(prompt).map(drop),
-        }
-    }
-
-    /// The argv a seed adds to the agent's command line, per `seed_prompt`:
-    /// `prompt` is what goes into `{prompt}` — the prompt, or under
-    /// `seed_by = "file"` the line pointing at its file. Refused — the error
-    /// is for the user — when the adapter has no template, or the text cannot
-    /// be one argv string: over `MAX_ARG_STRLEN`, or holding a NUL. Pasting such a seed
-    /// through the wrapper's own PTY writer is the spec's answer to both; it
-    /// is not built yet, as no bundled adapter needs it.
-    pub(crate) fn seed_args(&self, prompt: &str) -> Result<Vec<String>, String> {
-        if self.seed_prompt.is_empty() {
-            return Err("this agent's adapter has no launch.seed_prompt; seeding by paste is not \
-                        implemented yet"
-                .to_string());
-        }
-        if prompt.contains('\0') {
-            return Err("the prompt contains a NUL byte".to_string());
-        }
-        let args: Vec<String> = self
-            .seed_prompt
-            .iter()
-            .map(|a| a.replace("{prompt}", prompt))
-            .collect();
-        if let Some(long) = args.iter().find(|a| a.len() >= MAX_ARG_STRLEN) {
-            return Err(format!(
-                "the prompt is too long to pass on the command line ({} bytes; the limit is {}); \
-                 seeding by paste is not implemented yet",
-                long.len(),
-                MAX_ARG_STRLEN - 1
-            ));
-        }
-        Ok(args)
-    }
-}
-
-/// The adapters compiled into the binary, by agent id.
+/// The adapters compiled into the binary, by agent kind.
 const BUNDLED: &[(&str, &str)] = &[
     ("claude", include_str!("adapters/claude.toml")),
     ("codex", include_str!("adapters/codex.toml")),
 ];
 
-/// Parse one adapter file. Refuses a seed template with nowhere to put the
-/// prompt, which would otherwise launch the agent with the prompt dropped.
+/// Parse one adapter file, refusing what could only half work.
 fn parse(text: &str) -> Result<Adapter, String> {
     // Options the spec designed and nothing implements: said so, rather
     // than a bare "unknown variant" — or, as when they parsed, silently
@@ -493,12 +246,7 @@ fn parse(text: &str) -> Result<Adapter, String> {
         }
     }
     let adapter: Adapter = toml::from_str(text).map_err(|e| e.to_string())?;
-    let seed = &adapter.launch.seed_prompt;
-    if !seed.is_empty() && !seed.iter().any(|a| a.contains("{prompt}")) {
-        return Err("launch.seed_prompt has no {prompt}".to_string());
-    }
-    // A mode with no argv could not be launched, and argv for an unlisted
-    // mode has no rank to bound a child by.
+    // A mode with no argv could not be launched.
     let launch = &adapter.launch;
     let listed: std::collections::BTreeSet<&String> = launch.permission_modes.iter().collect();
     if listed.len() != launch.permission_modes.len() {
@@ -510,29 +258,11 @@ fn parse(text: &str) -> Result<Adapter, String> {
     if let Some((mode, _)) = launch.permission_argv.iter().find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-'))) {
         return Err(format!("launch.permission_argv.{mode} does not start with a flag"));
     }
-    let privileged = &launch.privileged;
-    if let Some(bad) = launch.config_flags.iter().chain(&privileged.flags).find(|f| !f.starts_with('-') || f.contains('=')) {
-        return Err(format!("launch: {bad:?} is not a flag"));
-    }
-    if !privileged.config_keys.is_empty() && launch.config_flags.is_empty() {
-        return Err("launch.privileged.config_keys needs launch.config_flags".to_string());
-    }
-    if let Some(bad) = privileged.commands.iter().find(|c| c.is_empty() || c.starts_with('-')) {
-        return Err(format!("launch.privileged.commands: {bad:?} is not a word"));
-    }
-    if let Some(am) = &launch.argv_mode {
-        if let Some(bad) = am.flags.values().find(|m| !listed.contains(m)) {
-            return Err(format!("launch.argv_mode.flags: {bad:?} is not one of permission_modes"));
-        }
-        if !am.config_keys.is_empty() && launch.config_flags.is_empty() {
-            return Err("launch.argv_mode.config_keys needs launch.config_flags".to_string());
-        }
-        if let Some(bad) = am.aliases.iter().chain(&am.flags).map(|(f, _)| f).chain(am.aliases.values()).find(|f| !f.starts_with('-')) {
-            return Err(format!("launch.argv_mode: {bad:?} is not a flag"));
-        }
-    }
     if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
         return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
+    }
+    if let Some(bad) = adapter.launch.pass_env.iter().find(|n| n.ends_with('*') || !valid_env_pattern(n)) {
+        return Err(format!("launch.pass_env: {bad:?} is not a variable name"));
     }
     let hooks = &adapter.hooks;
     if hooks.inject != Inject::None && (hooks.flags.is_empty() || hooks.events.is_empty()) {
@@ -542,10 +272,7 @@ fn parse(text: &str) -> Result<Adapter, String> {
         return Err(format!("hooks.flags: {bad:?} is not a flag"));
     }
     if let Some(bad) = hooks.events.iter().find(|e| !crate::hook::KNOWN_EVENTS.contains(&e.as_str())) {
-        return Err(format!(
-            "hooks.events: seagents records {}, not {bad:?}",
-            crate::hook::KNOWN_EVENTS.join(", ")
-        ));
+        return Err(format!("hooks.events: seagents records {}, not {bad:?}", crate::hook::KNOWN_EVENTS.join(", ")));
     }
     let resume = &adapter.restore.resume;
     if !resume.is_empty() && !resume.iter().any(|a| a.contains("{session}")) {
@@ -555,12 +282,8 @@ fn parse(text: &str) -> Result<Adapter, String> {
     if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
         return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
     }
-    if !send.input_glyph.is_empty() {
-        match crate::wrapper::inject::decode_keys(&send.input_clear) {
-            Ok(keys) if !keys.is_empty() => {}
-            Ok(_) => return Err("send.input_glyph needs input_clear".to_string()),
-            Err(e) => return Err(format!("send.input_clear: {e}")),
-        }
+    if !send.input_glyph.is_empty() && send.input_clear.is_empty() {
+        return Err("send.input_glyph needs input_clear".to_string());
     }
     Ok(adapter)
 }
@@ -570,17 +293,16 @@ fn parse(text: &str) -> Result<Adapter, String> {
 fn valid_env_pattern(p: &str) -> bool {
     let name = p.strip_suffix('*').unwrap_or(p);
     let b = name.as_bytes();
-    !b.is_empty()
-        && !b[0].is_ascii_digit()
-        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    !b.is_empty() && !b[0].is_ascii_digit() && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Of the variables `env` holds, those every bundled adapter's
-/// `session_env` names — what a window seagents launches must not inherit.
-/// Every bundled adapter, not the one being launched: an agent of one kind
-/// may spawn an agent of another, and it is the caller's session that
-/// leaks. The bundled files, not overrides: an override written before a
-/// variable was listed would otherwise quietly let it through.
+/// `session_env` names — what a window seagents launches, or a herdr server
+/// it starts, must not inherit. Every bundled adapter, not the one being
+/// launched: an agent of one kind may spawn an agent of another, and it is
+/// the caller's session that leaks. The bundled files, not overrides: an
+/// override written before a variable was listed would otherwise quietly let
+/// it through.
 pub(crate) fn session_env<'a>(env: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let patterns: Vec<String> = BUNDLED
         .iter()
@@ -601,11 +323,15 @@ pub(crate) fn session_env<'a>(env: impl IntoIterator<Item = &'a str>) -> Vec<Str
     names
 }
 
+/// [`session_env`] of this process's own environment.
+pub(crate) fn own_session_env() -> Vec<String> {
+    let vars: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
+    session_env(vars.iter().map(String::as_str))
+}
+
 /// `~/.config/seagents/agents/<agent>.toml`.
 fn override_path(agent: &str) -> PathBuf {
-    crate::vendor::herdr_detect::config::config_dir()
-        .join("agents")
-        .join(format!("{agent}.toml"))
+    crate::fsutil::config_dir().join("agents").join(format!("{agent}.toml"))
 }
 
 /// The adapter for the command whose first word is `argv0` (a path or a bare
@@ -613,7 +339,7 @@ fn override_path(agent: &str) -> PathBuf {
 /// a silent fallback: the user wrote it to change how the agent is driven,
 /// and driving it the default way instead is the surprise to avoid.
 pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
-    match agent_id(argv0) {
+    match crate::herdr::kind_for(argv0) {
         Some(agent) => for_agent(agent),
         None => Ok(Adapter::default()),
     }
@@ -621,30 +347,26 @@ pub(crate) fn for_command(argv0: &str) -> Result<Adapter, String> {
 
 /// What seagents can do with an agent started as `argv0`, as `status --json`
 /// reports it so a caller driving a mixed fleet knows — derived from the
-/// adapter, never stored: `state` (the detector knows the agent), `wait`
-/// (always: exit and gates need nothing from the agent), `turns` (an exact
-/// turn ledger, from hooks), `spawn` (a seed prompt can go on its command
-/// line), `send` (the default submit-when-idle needs a detector to say idle;
-/// any agent takes `send --now`), `stop` (always: signals need nothing from
-/// the agent), `read` (a transcript parser, and a way to learn which file the
-/// agent writes).
+/// adapter, never stored: `state`, `send`, `spawn` and `stop` (herdr starts,
+/// reads and drives every kind it knows), `wait` (always: exit and dialogs
+/// need nothing from the agent), `turns` (an exact turn ledger, from hooks),
+/// `read` (a transcript parser, and a way to learn which file the agent
+/// writes).
 pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
+    let known = crate::herdr::kind_for(argv0).is_some();
     let Ok(adapter) = for_command(argv0) else {
         return vec!["wait", "stop"];
     };
     let mut caps = Vec::new();
-    if agent_id(argv0).is_some() {
+    if known {
         caps.push("state");
     }
     caps.push("wait");
     if adapter.launch.turns == Turns::Hook && adapter.hooks.inject != Inject::None {
         caps.push("turns");
     }
-    if !adapter.launch.seed_prompt.is_empty() {
-        caps.push("spawn");
-    }
-    if agent_id(argv0).is_some() {
-        caps.push("send");
+    if known {
+        caps.extend(["spawn", "send"]);
     }
     caps.push("stop");
     if adapter.read.transcript.is_some() && adapter.launch.identity != Identity::None {
@@ -653,14 +375,7 @@ pub(crate) fn capabilities(argv0: &str) -> Vec<&'static str> {
     caps
 }
 
-/// The agent id for the command whose first word is `argv0` — the key of its
-/// adapter, detection manifest and transcript parser. None for a command no
-/// detection manifest knows.
-pub(crate) fn agent_id(argv0: &str) -> Option<&'static str> {
-    crate::vendor::herdr_detect::identify_agent(argv0).map(crate::vendor::herdr_detect::agent_label)
-}
-
-/// The adapter for agent id `agent` (as `agent_label` spells it).
+/// The adapter for herdr agent kind `agent`.
 pub(crate) fn for_agent(agent: &str) -> Result<Adapter, String> {
     let path = override_path(agent);
     match std::fs::read_to_string(&path) {

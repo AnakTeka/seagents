@@ -4,6 +4,22 @@ Design spec for `seagents spawn` / `wait` / `send` / `stop` / `read`: the abilit
 for you (or one running agent) to **launch, wait on, drive, and inspect other
 coding agents** that seagents itself started.
 
+> **Partly superseded (2026-10-12) by [`HERDR-BACKEND-SPEC.md`](./HERDR-BACKEND-SPEC.md).**
+> Agents now run in a herdr server and seagents drives them through herdr's
+> CLI: there is no pty wrapper, no control socket and **no lineage**. These
+> sections describe what was built before and no longer hold: *Threat model*,
+> *Tags and lineage* (tags remain, now `[a-z][a-z0-9_-]{0,31}`; lineage and
+> its ancestry rule are gone), *Fan-out caps*, *Permission mode: a child never
+> outranks its parent*, *Seeding lives in `run`* (a seed now goes in once the
+> agent is idle, by reference), *Control channel*, *Sharing the master
+> writer*, *Injection framing* (herdr frames), *The gate verdict has one
+> source* (herdr's verdict, plus the adapter's `[screen] dialogs`), the
+> socket and lineage parts of `seagents stop` and of *Safety*, and the
+> vendored-detection parts throughout. The turn ledger, `wait`'s reasons,
+> submit-when-idle, the input-box check, prompts by reference and `read` still
+> hold as written, with the mechanism changes recorded in `HANDOFF.md`, which
+> is the single source of truth for what is built.
+
 Status: **implemented** (Phases 0–5) on branch `refactor/phase0`, as of
 2026-09-29 (HEAD `c3d3ae8`). Written 2026-08-31, revised 2026-09-05,
 adversarially revised 2026-09-28, **brought in line with the code 2026-09-29**

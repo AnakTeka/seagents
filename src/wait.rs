@@ -11,6 +11,9 @@
 //! — which matters, because the caller is usually an agent whose shell tool
 //! kills long commands.
 //!
+//! Whether the agent is at a dialog is herdr's to say (asked at most once a
+//! second); whether it has exited, the registry's.
+//!
 //! `wait` only reads: it never acknowledges `done` (a human still sees 🔵
 //! after an agent has waited on it) and never writes `.state`.
 
@@ -21,6 +24,9 @@ use crate::registry::{self, AgentRecord, Found, StateRecord};
 use crate::turn::Ledger;
 
 const POLL: Duration = Duration::from_millis(250);
+
+/// How often herdr is asked whether the agent sits at a dialog.
+const HERDR_POLL: Duration = Duration::from_secs(1);
 
 /// What to wait for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -85,7 +91,8 @@ impl Reason {
 /// One look at the agent.
 struct Seen<'a> {
     agent: &'a AgentRecord,
-    state: Option<&'a StateRecord>,
+    /// herdr reads it as waiting at a dialog.
+    blocked: bool,
     alive: bool,
     in_turn: bool,
     /// `hook::health`: false when the agent's hooks are silent.
@@ -115,7 +122,7 @@ fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
     if !seen.alive {
         return Some(Reason::Exit);
     }
-    if seen.state.is_some_and(|s| s.state == "blocked") {
+    if seen.blocked {
         return Some(Reason::Blocked);
     }
     if !seen.hooks_ok {
@@ -128,20 +135,25 @@ fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
     (opened && !seen.in_turn).then_some(Reason::Interrupted)
 }
 
-/// The state to report. `.state` is re-stamped by the wrapper's monitor
-/// every 2 s at most, while the hook ledger `wait` returns on is exact, so at
-/// the moment a turn ends `.state` still says `working`. For hook adapters
-/// the ledger decides working-or-not (as `status` fuses it): a gate still
-/// shows as `blocked`, a turn as `working`, and a stale `working` outside a
-/// turn as `idle`, which the screen will say too within a tick.
-fn state_word(turns: Turns, state: Option<&StateRecord>, in_turn: bool) -> Option<&str> {
+/// The state to report. `.state` is re-stamped by `run`'s monitor every 2 s
+/// at most, while the hook ledger `wait` returns on is exact, so at the
+/// moment a turn ends `.state` still says `working`. For hook adapters the
+/// ledger decides working-or-not (as `status` fuses it): a dialog still shows
+/// as `blocked`, a turn as `working`, and a stale `working` outside a turn as
+/// `idle`, which the screen will say too within a tick.
+fn state_word(turns: Turns, state: Option<&StateRecord>, blocked: bool, in_turn: bool) -> Option<&str> {
+    if blocked {
+        return Some("blocked");
+    }
     let word = state.map(|s| s.state.as_str());
-    if turns != Turns::Hook || word == Some("blocked") {
-        return word;
+    if turns != Turns::Hook {
+        // A `blocked` herdr no longer reads is stale: not known yet.
+        return word.filter(|w| *w != "blocked");
     }
     match (in_turn, word) {
         (true, _) => Some("working"),
-        (false, Some("working")) => Some("idle"),
+        // Stale: the dialog was answered, or the turn ended, a tick ago.
+        (false, Some("working" | "blocked")) => Some("idle"),
         (false, w) => w,
     }
 }
@@ -185,71 +197,95 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
         Found::Exited(t) => (t.tag.clone(), t.agent.clone()),
     };
     let ledger = Ledger::for_command(&command);
+    // Whether herdr sees the agent at a dialog, and its rule: asked at most
+    // every HERDR_POLL.
+    let mut gate: (Option<Instant>, Option<String>, bool) = (None, None, false);
+    let mut herdr_gate = |s: &registry::Session| -> (bool, Option<String>) {
+        if gate.0.is_none_or(|t| t.elapsed() >= HERDR_POLL) {
+            let agent = crate::herdr::agent_on(&s.meta.key).ok().flatten();
+            let (blocked, rule) = match crate::status::agent_status(agent.as_ref(), s.meta.agent()) {
+                Some((crate::herdr::Status::Blocked, rule)) => (true, rule),
+                _ => (false, None),
+            };
+            gate = (Some(Instant::now()), rule, blocked);
+        }
+        (gate.2, gate.1.clone())
+    };
     // A gone agent has no screen and no turn: its ledger is final, and all
     // that is left to say is how its last turn ended, or that it exited.
-    let look = || match &found {
-        Found::Session(s) if crate::procfs::alive(s.child_pid()) => {
+    let mut look = || match &found {
+        Found::Session(s) if s.alive_now() => {
             let agent = registry::read_agent(&s.files);
             let state = registry::read_state(&s.files);
-            let in_turn = ledger.in_turn(&agent, state.as_ref(), &s.files);
-            // Read again: the monitor and the control thread record when the
-            // agent was first prompted.
+            let in_turn = ledger.in_turn(&agent, state.as_ref());
+            // Read again: `run` and `send` record when the agent was first
+            // prompted.
             let meta = registry::read_meta(&s.files).unwrap_or_else(|| s.meta.clone());
             let hooks_ok = crate::hook::health(&meta, &agent, crate::clock::unix_now()) != Some(false);
-            (agent, state, true, in_turn, hooks_ok)
+            let (blocked, rule) = herdr_gate(s);
+            Look { agent, state, blocked, rule, alive: true, in_turn, hooks_ok }
         }
-        Found::Session(s) => (registry::final_agent(s), None, false, false, true),
-        Found::Exited(t) => (t.ledger(), None, false, false, true),
+        Found::Session(s) => Look::gone(registry::final_agent(s)),
+        Found::Exited(t) => Look::gone(t.ledger()),
     };
 
-    let (agent, state, alive, in_turn, hooks_ok) = look();
+    let first = look();
     let after = match (what, after) {
-        (For::Turn, Some(n)) if n > agent.stops => {
+        (For::Turn, Some(n)) if n > first.agent.stops => {
             eprintln!(
                 "seagents wait: --after {n} is ahead of {tag}'s ledger (stops = {}); a restored agent \
                  starts again at 0 — wait without --after",
-                agent.stops
+                first.agent.stops
             );
             return 1;
         }
-        (For::Turn, None) => in_turn.then_some(agent.stops),
+        (For::Turn, None) => first.in_turn.then_some(first.agent.stops),
         (_, after) => after,
     };
 
     let deadline = Instant::now() + timeout;
-    let mut seen = (agent, state, alive, in_turn, hooks_ok);
+    let mut seen = first;
     loop {
-        let (agent, state, alive, in_turn, hooks_ok) = &seen;
         let now = Seen {
-            agent,
-            state: state.as_ref(),
-            alive: *alive,
-            in_turn: *in_turn,
-            hooks_ok: *hooks_ok,
+            agent: &seen.agent,
+            blocked: seen.blocked,
+            alive: seen.alive,
+            in_turn: seen.in_turn,
+            hooks_ok: seen.hooks_ok,
         };
-        let reason = decide(what, after, &now)
-            .or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
+        let reason = decide(what, after, &now).or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
         if let Some(reason) = reason {
             let message = match (&found, reason) {
                 (Found::Session(s), Reason::NoHooks) => Some(crate::hook::silence(&s.meta)),
                 _ => None,
             };
-            return report(&tag, reason, &ledger, agent, state.as_ref(), *in_turn, message);
+            return report(&tag, reason, &ledger, &seen, message);
         }
         std::thread::sleep(POLL);
         seen = look();
     }
 }
 
-fn report(
-    tag: &str,
-    reason: Reason,
-    ledger: &Ledger,
-    agent: &AgentRecord,
-    state: Option<&StateRecord>,
+/// Everything one look at the agent found.
+struct Look {
+    agent: AgentRecord,
+    state: Option<StateRecord>,
+    blocked: bool,
+    rule: Option<String>,
+    alive: bool,
     in_turn: bool,
-    message: Option<String>,
-) -> i32 {
+    hooks_ok: bool,
+}
+
+impl Look {
+    /// An agent that is gone: only its ledger is left.
+    fn gone(agent: AgentRecord) -> Look {
+        Look { agent, state: None, blocked: false, rule: None, alive: false, in_turn: false, hooks_ok: true }
+    }
+}
+
+fn report(tag: &str, reason: Reason, ledger: &Ledger, seen: &Look, message: Option<String>) -> i32 {
+    let agent = &seen.agent;
     // Why, in words, where the reason alone doesn't say what to do (also on
     // stderr, for a human).
     if let Some(m) = &message {
@@ -259,8 +295,8 @@ fn report(
         "tag": tag,
         "reason": reason.word(),
         "stops": agent.stops,
-        "state": state_word(ledger.turns, state, in_turn),
-        "rule": state.filter(|s| s.state == "blocked").and_then(|s| s.rule.as_deref()),
+        "state": state_word(ledger.turns, seen.state.as_ref(), seen.blocked, seen.in_turn),
+        "rule": seen.rule.as_deref().filter(|_| seen.blocked),
         "last_message": agent.last_message,
         "transcript_path": agent.transcript_path,
     });

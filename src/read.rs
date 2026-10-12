@@ -144,7 +144,7 @@ fn source(args: &Args) -> Result<Source, String> {
     // while they last, then the tombstone its reap left.
     let (tag, command, cwd, agent, ended) = match registry::resolve_exited(target)? {
         registry::Found::Session(s) => {
-            let alive = crate::procfs::alive(s.child_pid());
+            let alive = s.alive();
             let agent = if alive { registry::read_agent(&s.files) } else { registry::final_agent(&s) };
             (s.meta.tag.clone(), s.meta.agent().to_string(), s.meta.cwd.clone(), agent, !alive)
         }

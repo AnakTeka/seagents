@@ -2,8 +2,9 @@
 # Integration test for `seagents spawn` / `wait` / `send` / `read` / `stop` /
 # `status` / `focus`, with a real Claude Code, inside a nested, isolated desktop
 # (tools/lib-nested-desktop.sh: headless weston, rootful Xwayland on :9, its
-# own i3, HOME at a scratch directory), so no window it opens reaches your
-# session and the real cache is never touched.
+# own i3, HOME at a scratch directory — and so a herdr server of its own), so
+# no window it opens reaches your session, and neither the real cache nor
+# your herdr server is ever touched.
 #
 #   tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon] [--codex]
 #
@@ -70,6 +71,9 @@ for d in "$WORK" "$CODEX_WORK"; do
   for m in .git .codex .agents; do rmdir "$d/$m" 2>/dev/null; done
 done
 CACHE="$HOME/.cache/seagents"
+# The test's own herdr server (HOME is scratch), for a look at what herdr sees.
+herdr_agents() { herdr agent list | python3 -c "
+import json,sys; print(' '.join(sorted(a.get('name') or '' for a in json.load(sys.stdin)['result']['agents'])))"; }
 HAIKU=(--arg --model --arg haiku)
 
 pass() { echo "PASS: $*"; }
@@ -104,15 +108,17 @@ def walk(n):
 walk(json.load(sys.stdin))"
 }
 
-# 1. spawn: a handle back, a window in the nested i3, and the .meta naming it.
+# 1. spawn: a handle back once herdr has the agent up, a window in the nested
+#    i3, the .meta naming it, and herdr's agent list holding it by its tag.
 # `default`, not this machine's bypass: a prompt sent by reference must be
 # readable without a permission prompt, and step 3d needs a real gate.
 out=$(cd "$WORK" && "$SEA" spawn --tag it-a --permission-mode default "${HAIKU[@]}" -- 'Reply with exactly: ALPHA') \
   || fail "spawn exited $?: $out"
-[ "$(echo "$out" | jq_ "d['tag'], d['depth'], d['stops'], d['parent']")" = "it-a 0 0 None" ] \
+[ "$(echo "$out" | jq_ "d['tag'], d['stops'], bool(d['pid']), bool(d['pane_id'])")" = "it-a 0 True True" ] \
   || fail "spawn handle: $out"
-pass "spawn returned the handle ($out)"
-# spawn returns once the child registers; `run` records its window after that.
+herdr_agents | grep -qw it-a || fail "herdr does not list it-a: $(herdr_agents)"
+pass "spawn returned the handle ($out); herdr lists the agent as it-a"
+# spawn returns once the agent has started; `run` records its window after that.
 want="" got=""
 for _ in $(seq 1 40); do
   want=$(window_of it-a); got=$(meta_of it-a | jq_ "d.get('con_id')")
@@ -131,10 +137,10 @@ echo "$out" | jq_ "d['last_message']" | grep -q ALPHA || fail "wait: last_messag
 pass "wait --after 0 returned the turn (rc 0): $out"
 
 # 2a. The agent started clean of the calling session's variables (the
-#     launcher's doing), kept the user's config dir, and so wrote a transcript.
-anchor=$(meta_of it-a | jq_ "d['child_pid']")
-agent=$(cat /proc/$anchor/task/$anchor/children | awk '{print $1}')
-[ -n "$agent" ] || fail "no agent process under the anchor $anchor"
+#     launcher's doing, and the herdr server's it started), kept the user's
+#     config dir, and so wrote a transcript.
+agent=$(meta_of it-a | jq_ "d['pid']")
+[ -d "/proc/$agent" ] || fail "no agent process $agent"
 leaked=$(tr '\0' '\n' < /proc/$agent/environ | cut -d= -f1 | grep -xF "$(echo $SESSION_VARS | tr ' ' '\n')")
 [ -z "$leaked" ] || fail "the agent (pid $agent) inherited: $leaked"
 [ -z "${CLAUDE_CONFIG_DIR:-}" ] || tr '\0' '\n' < /proc/$agent/environ | grep -qxF "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
@@ -152,11 +158,11 @@ pass "wait with no baseline returns idle at once; --after 1 times out with rc 2"
 
 # 3. status lists it.
 s=$(status_of it-a)
-[ "$(echo "$s" | jq_ "d['tag'], d['depth'], d['stops'], d['in_turn'], d['parent']")" = "it-a 0 1 False None" ] \
+[ "$(echo "$s" | jq_ "d['tag'], d['stops'], d['in_turn']")" = "it-a 1 False" ] \
   || fail "status: $s"
 echo "$s" | jq_ "' '.join(d['capabilities'])" | grep -q "turns" || fail "capabilities: $s"
 echo "$s" | jq_ "' '.join(d['capabilities'])" | grep -q "send stop" || fail "capabilities: $s"
-pass "status --json lists it-a: tag, depth 0, stops 1, capabilities $(echo "$s" | jq_ "d['capabilities']")"
+pass "status --json lists it-a: tag, stops 1, capabilities $(echo "$s" | jq_ "d['capabilities']")"
 
 # 3b. send: a follow-up into the idle agent returns the baseline, and the next
 #     turn is its answer.
@@ -171,12 +177,12 @@ pass "send returned stops 1, paired; wait --after 1 got BRAVO"
 # agent's cwd, which it is told in one line to read — so it is carried out.
 printf 'First line with "double" and '"'"'single'"'"' quotes,\n  an indented $HOME `line`,\n\nand after a blank: reply with exactly: CHARLIE' \
   > "$ROOT/body.txt"
-wpid=$(meta_of it-a | jq_ "d['wrapper_pid']")
+key=$(meta_of it-a | jq_ "d['key']")
 out=$("$SEA" send it-a --prompt-file "$ROOT/body.txt"); rc=$?
 [ $rc -eq 0 ] || fail "multi-line send: rc=$rc $out"
 out=$("$SEA" wait it-a --after 2 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q CHARLIE || fail "multi-line wait: rc=$rc $out"
-pfile=$(ls "$WORK/.seagents/prompts/$wpid-2-"*.md 2>/dev/null)
+pfile=$(ls "$WORK/.seagents/prompts/$key-2-"*.md 2>/dev/null)
 [ -n "$pfile" ] && cmp -s "$pfile" "$ROOT/body.txt" || fail "the prompt file ($pfile) is not the body byte for byte"
 [ "$(stat -c %a "$pfile")" = 600 ] || fail "the prompt file is not 0600"
 echo "$out" | python3 -c "
@@ -185,7 +191,7 @@ d=json.load(sys.stdin)
 users=[json.loads(l) for l in open(d['transcript_path'])]
 texts=[r['message']['content'] for r in users if r.get('type')=='user' and isinstance(r.get('message',{}).get('content'),str)]
 want='Read the file .seagents/prompts/$(basename "$pfile") (relative to your working directory)'
-sys.exit(0 if any(t.startswith(want) and 'by the user.' in t and 'pasted_content' not in t for t in texts) else 1)" \
+sys.exit(0 if any(t.startswith(want) and 'through seagents.' in t and 'pasted_content' not in t for t in texts) else 1)" \
   || fail "the transcript lacks the one-line reference to $pfile"
 pass "a 4-line body with quotes went by reference ($(basename "$pfile"), byte for byte, 0600) and was carried out: CHARLIE"
 
@@ -213,12 +219,14 @@ out=$("$SEA" wait it-a --after 4 --timeout 90s); rc=$?
 rule=$(echo "$out" | jq_ "d['rule']")
 out=$("$SEA" send it-a 'never'); rc=$?
 [ $rc -eq 3 ] || fail "a plain send into the gate: rc=$rc $out"
-out=$("$SEA" send it-a --answer-permission --keys 1 --no-submit); rc=$?
+out=$("$SEA" send it-a --keys 1); rc=$?
+[ $rc -eq 3 ] || fail "keys into the gate without --answer-permission: rc=$rc $out"
+out=$("$SEA" send it-a --answer-permission --keys 1); rc=$?
 [ $rc -eq 0 ] || fail "answering the gate: rc=$rc $out"
 out=$("$SEA" wait it-a --after 4 --timeout 90s); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q GATED || fail "wait right after the answer: rc=$rc $out"
 [ -e "$WORK/gate-ok.txt" ] || fail "the gated command never ran"
-pass "wait stopped at the gate ($rule, rc 3), a plain send was refused (rc 3); answered with --keys 1, an immediate wait returned the turn: GATED"
+pass "wait stopped at the gate ($rule, rc 3), a plain send and bare --keys were refused (rc 3); answered with --answer-permission --keys 1, an immediate wait returned the turn: GATED"
 
 # 3e. read: the conversation so far as NDJSON — every answer, the gated Bash
 #     call, the by-reference prompt as the user's line, a cursor last — and,
@@ -268,7 +276,7 @@ pass "read --json: all five answers, the gated Bash call, the by-reference line,
 tp=$("$SEA" status --json | python3 -c "import json,sys; print(next(d['transcript_path'] for d in json.load(sys.stdin) if d['tag']=='it-a'))")
 marks=$(grep -c 'Request interrupted by user' "$tp")
 out=$("$SEA" send it-a 'Write a 300 word essay about rivers'); n=$(echo "$out" | jq_ "d['stops']")
-"$SEA" send it-a --now --keys '\e' --no-submit > /dev/null || fail "sending Esc"
+"$SEA" send it-a --now --keys esc > /dev/null || fail "sending Esc"
 out=$("$SEA" wait it-a --after "$n" --timeout 60s); rc=$?
 [ $rc -eq 5 ] && [ "$(echo "$out" | jq_ "d['reason'], d['stops']")" = "interrupted $n" ] || fail "wait on a dropped prompt: rc=$rc $out"
 [ "$(status_of it-a | jq_ "d['in_turn']")" = False ] || fail "still in a turn after the drop: $(status_of it-a)"
@@ -289,83 +297,14 @@ pass "the next send cleared the input box first: its prompt arrived alone, answe
 
 # 3g. A draft someone typed (not a prompt seagents sent) is refused, --now
 #     or not: the human is typing.
-"$SEA" send it-a --now --keys 'half a thought' --no-submit > /dev/null || fail "typing a draft"
+"$SEA" send it-a --now --no-submit 'half a thought' > /dev/null || fail "typing a draft"
 sleep 1
 out=$("$SEA" send it-a 'never'); rc=$?
 [ $rc -eq 6 ] && [ "$(echo "$out" | jq_ "d['reason']")" = draft ] || fail "send over a draft: rc=$rc $out"
 out=$("$SEA" send it-a --now 'never'); rc=$?
 [ $rc -eq 6 ] || fail "send --now over a draft: rc=$rc $out"
-for _ in 1 2 3; do "$SEA" send it-a --now --keys '\x15' --no-submit > /dev/null; done
+"$SEA" send it-a --now --keys 'ctrl+u ctrl+u ctrl+u' > /dev/null
 pass "a send into a human's draft was refused (rc 6, draft), --now too: $(echo "$out" | jq_ "d['error']")"
-
-# 4. Lineage: a spawn run under a wrapper is that wrapper's child, capped, and
-#    (its parent reporting no mode) launched at the least privileged mode.
-#    The caps are the user's config file's — here one child per parent —
-#    and the environment can't lift them; a hand-typed `run --parent` is
-#    held to them too. And a caller that connects to a socket, forks and
-#    exits (its child sending) is refused as unidentifiable, not taken for a
-#    human (it once stopped any agent that way).
-mkdir -p "$HOME/.config/seagents"
-printf '[spawn]\nmax_children = 1\n' > "$HOME/.config/seagents/config.toml"
-ITA_SOCK="$XDG_RUNTIME_DIR/seagents/$(meta_of it-a | jq_ "d['wrapper_pid']").sock"
-[ -S "$ITA_SOCK" ] || fail "it-a's socket is not at $ITA_SOCK"
-cat > "$ROOT/forkstop.py" <<'PY'
-import os, socket, sys, time
-s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
-if os.fork():
-    os._exit(0)          # the connecting process exits (and is reaped)
-time.sleep(0.5)
-s.sendall(b'{"op":"stop","force":true}\n')
-open(sys.argv[2], "w").write(s.makefile().readline())
-PY
-"$SEA" run --tag boss -- sh -c "
-  cd '$WORK'
-  seagents spawn --tag kid ${HAIKU[*]} -- 'Reply with exactly: KID' > '$ROOT/kid.json' 2> '$ROOT/kid.err'
-  seagents spawn --tag bad --arg --dangerously-skip-permissions -- 'never' > /dev/null 2> '$ROOT/bad.err'
-  echo \$? > '$ROOT/bad.rc'
-  SEAGENTS_MAX_CHILDREN=9 SEAGENTS_MAX_SPAWNED=99 seagents spawn --tag kid2 -- 'never' > /dev/null 2> '$ROOT/kid2.err'
-  echo \$? > '$ROOT/kid2.rc'
-  seagents run --tag kid3 --parent boss -- true > /dev/null 2> '$ROOT/kid3.err'
-  echo \$? > '$ROOT/kid3.rc'
-  python3 '$ROOT/forkstop.py' '$ITA_SOCK' '$ROOT/forkstop.json'
-  seagents wait kid --after 0 --timeout 90s > /dev/null
-  seagents send kid 'Reply with exactly: KIDTWO' > '$ROOT/kidsend.json' 2>&1
-  echo \$? > '$ROOT/kidsend.rc'
-  seagents send it-a 'never' > '$ROOT/stranger.json' 2>&1
-  echo \$? > '$ROOT/stranger.rc'
-  seagents stop kid > '$ROOT/kidstop.json' 2>&1
-  echo \$? > '$ROOT/kidstop.rc'
-  sleep 60" < /dev/null > /dev/null 2>&1 &
-ND_PIDS="$ND_PIDS $!"
-for _ in $(seq 1 60); do [ -s "$ROOT/forkstop.json" ] && break; sleep 0.25; done
-[ "$(jq_ "d['tag'], d['parent'], d['depth']" < "$ROOT/kid.json" 2>/dev/null)" = "kid boss 1" ] \
-  || fail "lineage: $(cat "$ROOT/kid.json" "$ROOT/kid.err")"
-meta_of kid | jq_ "d['argv']" | grep -q "'--permission-mode', 'plan'" \
-  || fail "kid's mode: $(meta_of kid | jq_ "d['argv']")"
-[ "$(cat "$ROOT/kid2.rc")" = 1 ] && grep -q "kid" "$ROOT/kid2.err" && grep -q "max_children" "$ROOT/kid2.err" \
-  || fail "breadth cap: rc=$(cat "$ROOT/kid2.rc") $(cat "$ROOT/kid2.err")"
-pass "spawn under a wrapper records parent boss, depth 1, mode plan; a second child past the configured cap is refused, SEAGENTS_MAX_* set or not: $(cat "$ROOT/kid2.err")"
-[ "$(cat "$ROOT/kid3.rc")" = 2 ] && grep -q "max_children" "$ROOT/kid3.err" \
-  || fail "run --parent past the cap: rc=$(cat "$ROOT/kid3.rc") $(cat "$ROOT/kid3.err")"
-pass "run --parent boss past the cap is refused too (rc 2): $(cat "$ROOT/kid3.err")"
-grep -q '"forbidden"' "$ROOT/forkstop.json" && grep -q "caller identity unknown" "$ROOT/forkstop.json" \
-  && "$SEA" status --json | grep -q '"tag": *"it-a"' \
-  || fail "connect, fork, exit, then stop --force: $(cat "$ROOT/forkstop.json")"
-pass "a stop --force from a peer that exited after connecting was refused, it-a lives: $(cat "$ROOT/forkstop.json")"
-[ "$(cat "$ROOT/bad.rc")" = 1 ] && grep -q -- "--dangerously-skip-permissions" "$ROOT/bad.err" \
-  && [ ! -e "$CACHE/bad.pending" ] && ! "$SEA" status --json | grep -q '"tag": *"bad"' \
-  || fail "a privileged --arg from an agent: rc=$(cat "$ROOT/bad.rc") $(cat "$ROOT/bad.err")"
-pass "an agent's spawn --arg --dangerously-skip-permissions was refused before any window: $(cat "$ROOT/bad.err")"
-
-# 4b. The lineage rule in the wrapper: boss may send to and stop its child,
-#     not an agent it did not spawn.
-for _ in $(seq 1 480); do [ -s "$ROOT/kidstop.rc" ] && break; sleep 0.25; done
-[ "$(cat "$ROOT/kidsend.rc" 2>/dev/null)" = 0 ] || fail "boss → kid send: $(cat "$ROOT/kidsend.json")"
-[ "$(cat "$ROOT/stranger.rc" 2>/dev/null)" = 5 ] && grep -q '"forbidden"' "$ROOT/stranger.json" \
-  || fail "boss → it-a should be forbidden: rc=$(cat "$ROOT/stranger.rc") $(cat "$ROOT/stranger.json")"
-[ "$(cat "$ROOT/kidstop.rc" 2>/dev/null)" = 0 ] || fail "boss → kid stop: $(cat "$ROOT/kidstop.json")"
-pass "boss sent to and stopped its child kid; sending to it-a was forbidden (rc 5)"
-rm -f "$HOME/.config/seagents/config.toml"
 
 # 5. focus.
 "$SEA" focus it-a || fail "focus exited $?"
@@ -380,9 +319,10 @@ walk(json.load(sys.stdin))")
 pass "focus it-a focused con_id $got"
 
 # 5b. A gate before any turn: Claude in a never-trusted directory opens on
-#     the folder-trust dialog before its first prompt. A plain wait (no
-#     baseline, no turn open) says blocked, as --after would — not idle.
-#     No model call is made; stop takes a gated agent straight to SIGTERM.
+#     the folder-trust dialog before its first prompt (spawn still returns:
+#     the agent is up, waiting there). A plain wait (no baseline, no turn
+#     open) says blocked, as --after would — not idle. No model call is made;
+#     stop takes a gated agent straight to closing its pane.
 UNTRUSTED=$(mktemp -d /tmp/sg-untrusted.XXXXXX)
 (cd "$UNTRUSTED" && "$SEA" spawn --tag it-t "${HAIKU[@]}" -- 'never' > /dev/null) || fail "untrusted spawn"
 for _ in $(seq 1 60); do [ "$(status_of it-t | jq_ "d['state']")" = blocked ] && break; sleep 0.25; done
@@ -393,10 +333,8 @@ rm -rf "$UNTRUSTED"
 pass "a plain wait on an agent at the trust dialog, no turn open, is blocked (rc 3, $(echo "$out" | jq_ "d['rule']"))"
 
 # 6. stop: the agent exits (Claude's /exit), a waiter on its exit (already
-#    waiting, as a caller would be) says so, its control socket is gone, and
-#    the window closes with it — a spawned window keeps no shell behind.
-sock="$XDG_RUNTIME_DIR/seagents/$(meta_of it-a | jq_ "d['wrapper_pid']").sock"
-[ -S "$sock" ] || fail "it-a has no control socket at $sock"
+#    waiting, as a caller would be) says so, its herdr tab is gone, and the
+#    window closes with it — a spawned window keeps no shell behind.
 "$SEA" wait it-a --for exit --timeout 30s > "$ROOT/exit.json" &
 waiter=$!
 sleep 1
@@ -405,11 +343,23 @@ out=$("$SEA" stop it-a); rc=$?
 wait $waiter; rc=$?
 out=$(cat "$ROOT/exit.json")
 [ $rc -eq 4 ] && [ "$(echo "$out" | jq_ "d['reason']")" = exit ] || fail "exit wait: rc=$rc $out"
-[ ! -e "$sock" ] || fail "the control socket outlived the agent"
 for _ in $(seq 1 20); do [ -z "$(window_of it-a)" ] && break; sleep 0.25; done
 [ -z "$(window_of it-a)" ] || fail "it-a's window stayed open after the agent exited"
-[ -z "$(ls "$WORK/.seagents/prompts/$wpid-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
-pass "stop it-a: wait --for exit returned exit (rc 4), the socket and its prompt files are gone, the window closed"
+herdr_agents | grep -qw it-a && fail "herdr still lists it-a"
+herdr pane list | grep -q "\"terminal_id\":\"$key\"" && fail "it-a's herdr pane outlived it"
+[ -z "$(ls "$WORK/.seagents/prompts/$key-"* 2>/dev/null)" ] || fail "it-a's prompt files outlived it"
+pass "stop it-a: wait --for exit returned exit (rc 4), its herdr pane and prompt files are gone, the window closed"
+
+# 6a. Closing the window stops the agent: the window and its agent live and
+#     die together.
+(cd "$WORK" && "$SEA" spawn --tag it-w "${HAIKU[@]}" -- 'Reply with exactly: WINDOW' > /dev/null) || fail "it-w spawn"
+wpid=$(meta_of it-w | jq_ "d['pid']"); wkey=$(meta_of it-w | jq_ "d['key']")
+for _ in $(seq 1 40); do [ -n "$(window_of it-w)" ] && break; sleep 0.25; done
+i3-msg "[con_id=$(window_of it-w)] kill" > /dev/null
+for _ in $(seq 1 40); do [ -d "/proc/$wpid" ] || break; sleep 0.25; done
+[ -d "/proc/$wpid" ] && fail "it-w's agent ($wpid) outlived its window"
+herdr pane list | grep -q "\"terminal_id\":\"$wkey\"" && fail "it-w's herdr pane outlived its window"
+pass "closing it-w's window ended its agent and its herdr pane"
 
 # 6b. After the reap (any status does it), it-a is a tombstone: wait still
 #     answers for it — exit, or the turn it was asked about — and read still
@@ -441,6 +391,8 @@ ln -s "$REAL_CODEX_HOME/auth.json" "$CODEX_HOME/auth.json"
 cat > "$CODEX_HOME/config.toml" <<EOF
 model = "gpt-5.6-luna"
 model_reasoning_effort = "low"
+# An "update available" notice is a dialog that holds the seed back.
+check_for_update_on_startup = false
 
 [projects."$REPO"]
 trust_level = "trusted"
@@ -460,9 +412,8 @@ pass "codex spawned; its hooks reported the seeded turn (CHARLIE) and its rollou
 s=$(status_of it-c)
 [ "$(echo "$s" | jq_ "' '.join(d['capabilities'])")" = "state wait turns spawn send stop read" ] \
   || fail "codex capabilities: $s"
-wpid=$(meta_of it-c | jq_ "d['wrapper_pid']")
-anchor=$(meta_of it-c | jq_ "d['child_pid']")
-agent=$(pgrep -P "$anchor" | head -1)
+key=$(meta_of it-c | jq_ "d['key']")
+agent=$(meta_of it-c | jq_ "d['pid']")
 leaked=$(tr '\0' '\n' < "/proc/$agent/environ" | grep -E '^(CLAUDECODE|CLAUDE_CODE_SESSION_ID|CODEX_THREAD_ID)=' || true)
 [ -z "$leaked" ] || fail "codex (pid $agent) inherited: $leaked"
 pass "status: codex has every capability; it started without the calling session's variables"
@@ -479,9 +430,10 @@ python3 -c "print('\n'.join(['Line %d: filler for the paste test' % i for i in r
 out=$("$SEA" send it-c --prompt-file "$body"); n=$(echo "$out" | jq_ "d['stops']")
 out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q LONGOK || fail "codex long send: rc=$rc $out"
-# The seed's own file (`<wpid>-0-*`, seed_by = "file") is expected; a send
-# must not have added one — Codex takes any paste as the user's words.
-[ -z "$(ls "$CODEX_WORK/.seagents/prompts/$wpid-"* 2>/dev/null | grep -v "/$wpid-0-")" ] \
+# The seed's own file (`<key>-0-*`: seeds always go by reference) is
+# expected; a send must not have added one — Codex takes any paste as the
+# user's words.
+[ -z "$(ls "$CODEX_WORK/.seagents/prompts/$key-"* 2>/dev/null | grep -v "/$key-0-")" ] \
   || fail "a codex paste went by reference"
 pass "a 41-line send was pasted whole (no prompt file) and answered LONGOK"
 
@@ -489,7 +441,7 @@ pass "a 41-line send was pasted whole (no prompt file) and answered LONGOK"
 out=$("$SEA" send it-c 'Run the shell command: sleep 60 && echo done'); n=$(echo "$out" | jq_ "d['stops']")
 for _ in $(seq 1 40); do [ "$(status_of it-c | jq_ "d['state']")" = working ] && break; sleep 0.25; done
 sleep 2
-"$SEA" send it-c --now --keys '\e' --no-submit > /dev/null || fail "codex: sending Esc"
+"$SEA" send it-c --now --keys esc > /dev/null || fail "codex: sending Esc"
 out=$("$SEA" wait it-c --after "$n" --timeout 30s); rc=$?
 [ $rc -eq 5 ] && [ "$(echo "$out" | jq_ "d['reason']")" = interrupted ] || fail "codex Esc: rc=$rc $out"
 out=$("$SEA" send it-c 'Reply with exactly: AFTER'); n=$(echo "$out" | jq_ "d['stops']")
@@ -497,11 +449,11 @@ out=$("$SEA" wait it-c --after "$n" --timeout 2m); rc=$?
 [ $rc -eq 0 ] && echo "$out" | jq_ "d['last_message']" | grep -q AFTER || fail "codex after Esc: rc=$rc $out"
 pass "an Esc'd codex turn is interrupted (rc 5); the next send's wait gets its own turn (AFTER)"
 
-"$SEA" send it-c --now --keys 'half a thought' --no-submit > /dev/null || fail "codex: typing a draft"
+"$SEA" send it-c --now --no-submit 'half a thought' > /dev/null || fail "codex: typing a draft"
 sleep 1
 out=$("$SEA" send it-c 'never'); rc=$?
 [ $rc -eq 6 ] && [ "$(echo "$out" | jq_ "d['reason']")" = draft ] || fail "codex send over a draft: rc=$rc $out"
-for _ in 1 2 3; do "$SEA" send it-c --now --keys '\x15' --no-submit > /dev/null; done
+"$SEA" send it-c --now --keys 'ctrl+u ctrl+u ctrl+u' > /dev/null
 pass "codex: a send into a draft in its composer was refused (rc 6, draft)"
 
 out=$("$SEA" read it-c)
@@ -517,4 +469,27 @@ out=$("$SEA" stop it-c); rc=$?
 wait $waiter; rc=$?
 [ $rc -eq 4 ] || fail "codex exit wait: rc=$rc $(cat "$ROOT/cexit.json")"
 pass "stop it-c: codex exited on /exit (wait --for exit rc 4)"
+
+# 7b. Codex's folder-trust question in a never-trusted directory, which herdr
+#     reads as idle: the adapter's `[screen] dialogs` make it blocked, so the
+#     seed is held back (its Enter would trust the folder), `wait` says
+#     blocked, and `stop` closes the pane rather than type /exit. The scratch
+#     config gains no trust entry for the directory.
+UNTRUSTED=$(mktemp -d /tmp/sg-untrusted.XXXXXX)
+(cd "$UNTRUSTED" && "$SEA" spawn --agent codex --tag it-ct -- 'never' > /dev/null) || fail "codex untrusted spawn"
+for _ in $(seq 1 60); do
+  P=$(status_of it-ct | jq_ "d['pane_id']")
+  herdr pane read "$P" --source visible 2>/dev/null | grep -q 'Do you trust the contents of this directory' && break
+  # An update notice comes first on an outdated Codex: skip it.
+  herdr pane read "$P" --source visible 2>/dev/null | grep -q 'Update available' && "$SEA" send it-ct --answer-permission --keys 2 > /dev/null
+  sleep 0.5
+done
+out=$("$SEA" wait it-ct --timeout 5s); rc=$?
+[ $rc -eq 3 ] && [ "$(echo "$out" | jq_ "d['reason'], d['rule']")" = "blocked seagents_dialog" ] \
+  || fail "wait at codex's trust question: rc=$rc $out"
+cp "$CODEX_HOME/config.toml" "$ROOT/codex-config.before"
+"$SEA" stop it-ct > /dev/null || fail "stopping it-ct"
+cmp -s "$ROOT/codex-config.before" "$CODEX_HOME/config.toml" || fail "stop at codex's trust dialog changed its config: $(diff "$ROOT/codex-config.before" "$CODEX_HOME/config.toml")"
+rm -rf "$UNTRUSTED"
+pass "codex at its folder-trust question reads blocked (seagents_dialog), its seed held back; stop closed the pane; no trust was written"
 exit 0

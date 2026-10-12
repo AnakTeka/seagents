@@ -6,7 +6,11 @@
 # It is a headless weston providing a Wayland socket, a rootful Xwayland on :9
 # as the X server, and its own i3 on its own IPC socket; HOME (and the runtime
 # dir) point at a scratch directory, so the real cache, snapshot and runtime
-# files are never touched.
+# files are never touched — and so does the herdr server the agents run in:
+# herdr keeps its socket under HOME, so the first `seagents run` starts a
+# server of the test's own, never the one you work in. Inherited herdr
+# variables (a test run from inside a herdr pane) are cleared for the same
+# reason.
 #
 #   . "$(dirname "$0")/lib-nested-desktop.sh"
 #   nd_init <terminator|alacritty|alacritty-daemon>   # checks, scratch dirs, env
@@ -36,9 +40,13 @@ nd_init() {
   command -v "$bin" >/dev/null || { echo "$bin not installed"; exit 1; }
   export SEAGENTS_TERMINAL=$TERM_UNDER_TEST
 
-  ROOT=$(mktemp -d /tmp/seagents-nested-test.XXXXXX)
+  # Short: herdr's socket goes under $HOME/.config/herdr, and a UNIX socket
+  # path caps at ~108 bytes.
+  ROOT=$(mktemp -d /tmp/sg-nd.XXXXXX)
   trap nd_cleanup EXIT
   export HOME="$ROOT/home"
+  # These would point herdr — and every seagents command — at another server.
+  unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION HERDR_BIN_PATH
   # seagents derives its config and state dirs from these when set; they would
   # point the run (and its layout.json) back at the real ones.
   unset XDG_STATE_HOME XDG_CONFIG_HOME
@@ -46,6 +54,10 @@ nd_init() {
   export XDG_RUNTIME_DIR="$ROOT/run"
   export SEAGENTS_NO_NOTIFY=1
   mkdir -p "$HOME" "$ROOT/bin"
+  # herdr opens each agent's pane on the user's shell under this HOME, and a
+  # zsh with no .zshrc opens its new-user wizard — which eats the command
+  # herdr types to start the agent.
+  touch "$HOME/.zshrc"
   chmod 700 "$ROOT"; mkdir -m 700 "$XDG_RUNTIME_DIR"
   # Launches a test makes by hand run a bare `seagents` (seagents' own
   # launcher uses its absolute path); make sure it finds the build under test.
@@ -97,10 +109,11 @@ nd_kill_windows() {
   ND_PIDS=""
 }
 
-# Stop whatever still runs with the scratch HOME — an agent that outlived its
-# window, or is still writing its caches on the way out — so nothing recreates
-# files under ROOT after it is removed. By environment, not by name: the
-# processes are seagents wrappers, agents and whatever those run.
+# Stop whatever still runs with the scratch HOME — the test's herdr server, an
+# agent that outlived its window, or one still writing its caches on the way
+# out — so nothing recreates files under ROOT after it is removed. By
+# environment, not by name: the processes are seagents, herdr, agents and
+# whatever those run.
 _nd_reap_stragglers() {
   python3 - "$HOME" <<'PY'
 import os, signal, sys, time
@@ -129,6 +142,7 @@ PY
 
 nd_cleanup() {
   [ -n "$_ND_I3" ] && DISPLAY=$ND_DISP I3SOCK=$ND_SOCK nd_kill_windows
+  herdr server stop >/dev/null 2>&1
   for pid in $_ND_DAEMON $_ND_I3 $_ND_XWAYLAND $_ND_WESTON; do kill "$pid" 2>/dev/null; done
   sleep 1
   for pid in $_ND_DAEMON $_ND_I3 $_ND_XWAYLAND $_ND_WESTON; do kill -9 "$pid" 2>/dev/null; done

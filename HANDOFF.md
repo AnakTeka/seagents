@@ -8,47 +8,55 @@ does not travel between machines.
 
 ## TL;DR — what seagents is
 
-**seagents = "see agents".** A sidecar/observer for coding agents (Claude Code
-today) that run in your *own* i3wm-managed terminal windows. It is **not** a
-terminal multiplexer.
+**seagents = "see agents": the i3 integration for [herdr](https://github.com/ogulcancelik/herdr).**
+Your coding agents (Claude Code, Codex, any agent herdr knows) run inside a
+**herdr server**, which owns their terminals, detects their state, and lets
+any herdr client show and drive them — including `herdr --remote ssh <this
+machine>` from another computer. seagents gives each agent its **own i3
+window** (`seagents run claude` starts the agent in herdr and turns the
+current terminal into a full-window view of it, through `herdr terminal
+attach`), a floating **HUD** of every agent's state (blocked / done /
+working / idle) that jumps to the agent's window, and **orchestration** —
+agents spawning, waiting on, driving and reading other agents.
 
-Contrast with [herdr](https://github.com/ogulcancelik/herdr) (a herd/agent
-multiplexer we studied): herdr *owns* the PTYs — agents run inside herdr's panes.
-seagents does the opposite: you keep running `claude` in your normal Terminator/i3
-windows, and seagents watches them from the side. It shows a floating HUD of every
-agent's status (blocked / done / working / idle) and, on click, focuses that agent's real
-i3 window.
+The core value: **at a glance, see which agent is blocked and waiting on you,
+and jump straight to it** — on this machine, in i3 windows; from any other,
+through herdr.
 
-The core value: **at a glance, see which agent is blocked and waiting on you, and
-jump straight to it.**
+Until 2026-10-12 seagents ran each agent itself, on a pty of its own inside
+the window (a "pty-tee" wrapper), which made the window the only way in:
+nothing could reach an agent from another machine. HERDR-BACKEND-SPEC.md is
+the design of the move to herdr, with every decision and why.
 
 ---
 
 ## Current status
 
-The observer (run / status / focus / HUD / snapshot+restore) is on `main`.
-**Orchestration** — agents driving agents (ORCHESTRATION-SPEC phases 0–5
-and the polish after them) — is complete on the branch `refactor/phase0`,
-not yet merged:
+Built on the branch `feat/herdr-backend` (from `main` after `refactor/phase0`
+was fast-forwarded into it), not yet merged, not yet installed:
 
 | capability | command | state |
 |---|---|---|
-| transparent launcher (pty-tee) | `seagents run <cmd>` | done, verified feels native; tags, lineage, seed prompts |
-| status detection | `seagents status` | done; blocked/working/idle verified live; the hook turn ledger (§6) |
-| focus the agent's i3 window | `seagents focus <target>` | done; exact handles only, con_id focus and healing verified live |
-| floating HUD | `seagents hud` | done; j/k preview + click-to-focus; lineage tree, tags, send/stop keys |
-| reboot survival | `seagents snapshot` / `restore` | done; round-trip verified in a nested X (`tools/test-restore.sh`, all three terminals) |
-| start an agent on a prompt | `seagents spawn` | done (§7): lineage from ancestry, caps from the user's config, permission mode bounded by the parent's |
+| start an agent in herdr, shown in this window | `seagents run <agent>` | done (§1): one workspace per directory, one tab per agent; window and agent live and die together; a detach is undone |
+| status | `seagents status` | done (§3): herdr's detection fused with the hook turn ledger (§6) |
+| focus the agent's i3 window | `seagents focus <target>` | done (§4) |
+| floating HUD | `seagents hud` | done (§5): j/k preview + click-to-focus; tags; send/stop keys |
+| reboot survival | `seagents snapshot` / `restore` | done (§6) |
+| start an agent on a prompt | `seagents spawn` | done (§7) |
 | wait for a turn | `seagents wait` | done (§8): turn / idle / timeout / blocked / exit / interrupted / no_hooks |
-| drive an agent | `seagents send` / `stop` | done (§9): the wrapper's socket, lineage rule, submit-when-idle, input-box check |
-| read the conversation | `seagents read` | done (§10): main line, cursor, index |
-| agents | Claude Code, Codex | both adapters verified live (Claude 2.1.28x, codex-cli 0.152.0) |
+| drive an agent | `seagents send` / `stop` | done (§9): through herdr; submit-when-idle, the input-box check |
+| read the conversation | `seagents read` | done (§10) |
+| agents | Claude Code, Codex | both verified live through herdr 0.9.0 (Claude 2.1.28x, codex-cli 0.152.0) |
 
-Verified end to end by `tools/test-orchestration.sh` (Claude, and `--codex`)
-in a nested desktop. Not built, by decision: the hookless-agent paths
-(`watch` identity, a screen-turn ledger) and seeding by paste — no bundled
-adapter needs them (ORCHESTRATION-SPEC *Phasing*). The agent-facing
-workflow is the skill, `skills/seagents-orchestrate/SKILL.md`.
+Verified end to end in a nested desktop by `tools/test-orchestration.sh
+alacritty --codex` and `tools/test-restore.sh` (all three terminals), and by
+hand against an isolated herdr session (§ Dev workflow). There is no lineage:
+any agent may drive any agent (decided 2026-10-12, HERDR-BACKEND-SPEC). The
+agent-facing workflow is the skill, `skills/seagents-orchestrate/SKILL.md`.
+
+**Installing it.** Agents started by the pre-herdr binary (pty-wrapper
+sessions, `<pid>.*` in the cache) are not seen by this one: restart them
+after installing. Their files are swept once their wrapper exits.
 
 ---
 
@@ -64,17 +72,27 @@ cargo build --release
 install -Dm755 target/release/seagents ~/.local/bin/seagents   # ensure ~/.local/bin is on PATH
 ```
 
-Runtime deps on the machine: **i3wm**, **i3-msg** (ships with i3), a terminal
-emulator. Everything else is vendored via Cargo. **`xdotool`** is optional but
-worth having: it is what lets a one-process-per-window terminal identify an
-agent's window exactly (§4); without it seagents falls back to the correlation
-paths.
+Runtime deps on the machine: **herdr ≥ 0.9.0** (`~/.local/bin/herdr` or on
+`PATH`), **i3wm**, **i3-msg** (ships with i3), a terminal emulator. seagents
+starts a herdr server when none is running (`herdr::ensure_server`; herdr's
+own CLI does not). **`xdotool`** is optional but worth having: it is what lets
+a one-process-per-window terminal identify an agent's window exactly (§4);
+without it seagents falls back to the correlation paths.
 
 Auto-track every agent by aliasing `claude` (zsh):
 
 ```zsh
 alias claude='seagents run claude'
 ```
+
+The alias also works inside herdr's own panes: herdr starts an agent by typing
+`claude …` into the pane's shell, which the alias turns into `seagents run
+claude`, and `run` inside a herdr pane (`HERDR_ENV=1`) just execs the command
+(§1) — so herdr finds the agent itself in its pane.
+
+From another machine: `herdr --remote ssh <this machine>` shows every agent
+seagents started (workspace = directory, tab = agent) and drives them; the i3
+windows here keep showing them.
 
 Add the HUD keybind + float rule to your i3 config (`~/.config/i3/config`).
 `$mod` is Super on the dev machine; `$mod+o` was free there — pick any free key:
@@ -137,14 +155,15 @@ changes the skill in the same commit.
 
 ```
 seagents [hud]              floating agent HUD (also the default with no args)
-seagents run [--tag T] [--parent P] [--seed-file F] <cmd> [args]
-                           launch an agent, teeing its output (this is how
-                           tracking happens); every agent gets a tag (below)
+seagents run [--tag T] [--seed-file F] <agent> [args]
+                           start the agent in herdr and show it in this
+                           window (this is how tracking happens); every agent
+                           gets a tag (below) (§1)
 seagents spawn [--cwd DIR] [--tag T] [--agent claude] [--permission-mode M]
                [--worktree] [--arg A]... (--prompt-file F | [--] PROMPT)
                            open a new terminal running an agent on a prompt;
-                           prints {"tag","child_pid","wrapper_pid","cwd",
-                           "parent","depth","stops"} (§7)
+                           prints {"tag","pid","pane_id","cwd","stops"} once
+                           herdr has it up (§7)
 seagents wait <target> [--after N] [--for turn|exit] [--timeout DUR]
                            block until the turn after N ends, the agent is
                            blocked, interrupted or gone; prints the outcome
@@ -156,7 +175,7 @@ seagents send <target> [--now] [--keys] [--no-submit] [--answer-permission]
                            the baseline for `wait --after` (§9)
 seagents stop <target> [--force]
                            make the agent exit: its exit command, then
-                           SIGTERM, then SIGKILL (§9)
+                           closing its herdr pane, then SIGKILL (§9)
 seagents read (<target> | --transcript PATH) [--json] [--from CURSOR]
               [--tail N] [--raw]
                            the conversation's main line from the agent's
@@ -166,12 +185,13 @@ seagents status [--json] [--sort=urgency|dir|recent]
                            one-shot table of every tracked agent's state
                            (--json: machine-readable, for eww/widget frontends,
                             incl. each agent's conversation `title`, `tag`,
-                            `parent`, `depth`, and from its hooks `stops`,
-                            `in_turn`, `transcript_path`, `session_id`,
-                            `hooks_ok` (null: no hooks; false: silent), and
-                            `capabilities` derived from its adapter;
-                            sorts: urgency = triage, longest-waiting first;
-                            dir = grouped by cwd; recent = latest change first)
+                            `pid`, `pane_id`, `herdr_state`, and from its
+                            hooks `stops`, `in_turn`, `transcript_path`,
+                            `session_id`, `hooks_ok` (null: no hooks; false:
+                            silent), and `capabilities` derived from its
+                            adapter; sorts: urgency = triage, longest-waiting
+                            first; dir = grouped by cwd; recent = latest
+                            change first)
 seagents focus <target>    focus that agent's i3 window (target: `tag`,
                            `@tag`, or the `pid` status --json reports)
 seagents snapshot [--print]
@@ -180,19 +200,14 @@ seagents snapshot [--print]
 seagents restore [--dry-run] [--stagger=N] [--workspace=NAME]
                            rebuild that layout after a reboot, each window
                            resuming its own conversation
-seagents update-manifests  fetch fresh detection rules from herdr.dev now
-seagents debug-screen <FILE> [COLS] [ROWS] [--agent A] [--json]
-                           dev tool: render a .raw + the engine's explain verdict
 ```
 
 `seagents --help` and `seagents <command> --help` are generated from the clap
 definition in `main.rs`, so they are the authoritative reference. Every flag
 takes both `--flag value` and `--flag=value`. `run` passes everything after
 the agent's first word through untouched (`seagents run claude --model opus
---help` hands `--help` to claude); `--tag`/`--parent` are only `run`'s own
-when they come before the command. Usage errors exit 2. `debug-screen` used to guess which
-argument was the file and which were the geometry (any number was a
-dimension); since the move to clap it is strictly file, then cols, then rows.
+--help` hands `--help` to claude); `--tag` is only `run`'s own when it comes
+before the command. Usage errors exit 2.
 
 HUD keys: `j`/`k` or arrows = navigate + **preview** (reveal the agent window,
 keep focus on HUD); `g`/`G` = first/last row (vim-style, also previews);
@@ -213,6 +228,10 @@ says `▼ n more` — otherwise `q / esc` would silently fall off the end. The s
 line and the stop confirmation own the keyboard the same way (`q` there is a
 letter).
 
+In an agent's window, **Ctrl+B is herdr's attach prefix** (fixed in herdr
+0.9.0): Ctrl+B Ctrl+B sends one Ctrl+B (Claude's "background this command"),
+and Ctrl+B q — herdr's detach — is undone at once (§1).
+
 ---
 
 ## Architecture / how it works
@@ -221,53 +240,50 @@ Source layout under `src/`:
 
 - **`src/main.rs`** — the command line only: the clap-derived `Cli`/`Command`
   and `dispatch()` to the module that owns each command.
-- **`src/wrapper/`** — `seagents run`, the pty-tee wrapper (§1):
-  - `mod.rs` — setup and wiring: `run()` (pty + child, `.meta`, then window
-    identity on a thread, raw mode, thread start, the job-control wait loop),
-    `identify_window()`, `terminal_size()`, `write_meta()`.
-  - `pumps.rs` — the output pump (stdout + tee, with `.raw` rotation), the
-    input pump (with window-identity healing, `input_capture_eligible()`), and
-    the SIGWINCH resize pump.
-  - `monitor.rs` — the self-monitor thread: detection tick, `.state`
-    transitions, `notify_transition()`, the done-ack on focus, the snapshot
-    offer; `Wake`, how input into a gated agent hurries it.
-  - `lead.rs` — `lead()`, the hidden `__lead` job-control anchor.
-  - `control.rs` — the control socket (§9): bind, `SO_PEERCRED`
-    authorization (`authorize()`, the lineage rule), submit-when-idle
-    (`gate()`), the input-box check (`make_room()`: clear a prompt of ours
-    the agent put back, refuse a draft), `stop`'s escalation;
-    `Control::finish()` at exit.
-  - `inject.rs` — the one implementation of writing into the agent
-    (§9): `SharedWriter` (the PTY master's input side, shared by the input
-    pump and the control thread), `ModeScanner`/`PtyModes` (bracketed paste
-    and kitty keyboard flags, watched in the output stream), `deliver()`
-    (pre-send nudge, bracketed paste, delayed Enter encoded for the
-    keyboard protocol), `decode_keys()`.
-- **`src/send.rs`** — `seagents send` / `stop`, the socket's client, and its
-  wire format (`Request`, `Reply`, `Refusal` → exit codes).
+- **`src/herdr.rs`** — **the one place seagents talks to herdr**: every call
+  is the `herdr` CLI (herdr 0.9.0's), its JSON parsed here and nowhere else.
+  `bin()` (`HERDR_BIN_PATH`, `PATH`, `~/.local/bin/herdr`), `kind_for()` (an
+  argv0 → herdr agent kind: the adapter key), `server_running()` /
+  `server_socket()` / `ensure_server()`, `agents()` / `agent_on(terminal)` /
+  `agent_names()`, `panes()` / `pane_of(terminal)` / `tabs()`,
+  `create_workspace()` / `create_tab()` / `rename_tab()`, `start_agent()`,
+  `process_info()`, `attach()`, `prompt()` / `send_text()` / `send_keys()` /
+  `run_line()`, `read()`, `blocked_rule()` (`agent explain`), `close_pane()`.
+  The CLI rather than the socket API because the CLI is the surface herdr
+  keeps stable (it checks the server's protocol itself). Which server is the
+  environment's business, as for any `herdr` command: `HERDR_SOCKET_PATH`,
+  else `HERDR_SESSION`, else the default.
+- **`src/run.rs`** — `seagents run` (§1): the in-pane exec, `place()` (the
+  agent's workspace and tab), `clean_shell()`, the start, `identify_window()`,
+  `attach_loop()` (D1: a detach undone, a takeover respected, a closed window
+  ending the agent), the `monitor()` thread, `deliver_seed()`,
+  `notify_transition()`.
+- **`src/screen.rs`** — what seagents reads off an agent's screen itself, as
+  herdr hands it over: `input_box()` (what the input box holds — dim text is
+  a placeholder, §9) and `shows_any()`.
+- **`src/send.rs`** — `seagents send` / `stop` (§9): `submit()` (the gate,
+  the input-box check `make_room()`, by-reference bodies, the landing wait),
+  `stop_session()`, the `Reply`/`Refusal` → exit codes; `prompt_target()` /
+  `stop_target()` for the HUD.
 - **`src/hook.rs`** — the agent's lifecycle hooks (§6): `inject()` (the one
-  merged hook flag `run` hands a hook-capable agent — Claude's `--settings`
-  JSON, Codex's trusted `-c hooks=…`, per the adapter's `[hooks] inject`) and `run()`,
-  the hidden `__hook` command that records each event in `.agent`.
+  merged hook flag `run` hands a hook-capable agent — Claude's `--settings`,
+  as a file path; Codex's trusted `-c hooks=…` — per the adapter's `[hooks]
+  inject`) and `run()`, the hidden `__hook` command that records each event in
+  `.agent`, finding its session from `HERDR_PANE_ID`/`HERDR_SOCKET_PATH`.
 - **`src/registry.rs`** — the one owner of the session cache (§2): `cache_dir()`,
   sidecar paths (`Files`), the typed `Meta` / `StateRecord` / `AgentRecord`,
-  `Dirs` (the cache and the runtime dir — sockets live in the latter),
-  `list()` (live, never deletes) / `reap()` (deletes the dead, leaving each a
-  `<tag>.exited` tombstone, and sweeps control sockets whose wrapper is dead
-  or not seagents) /
-  `resolve_exited()` + `final_agent()` (an agent that may have exited, for
-  `wait`/`read`) /
-  `by_child_pid()` / `enclosing_session(pid, pinned)` (the session a process runs
-  inside, by `/proc` ancestry — "who is calling"; Ok(None) is a human, Err
-  is unknown), the locked `update_meta()` / `update_state()` / `update_agent()`;
-  tags (`valid_tag()`,
-  `claim_tag()` → `TagClaim::create_meta()`, the only way a `.meta` is born;
-  `claim_spawn()` with its `Caps`; `backfill_tags()`), `runtime_dir()`, and
-  `resolve_target()`, the one resolver every command
-  that addresses an agent uses; a session's prompt files
-  (`write_prompt()` / `remove_prompts()`) and `exclude_seagents()`, the one
-  way `.seagents/` gets into a repo's `info/exclude`. No other module builds a `<pid>.*` path or
-  parses one.
+  `Session::alive()` (the liveness rule), `list()` (live, never deletes) /
+  `reap()` (finishes the dead) / `finish()` (tombstone, then every file of
+  the session) / `resolve_exited()` + `final_agent()` (an agent that may have
+  exited, for `wait`/`read`) / `by_key()` / `by_pane()` (the hook's lookup),
+  the locked `update_meta()` / `update_state()` / `update_agent()`,
+  `send_lock()`; tags (`valid_tag()`, `fold_tag()`, `claim_tag()` →
+  `TagClaim::create_meta()`, the only way a `.meta` is born; `pick_tag()` for
+  `spawn`), `runtime_dir()`, `hooks_file()`, and `resolve_target()`, the one
+  resolver every command that addresses an agent uses; a session's prompt
+  files (`write_prompt()` / `remove_prompts()`) and `exclude_seagents()`, the
+  one way `.seagents/` gets into a repo's `info/exclude`. No other module
+  builds a session path or parses one.
 - **`src/turn.rs`** — `Ledger::in_turn()`, the one definition of "this agent
   is mid-turn" (§6), per adapter: the hook ledger plus the transcript's
   interrupt record and the dropped-turn rule, or the screen for hookless
@@ -281,29 +297,19 @@ Source layout under `src/`:
   `Format::detect` uses for `read --transcript`),
   `index.rs` (the lazy, incrementally extended offset index cached under
   `sessions/`), `mainline.rs` (the tree, the main line, `resume()` for a
-  cursor), `render.rs` (the collapse rules); `interrupted_since()` and `responded_since()` in `mod.rs` are the turn ledger's two questions of it; `Transcript` there ties
-  them together. `Format` names a parser; the adapter's `[read] transcript`
-  picks it.
+  cursor), `render.rs` (the collapse rules); `interrupted_since()` and
+  `responded_since()` in `mod.rs` are the turn ledger's two questions of it;
+  `Transcript` there ties them together. `Format` names a parser; the
+  adapter's `[read] transcript` picks it.
 - **`src/read.rs`** — `seagents read`: the source (a target's reported
   transcript, or `--transcript`), the cursor and its token, continuing
   after one (`rewound`/`reset`), text and NDJSON output.
-- **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then
-  detects), `print()`, `read_session()` (detection), `settle()` (screen fused
-  with the turn ledger), `observe_state()` (the `.state` transition rules), OSC-title parsing (`all_titles`,
-  `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
-- **`src/detect.rs`** — `render()` (vt100), `input_box()` (what the
-  agent's input box holds, §9); `debug_screen()`; the
-  manifest-update helpers (`update_manifests_now()`, the HUD's daily
-  `spawn_manifest_update()`, `manifest_health_warning()`).
-- **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
-  (see its `VENDORED.md`): per-agent TOML rule manifests evaluated by a
-  region/priority engine, self-updating from herdr.dev. This replaced our
-  hand-written `is_blocked()` rules entirely. Where herdr's answer to a rule
-  differs from what seagents needs, `manifest/patches.rs` re-weights that one
-  rule by id as the manifest loads, so the rest keeps updating upstream; for
-  a screen no re-weighting fixes it adds a `seagents_`-prefixed rule (Codex's
-  folder-trust dialog drawn over an update notice, which upstream reads as
-  idle — and `stop`'s `/exit` + Enter then *trusted the folder*).
+- **`src/status.rs`** — `State` enum, `Session`, `collect()` (reaps, then one
+  `herdr agent list`), `print()`, `read_session()`, `agent_status()` (herdr's
+  status corrected for the dialogs herdr misses — the one place anything asks
+  whether an agent waits at a dialog), `settle()` (screen fused with the turn
+  ledger), `observe_state()` (the `.state` transition rules), `track()` (the
+  monitor's pass), `conversation_title()`.
 - **`src/window.rs`** — window identity and focus (§4): `focus()` (the
   `focus` command), `focus_window()` (exact handles: con_id, then X window id,
   with healing), `preview_window()`, `record_window()` (identity capture),
@@ -315,181 +321,236 @@ Source layout under `src/`:
   `WindowMatch` (which X11 property carries it), the per-terminal recipes
   (`terminal()`, `recipe_for_class()`, `matcher_for()`), `spawn_terminal()`,
   `shell_quote()`. `spawn_terminal(&Run)` runs `<abs path of this binary> run
-  --tag <tag> [--parent <p>] [--seed-file <f>] -- <argv>`, so the new
-  window's PATH doesn't matter; `Run::keep_shell` is the one difference
-  between its two callers — `restore` leaves the window at a shell when the
-  agent exits (`; exec "$SHELL"`), `spawn` closes it with the agent. The
-  window starts as a user's shell would: the calling agent's own session
-  variables (every bundled adapter's `[launch] session_env` — Claude's
-  `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, messaging socket and token, … but
-  never `CLAUDE_CONFIG_DIR` or other user config) are removed from the
-  terminal's environment *and* `unset` at the head of its `sh -c` line, since
-  a daemon-hosted window (`alacritty msg`) gets the daemon's environment, not
-  ours. Inherited, they made a Claude started outside tmux never write its
-  transcript (bisected in Phase 2), and the socket/token are that session's
-  alone. seagents sets no per-agent variables of its own.
+  --tag <tag> [--seed-file <f>] -- <argv>`, so the new window's PATH doesn't
+  matter; `Run::keep_shell` is the one difference between its two callers —
+  `restore` leaves the window at a shell when the agent exits (`; exec
+  "$SHELL"`), `spawn` closes it with the agent. The window starts as a user's
+  shell would: the calling agent's own session variables (every bundled
+  adapter's `[launch] session_env` — Claude's `CLAUDECODE`,
+  `CLAUDE_CODE_SESSION_ID`, messaging socket and token, … but never
+  `CLAUDE_CONFIG_DIR` or other user config) and the herdr pane it runs in
+  (`herdr::PANE_ENV`: `HERDR_ENV`, `HERDR_PANE_ID`, … — with them the new
+  window's `run` would take itself for an agent herdr started and exec
+  untracked) are removed from the terminal's environment *and* `unset` at the
+  head of its `sh -c` line, since a daemon-hosted window (`alacritty msg`)
+  gets the daemon's environment, not ours. Inherited, the session variables
+  made a Claude started outside tmux never write its transcript (bisected in
+  Phase 2). The caller's window ids (`window::WINDOW_ENV`: `WINDOWID`,
+  `ALACRITTY_WINDOW_ID`, `TERMINATOR_UUID`) are removed from the terminal's
+  environment too — a terminal that sets none of its own would hand the
+  caller's to `run`, which would take the caller's window for its own — but
+  not `unset` in the new window, where they are already its own.
 - **`src/wait.rs`** — `seagents wait` (§8): `decide()`, the whole reason
-  logic as a pure function over one look at the ledger, `.state` and
-  liveness; `parse_duration()`.
-- **`src/spawn.rs`** — `seagents spawn` (§7): prompt checks, permission-mode
-  resolution (`permission_args()`), caps from the environment, the seed file,
-  `--worktree`, the launch, and the wait for the child's `.meta`.
+  logic as a pure function over one look at the ledger, herdr's dialog
+  verdict and liveness; `parse_duration()`.
+- **`src/spawn.rs`** — `seagents spawn` (§7): prompt checks, `--permission-mode`
+  to argv, the tag, the seed file, `--worktree`, the launch, and the wait for
+  the agent to start.
 - **`src/adapter.rs`** + **`src/adapters/*.toml`** — per-agent orchestration
-  facts as data (ORCHESTRATION-SPEC "agent adapters"): how a seed prompt is
-  passed, the settings flag, the permission modes (in order) and each one's
-  argv, where identity and
-  turns come from, submit delay / pre-send / exit sequence. Keyed by the
-  detection engine's agent id for `argv[0]`; `~/.config/seagents/agents/<agent>.toml`
-  replaces the bundled file whole (an unparseable override is an error, not a
-  silent default — so is one asking for the designed-but-unbuilt `identity =
-  "watch"` / `watch_dir`, which until 2026-09-30 parsed and did nothing);
-  unknown agents get the generic state-only adapter. Bundled:
-  `claude` and `codex` (§11). `run` reads it to decide on hook injection
-  (`[hooks]`: how — `inject = "settings" | "config"` — the flag's spellings,
-  the events, `hookless_flags`; and `identity`/`turns`) and to turn a
-  seed into argv (`Launch::seed_args()`); `restore` reads `[restore]` (the
-  argv that resumes a conversation, and the stale words it replaces);
-  `spawn` reads the mode order,
-  `permission_argv` and, for an agent caller, `privileged`; `capabilities()` is what `status --json` reports per agent
-  (`state`, `wait`, `turns`, `spawn`, `send`, `stop`, `read` as applicable); `send`
-  and `stop` read `[send]` (submit delay, pre-send nudge, exit sequence,
-  when a body goes by reference: `long_prompt`, `inline_max_chars`,
-  `inline_max_lines`, and the input box: `input_glyph`, `input_clear`); `[read] transcript` names the transcript format
-  (`claude`, `codex`) that `read` and the turn ledger's interrupt check parse —
-  `read` is a capability where there is one and a way to learn the path.
+  facts as data (ORCHESTRATION-SPEC "agent adapters"): the settings flag and
+  how it is injected, the permission modes and each one's argv, where identity
+  and turns come from, which variables are the calling agent's session
+  (`session_env`) and which configuration paths the pane is given
+  (`pass_env`), the input box, the exit sequence, the dialogs herdr misses
+  (`[screen] dialogs`). Keyed by the herdr agent kind of `argv[0]`
+  (`herdr::kind_for`); `~/.config/seagents/agents/<agent>.toml` replaces the
+  bundled file whole (an unparseable override is an error, not a silent
+  default — so is one asking for the designed-but-unbuilt `identity =
+  "watch"` / `watch_dir`); other herdr kinds get the generic adapter.
+  Bundled: `claude` and `codex` (§11). `run` reads `[hooks]` (how — `inject =
+  "settings" | "config"` — the flag's spellings, the events,
+  `hookless_flags`; and `identity`/`turns`) and `pass_env`; `restore` reads
+  `[restore]` (the argv that resumes a conversation, and the stale words it
+  replaces); `spawn` reads `permission_argv`; `capabilities()` is what `status
+  --json` reports per agent; `send` reads `[send]` (when a body goes by
+  reference: `long_prompt`, `inline_max_chars`, `inline_max_lines`, and the
+  input box: `input_glyph`, `input_clear` as herdr key names); `stop` reads
+  `[stop] exit_sequence`; `[read] transcript` names the transcript format
+  (`claude`, `codex`) that `read` and the turn ledger's interrupt check parse.
 - **`src/i3.rs`** — the only `i3-msg` caller: `tree()`, `windows()`,
   `focused_node()`, `focus()`, `msg()`, `active_outputs()`, `quote()`.
-- **`src/procfs.rs`** — `/proc` access: `alive()` (the liveness rule),
-  `parent_pid()`, `ancestors()` (the whole chain to init, or None),
-  `Pinned` (a pidfd, and whether it is still alive), `live_pty_size()`.
+- **`src/procfs.rs`** — `/proc` access: `alive()`, `parent_pid()`,
+  `ancestors()` (the whole chain to init, or None), `boot_time()`.
 - **`src/fsutil.rs`** — `write_atomic()`, the one tmp+rename writer every
-  cache and state file goes through (`<path>.<pid>.tmp`, removed on failure):
-  the sidecars and tombstones, the transcript index, the layout.
+  cache and state file goes through (`<path>.<pid>.tmp`, removed on failure);
+  `create_private()`, `private_dir()`, `config_dir()` / `state_dir()` (XDG),
+  `read_tail()`.
 - **`src/clock.rs`** — `unix_now()` (seconds: `.meta`, `.state`, the
   snapshot) and `unix_now_ms()` (the `.agent` turn ledger).
 - **`src/hud.rs`** — the ratatui HUD, event loop, preview-on-navigation.
 - **`src/snapshot.rs`** — the reboot snapshot, layout capture/restore only:
   `capture()` (conversation ids read from each session's `.agent`), layout
-  emission with i3 swallow criteria, `restore_cmd()` (which launches through
-  `launch`).
+  emission with i3 swallow criteria, `fold_tags()`, `restore_cmd()` (which
+  launches through `launch`).
 
-### 1. `seagents run` — the transparent pty-tee launcher
+### 1. `seagents run` — the agent in herdr, shown in this window
 
-Runs `<cmd>` on an *inner* PTY and relays stdin/output byte-for-byte between your
-real terminal and the child, while **tee**-ing a copy of the output stream to a
-file. "pty-teeing" = a T-junction in the terminal stream (like `tee`, named after
-the plumbing fitting): the output flows through to your terminal unchanged *and* a
-copy branches off for status detection. Transparency comes from **relaying, not
-interpreting** — nothing in the hot path changes the stream, so colors, mouse,
-alt-screen, resize (SIGWINCH) all pass through. (The output pump does *look*
-at it, byte by byte, for the handful of mode switches `send` needs —
-`wrapper/inject.rs`, §9 — and forwards every byte untouched.) Uses
-`portable-pty` + `crossterm`.
+`seagents run claude …` in an i3 terminal:
 
-We chose pty-tee over reading the terminal's screen because **you cannot read the
-PTY of a process you didn't spawn** (a kernel isolation, not a missing feature).
-The alternative was kitty's `@ get-text` introspection, rejected because the dev
-machine has no kitty (`TERM=xterm-256color`, Terminator).
+1. **Inside a herdr pane** (`HERDR_ENV=1` and `HERDR_PANE_ID` set) it is not
+   the launcher: it execs the command as it is (same pid, so herdr sees
+   `claude` in its pane). This is the alias case — herdr's `agent start`
+   types `claude …` into the pane's shell — and a `seagents run` typed into a
+   pane of herdr's TUI. A `--seed-file` is then deleted and dropped.
+2. The command must be an agent herdr can start (`herdr::kind_for`: claude,
+   codex, gemini, opencode, … 23 kinds in 0.9.0), else exit 2.
+3. `herdr::ensure_server()`: a herdr server for this environment, started if
+   none is — `herdr server`, detached into its own session, without the
+   calling agent's session variables, the herdr pane variables or the
+   window's id variables (`window::WINDOW_ENV`: a server would hand them all
+   to every pane — a server started from inside an agent gave every pane its
+   `CLAUDECODE` & co.). herdr's CLI does not start a server itself.
+4. The tag is claimed under `tags.lock` (§2), held through the next step.
+5. **`place()`**: the agent's place in herdr is **a tab of its own, labelled
+   with its tag, in the workspace of its launch directory** (decided
+   2026-10-12) — a new workspace, labelled with the directory's name, when no
+   pane is at that cwd. A tab already labelled with the tag, holding one pane
+   and no agent, is taken instead, in any workspace at that cwd: herdr brings
+   tabs back after a server restart (measured: and one that had been closed,
+   too), and `restore` relaunches an agent under its old tag. A new tab's
+   shell is given the adapter's `pass_env` (`CLAUDE_CONFIG_DIR`,
+   `CODEX_HOME`) and `SEAGENTS_DEBUG` from `run`'s environment (`--env`):
+   **the agent runs under the herdr server's environment, not `run`'s.**
+6. Hooks injected (§6) — Claude's merged settings go to
+   `$XDG_RUNTIME_DIR/seagents/hooks-<key>.json` (0600) and are passed as
+   `--settings <path>`, because herdr types the command line into the pane's
+   shell, where inline JSON would show and land in its history; Codex's `-c
+   hooks=…` stays inline. The `.meta` is written **before** the agent starts
+   — its first hook fires before `agent start` returns, and finds its session
+   by it — and before the hook settings file, so whoever finishes the session
+   finds that too.
+7. `starting <tag>…` is printed; `clean_shell()` unsets any calling-session
+   variable the pane's shell already holds (a server someone else started
+   from inside an agent); then, once the pane's foreground is its shell
+   again (herdr refuses `agent start` with `agent_pane_busy` while anything
+   else is — a shell still running its rc files, or that `unset`; its CLI
+   retries only 2 s), `herdr agent start <tag> --kind <kind> --pane <p>
+   --timeout 120000 -- <args>`, retried on `agent_pane_busy` for up to 15 s
+   (verified with an rc file running `sleep 4`). `agent_not_ready` (up, and stopped at a
+   dialog on the way — a folder-trust prompt) counts as started: the window is
+   where it is answered. Any other failure closes the pane, finishes the
+   session and exits 1 with herdr's message. Ctrl+C or the window closing
+   while it starts cancels it. After that, only the window closing (SIGHUP,
+   SIGTERM, or the tty gone) ends the session: Ctrl+C reaches the agent
+   through the raw attach, and in a window that only waits (taken over, below)
+   it does nothing (verified).
+8. The agent's pid (the pane's foreground process group) goes into `.meta`;
+   the window is identified on a thread (§4); the **monitor** thread starts;
+   a seed (from `spawn`) is delivered by its own thread once the agent has
+   read idle for 1.5 s (§7).
+9. **The attach loop** (`attach_loop()`): `herdr terminal attach <terminal
+   id>` as a child, stdio inherited (its stderr piped, to read why it ended).
+   The window shows the agent alone, full-size. Then:
+   - **Window closed** — SIGHUP, or stdin polls as hung up — the agent's pane
+     is closed, which ends the agent: **the window and its agent live and die
+     together** (decided 2026-10-12).
+   - **A detach** (Ctrl+B q; attach exits 0, the window still there) is
+     **undone**: the attach is started again at once (decision D1), so the
+     window never sits empty over a running agent.
+   - **Taken over** by another client (`herdr terminal attach --takeover`;
+     attach exits 1, `terminal attach taken over`): the window says so and
+     waits — it never takes the agent back, and never uses `--takeover`
+     itself. Closing it still ends the agent; Ctrl+C in it does not. herdr's normal remote view
+     (`herdr --remote`) is a different kind of client and takes nothing over
+     (verified 2026-10-12: the laptop window and the PC both showed and drove
+     one agent).
+   - **Attach failing** 3 times within 10 s ends the session with its error.
+   - **The agent exiting** (`/exit`, a crash): the monitor sees its pid gone
+     and closes its pane, the attach ends, `run` exits — back at the shell for
+     a window opened by hand (as before), the window closed for a spawned one.
 
-**Desktop notifications on transitions.** The wrapper's monitor thread fires
-`notify-send` when its agent finishes (working → idle, normal urgency) or
-starts waiting on input (→ blocked, critical urgency) — suppressed while the
-agent's own i3 window is focused (you're already looking at it; tabs sharing
-one window/con_id are all treated as focused). `SEAGENTS_NO_NOTIFY=1`
-disables. herdr does this with OSC 9/99 terminal-native notifications, which
-Terminator/VTE doesn't support — hence notify-send.
+   On the way out `run` closes the pane if it is still there and `finish()`es
+   the session: a tombstone, then every file, its prompt files and its hook
+   settings.
 
-**Job control (Ctrl+Z) is forwarded, not passed through.** The agent does not run
-directly as the inner PTY's session leader: a lone process group in its own
-session is *orphaned*, and the kernel silently discards the SIGTSTP an agent
-raises on Ctrl+Z (this is why suspend "did nothing" before 2026-07-08). Instead
-`run` spawns a hidden anchor (`seagents __lead <cmd>`) as session leader, which
-forks the agent into its own foreground process group — de-orphaned, so Ctrl+Z
-stops it normally. The anchor mirrors the stop upward with `raise(SIGSTOP)`
-(not discardable); the wrapper waits with `WUNTRACED`, has its output pump
-relay whatever the agent printed on its way down (stopping itself freezes the
-pump too — until 2026-09 that race left Claude's "run `fg`" line, or any last
-output, unshown until `fg`, and made `tools/test-jobctl.py` flake), restores the
-outer terminal, and suspends itself, so your shell shows the job as `Stopped`. `fg`
-unwinds the chain: wrapper re-raws + resizes, continues the anchor, anchor
-continues the agent's group and nudges a repaint with SIGWINCH.
+**The monitor** (`run::monitor`, every 2 s): fills in the agent's pid if it
+had none; on the agent's exit closes its pane — and likewise when the
+session's `.meta` has gone from under it (someone finished it); one `herdr agent list` →
+`status::track` (herdr's verdict fused with the ledger, into `.state`, §3);
+desktop notifications on transitions; the done marker cleared when the
+agent's window is focused; the **screen clock** the dropped-turn rule needs
+(§6) — while the agent sits idle in a turn, it hashes the screen (`herdr pane
+read`) and stamps `.state`'s `screen_changed_ms` when it changes; and the
+reboot snapshot offer.
+
+**Desktop notifications on transitions.** The monitor fires `notify-send` when
+its agent finishes (working → idle, normal urgency) or starts waiting on input
+(→ blocked, critical urgency) — suppressed while the agent's own i3 window is
+focused. `SEAGENTS_NO_NOTIFY=1` disables.
+
+**Job control**: Ctrl+Z goes through the attach to the agent, which stops in
+its herdr pane — the pane's shell shows, `fg` there resumes it. While it is
+suspended herdr does not list it as an agent (status `unknown`); its pid is
+alive, so nothing ends. The old wrapper's `__lead` anchor and its job-control
+forwarding are gone with the wrapper.
+
+**A server restart** ends every agent (their terminals were the server's):
+each `run` sees its agent's pid gone and ends. herdr brings the tabs back
+empty; `restore` reuses them (§6).
 
 ### 2. Data model — `~/.cache/seagents/`
 
-**Private.** The cache holds everything each agent put on screen (`.raw`),
-its last message (`.agent`, the tombstones) and where its conversations are,
-so the directory is 0700 and every file in it is created 0600 — the
-sidecars and tombstones (`fsutil::write_atomic`), the tee and its rotation
-tmp, `.pending`, the locks, `hook.log`, and `sessions/` (0700) with its
-indexes. The state dir (`~/.local/state/seagents`: the layout, HUD prefs)
-is 0700 too, its layout and prefs 0600. One helper decides every such
-directory, `fsutil::private_dir`: made 0700, then `lstat`ed — a real
-directory owned by us, a loosened mode tightened (so a cache made 0755 by an
-older binary is fixed by the first command that uses it; its older files
-become 0600 as they are next rewritten). Under `HOME` a symlink or someone
-else's directory is left as the user arranged it; in `/tmp` it is refused.
-With no `HOME` the cache is `/tmp/seagents-<uid>/cache` (inside the checked
-runtime fallback, below; it was a shared `/tmp/seagents` until 2026-09-30),
-and where that is refused, a path nothing can be written under — the agent
-runs untracked rather than tee its screen into another user's directory.
-Until 2026-09-30 all of it was 0755/0644, readable by any local user.
+**Private.** The cache holds the last prompt seagents sent each agent
+(`.meta`), its last message (`.agent`, the tombstones) and where its
+conversations are, so the directory is 0700 and every file in it is created
+0600 — the sidecars and tombstones (`fsutil::write_atomic`), the locks,
+`hook.log`, and `sessions/` (0700) with its indexes. The state dir
+(`~/.local/state/seagents`: the layout, HUD prefs) is 0700 too, its layout
+and prefs 0600. One helper decides every such directory,
+`fsutil::private_dir`: made 0700, then `lstat`ed — a real directory owned by
+us, a loosened mode tightened. Under `HOME` a symlink or someone else's
+directory is left as the user arranged it; in `/tmp` it is refused. With no
+`HOME` the cache is `/tmp/seagents-<uid>/cache` (inside the checked runtime
+fallback, below), and where that is refused, a path nothing can be written
+under.
 
-Per session, keyed by the wrapper's pid:
+Per session, keyed by the **herdr terminal id** of the agent's pane
+(`term_65d9…`): herdr's own name for it, fixed for its life (a pane moved to
+another workspace gets a new pane id; its terminal keeps its id) and unique
+across herdr servers.
 
-- **`<wrapper_pid>.raw`** — the teed output byte stream (for detection);
-  rotated down to its last ~1 MB once it passes 16 MB (via a
-  `<wrapper_pid>.raw.tmp` renamed over it).
-- **`<wrapper_pid>.state`** — last observed state transition
-  (`{"state": "idle", "since": <unix>, "seen": bool}`, plus `"rule"` — the
-  matched detection rule's id, e.g. `live_blocked_form` — while `blocked`,
-  which names the gate for `wait`, and `"screen"` — the detector's own verdict
-  when the ledger overrode it, e.g. `working` with `screen: idle` mid-turn,
-  which the dropped-turn rule reads, §6); powers the
-  "idle for / waiting for" column and the **done** state: the wrapper marks a
-  working→idle completion `seen: false` (shown as 🔵 done, ranked just under
-  blocked) until acknowledged — by a HUD preview/jump of that agent, or by the
-  agent's window gaining focus — which flips it to plain idle without touching
-  the clock. Whoever observes the working→idle edge marks it — the monitor
-  or a reader (the HUD, `status`): for a hook agent the edge is the ledger's
-  `Stop`, which lands between screen changes, and the HUD's 750 ms poll
-  usually sees it before the monitor's 2 s tick; while only the monitor's
-  sighting counted, the HUD won that race and wrote plain idle (a HUD `p`
-  send's finished turn showed idle, not done).
-  **Maintained by the wrapper itself** (a monitor thread re-detects
-  its own agent every 2s — every 100 ms for a second after input reaches it
-  at a gate, §8 — skipping the pass while neither the tee nor `.agent` has
-  changed: a `Stop` need not be followed by output), so
-  durations stay truthful with no HUD open. HUD/status polls also write it
-  whenever their own detection disagrees — the writers race benignly on
-  transitions (both stamp since≈now; each read-decide-write is one locked
-  update, and a transient Unknown never overwrites a known state).
-  Transition-based on purpose: output age can't work because a
-  focused Claude repaints on the terminal's focus-in report, which would
-  reset the clock every time the HUD previews a window.
-- **`<wrapper_pid>.meta`** — JSON identity:
+- **`<key>.meta`** — JSON identity:
   ```json
   {
-    "wrapper_pid": 1437882,
-    "child_pid": 1437883,          // the __lead anchor (agent's parent, same lifetime, same tty)
-    "cwd": "/home/me/.../homelab", // launch cwd = grouping key (like herdr)
-    "argv": ["claude"],
+    "key": "term_65d9c80ddc3621",
+    "pane_id": "w1:p1",            // the pane it started in (its hooks' HERDR_PANE_ID)
+    "socket": "/home/me/.config/herdr/herdr.sock", // the server (its hooks' HERDR_SOCKET_PATH)
+    "run_pid": 305301,             // the `run` holding the window
+    "pid": 305358,                 // the agent (its pane's foreground group); null while starting
+    "kind": "claude",              // herdr agent kind: which adapter
+    "cwd": "/home/me/.../homelab", // launch cwd = grouping key
+    "argv": ["claude", "--model", "haiku"],
     "started": 1783468316,
-    "cols": 212, "rows": 53,        // launch geometry (fallback for rendering)
-    "con_id": 103471613296720,      // i3 window recorded at launch (focus handle)
-    "window_id": 30728026,          // X11 id (survives an i3 restart)
-    "tag": "homelab-3f9a",          // the agent's name (see Tags, below)
-    "parent": null,                 // spawner's tag; depth = its depth + 1
-    "depth": 0,
-    "hooks": true,                  // run handed the agent our hooks (absent: false)
-    "engaged_at": 1783468320        // first prompt given (seed past any gate, or a send)
+    "con_id": 103471613296720,     // i3 window recorded at launch (focus handle)
+    "window_id": 30728026,         // X11 id (survives an i3 restart)
+    "tag": "homelab-3f9a",         // the agent's name, and its herdr agent name
+    "hooks": true,                 // run handed the agent our hooks (absent: false)
+    "engaged_at": 1783468320,      // first prompt given (a seed, or a send)
+    "last_prompt": "…",            // the last prompt seagents submitted (§9)
+    "submitted_ms": 1783468390100  // when (Unix ms): still landing until its hook fires
   }
   ```
   `argv` is the user's command line — never what `run` injected (§6) —
-  because `restore` relaunches from it. Parsed as a typed record with
-  every field but `wrapper_pid` optional, and fields this binary doesn't know
-  carried through untouched — live wrappers outlast a reinstall, so a `.meta`
-  may come from an older or newer seagents than the one reading it.
-- **`<wrapper_pid>.agent`** — what the agent reports about itself, written by
+  because `restore` relaunches from it. Parsed as a typed record with every
+  field optional, and fields this binary doesn't know carried through
+  untouched — a `run` outlasts a reinstall. A `.meta` with no `key` (a
+  pty-wrapper session's `<pid>.meta`) is not a session to this binary.
+- **`<key>.state`** — last observed state transition (`{"state": "idle",
+  "since": <unix>, "seen": bool}`, plus `"rule"` — the dialog's rule id,
+  e.g. `live_blocked_form` — while `blocked`, `"screen"` — herdr's own
+  verdict when the ledger overrode it, e.g. `working` with `screen: idle`
+  mid-turn — and `"screen_changed_ms"`, the monitor's screen clock, §6);
+  powers the "idle for / waiting for" column and the **done** state: a
+  working→idle completion is marked `seen: false` (shown as 🔵 done, ranked
+  just under blocked) until acknowledged — by a HUD preview/jump of that
+  agent, or by the agent's window gaining focus — which flips it to plain
+  idle without touching the clock. Whoever observes the working→idle edge
+  marks it — the monitor or a reader (the HUD, `status`). herdr keeps no
+  time and its own "done"/seen marker is per server and cleared only by
+  `herdr agent focus` (which would move a remote client's view), so both
+  stay seagents'. Transition-based on purpose: output age can't work
+  because a focused Claude repaints on the terminal's focus-in report.
+- **`<key>.agent`** — what the agent reports about itself, written by
   `__hook` from its own lifecycle events (§6); absent for agents without
   hooks:
   ```json
@@ -505,143 +566,122 @@ Per session, keyed by the wrapper's pid:
     "updated": 1783468399870
   }
   ```
-  Its own file because it churns on every prompt and turn end while `.meta`
-  almost never changes.
-- **`<wrapper_pid>.lock`** — empty; `flock`ed around every change to `.meta`,
+- **`<key>.lock`** — empty; `flock`ed around every change to `.meta`,
   `.state` or `.agent`.
+- **`<key>.send.lock`** — held across one whole `send` or `stop`
+  (`registry::send_lock`, §9). Its own file because a `send` waits for a hook
+  that takes `.lock`.
 - **`tags.lock`** — one for the whole cache; see Tags.
-- **`<tag>.exited`** — a tombstone: what `reap` keeps of a session it
-  deletes (`{tag, wrapper_pid, exited_at, agent, cwd, stops, last_message,
-  transcript_path, session_id}`), written before anything is removed, so
-  `wait` and `read` still answer for a child that exited (§8, §10). Not
-  written while a live agent holds the tag; removed when a new agent claims
-  it (`TagClaim::create_meta`) and by `reap` after 24 h.
-  `registry::resolve_exited()` is the resolver that sees them (live, then a
-  dead unreaped session by that tag, then the tombstone) and
+- **`<tag>.exited`** — a tombstone: what `finish()` keeps of a session
+  (`{tag, key, exited_at, agent, cwd, stops, last_message, transcript_path,
+  session_id}`), written before anything is removed, so `wait` and `read`
+  still answer for an agent that exited (§8, §10). Not written while a live
+  agent holds the tag; removed when a new agent claims it and by `reap` after
+  24 h. `registry::resolve_exited()` is the resolver that sees them (live,
+  then a dead unfinished session by that tag, then the tombstone) and
   `registry::final_agent()` the ledger read that falls back to one; `send`,
   `stop` and `focus` use `resolve_target()`, live agents only.
-- **`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md`** — a
-  `send` body too long to paste as the user's words (§9), 0600. Outside the
-  cache, but the session's: named and deleted by `registry`.
+- **`<agent cwd>/.seagents/prompts/<key>-<stops>-<4 hex>.md`** — a body sent
+  by reference (§9) and every seed (§7), 0600. Outside the cache, but the
+  session's: named and deleted by `registry`.
 - **`sessions/<session id>.idx`** — a transcript's offset index (§10),
-  about a conversation rather than a live agent, so never reaped with a
-  session (swept daily instead, §10); a
-  subagent's transcript (not named by a uuid) is keyed by a hash of its
-  path. `registry::sessions_dir()`.
-- **`$XDG_RUNTIME_DIR/seagents/<wrapper_pid>.sock`** — the wrapper's control
-  socket (§9; 0600 in a 0700 dir). Bound once the `.meta` exists; removed
-  by the wrapper on exit and on SIGHUP/SIGTERM, and by `reap()` when no live
-  session owns it (a SIGKILLed wrapper) **and** its pid is dead or provably
-  not seagents (`procfs::runs_seagents`: neither `/proc/<pid>/exe` nor
-  argv[0] is named `seagents…`; unreadable counts as "can't say" and keeps
-  it). The runtime dir is shared by every seagents whatever its `HOME` — a
-  test's scratch one, `sudo -E`, a second profile — so "not in this cache"
-  alone once let such a run delete the user's live agents' sockets.
-  Verified: a wrapper under one scratch `HOME` kept its socket through a
-  `status` under another sharing its runtime dir, and `send` still reached
-  it; a dead pid's socket went. `registry::runtime_dir()` is the one
-  place the directory is decided (the wrapper binding, every client
-  connecting, `spawn`'s seed file): `$XDG_RUNTIME_DIR/seagents` unless that is
-  unset, can't be created, or is too long for a socket path (`sun_path` holds
-  108 bytes with its NUL; room is kept for a 10-digit pid) — then
-  `/tmp/seagents-<uid>`, made 0700 and used only if `lstat` says it is a real
-  directory owned by us (`fsutil::private_dir`, as for the cache: a loosened
-  mode is tightened; a symlink or someone else's directory is refused, and
-  then there is no socket and no `send` —
-  the agent still runs, and `send` says why). Verified with a 119-byte
-  `XDG_RUNTIME_DIR`: the socket went to `/tmp/seagents-1000`, `send` and `stop`
-  worked.
+  about a conversation rather than a live agent, so never removed with a
+  session (swept daily instead, §10). `registry::sessions_dir()`.
+- **`$XDG_RUNTIME_DIR/seagents/`** (`registry::runtime_dir()`; else
+  `/tmp/seagents-<uid>`, used only if `lstat` says it is a real directory
+  owned by us) — `seed-<tag>` (`spawn` → `run`, deleted by `run` first
+  thing) and `hooks-<key>.json` (Claude's merged settings, removed with the
+  session).
+
+**Liveness** (`Session::alive`): the `run` holding the window is alive, and
+so is the agent — or it has no pid yet and started under 180 s ago (`agent
+start` waits up to 120 s). `list()` applies it and never deletes. A caller
+that holds a session across time judges it on the `.meta` as it is now
+(`Session::alive_now`: `wait`, `send`), not the one it resolved — which may
+predate the agent's pid. `reap()` (from `status::collect`, so `status` and
+the HUD) `finish()`es every session **whose `run` is gone**; a session whose
+`run` is alive is never touched, ended agent or not — `run` owns its own
+ending (closes the pane, the window, then finishes). (Reaping on the agent's
+pid alone once deleted the `.meta` of an agent that had just `/exit`ed, from
+under its `run`, while an open HUD reaped every 750 ms: the window stayed on
+a bare shell.) One whose `run` is gone while its agent still runs in herdr (a
+SIGKILLed `run`) has its pane closed first: window and agent die together. It also sweeps orphan sidecars (`term_*.state|agent|lock|send.lock`
+with no `.meta`) and the files of pty-wrapper sessions (`<pid>.*`) once that
+pid is dead.
 
 **Tags.** Every agent has one: its name for every command (`focus reviewer`),
-the window handle `restore` swallows on (`seagents-<tag>`), and the lineage
-key. `run --tag T` asks for one; otherwise `run` mints `<cwd basename>-<4 hex>`.
-Charset `[a-z0-9][a-z0-9-]{0,31}`, never all digits (so a bare target can't be
-mistaken for a pid). `registry::claim_tag()` checks uniqueness among live
-agents under an exclusive `flock` on `tags.lock` and keeps it held — through
-the pty open and the fork — until `TagClaim::create_meta()` has written the
-`.meta`, so two concurrent `run`s cannot both get a name. A malformed or taken
-`--tag`, or a `--parent` that isn't a live agent, exits 2 before anything is
-spawned. Minting also avoids every tag recorded in `layout.json`, so a new
-agent can't take a placeholder a pending restore will want back; a *requested*
-tag may be one of those — that is how `restore` relaunches an agent under its
-old name. `parent`/`depth` are lineage (0 without a parent); `spawn` derives
-them from its caller and caps them (§7).
-
-**Spawn reservations — `<tag>.pending`.** `spawn` and the `run` it launches are
-different processes with a terminal between them, so the tags lock can't be
-held from `spawn`'s check to the child's `.meta`. Instead `claim_spawn()`, under
-the lock, writes `<tag>.pending` (`{tag, parent, spawner}`): other claims treat
-the tag as taken (and count it against the caps), the spawned `run --tag`
-may claim it and deletes it in `create_meta()`, and it lives only as long as
-the spawner's pid (dead ones are swept by the next claim).
+the window handle `restore` swallows on (`seagents-<tag>`), and its **herdr
+agent name** (`herdr agent list` shows it; herdr's rule for names is the
+tag rule). `run --tag T` asks for one; otherwise `run` mints `<cwd
+basename>-<4 hex>`. Charset `[a-z][a-z0-9_-]{0,31}` — a leading letter, which
+herdr requires and which keeps a bare target from reading as a pid; a
+directory whose name starts with anything else mints `d<name>-<hex>`
+(`20260612_doc_parser` → `d20260612-doc-parser-3f2a`, decision D4), and
+`restore` folds a captured tag from before the same way (`fold_tag`, for the
+placeholder and the launch alike). `registry::claim_tag()` checks uniqueness
+— against live agents and herdr's own agent names — under an exclusive `flock`
+on `tags.lock` and keeps it held through `place()` until
+`TagClaim::create_meta()` has written the `.meta`, so two concurrent `run`s
+cannot both get a name (nor both make a workspace for one directory). A
+malformed or taken `--tag` exits 2 before anything is started. Minting also
+avoids every tag recorded in the layout snapshots, so a new agent can't take
+a placeholder a pending restore will want back; a *requested* tag may be one
+of those — that is how `restore` relaunches an agent under its old name.
+`spawn` picks its tag the same way (`pick_tag`), without holding it; the
+window's `run` claims it.
 
 **Every sidecar goes through `registry.rs`**, because each has writers in
-several processes (`.meta`: the wrapper at launch, window healing from its
-input pump *and* from `focus`/the HUD, tag backfill from whichever process runs
-a snapshot capture; `.agent`: each `__hook` the agent runs). Each change is `flock` on `.lock` → read →
-mutate the typed record → write a pid-suffixed tmp file → rename over → unlock;
-readers take no lock. tmp+rename is what stops a reader seeing torn JSON (a row
-vanishing for a tick); only the lock stops two writers dropping each other's
-update (two window heals landing at once, one silently lost).
+several processes (`.meta`: `run`, window healing from `focus`/the HUD, the
+last prompt from `send`; `.agent`: each `__hook` the agent runs). Each change
+is `flock` on `.lock` → read → mutate the typed record → write a
+pid-suffixed tmp file → rename over → unlock; readers take no lock. Nothing
+may write a sidecar once the `.meta` is gone: `update_meta`, `update_agent`
+and `update_state` all check for it first.
 
-Sessions self-reap: `status::collect()` (so `status` and the HUD) calls
-`registry::reap()`, which deletes every file of a session whose child process is
-gone (`/proc/<child_pid>` missing). So the HUD/status only ever show live agents;
-there is no `ended` state. `registry::list()` applies the same liveness rule but
-never deletes — the snapshot capture uses it, from inside wrappers' monitor
-threads, which have no business deleting other sessions.
+### 3. `seagents status` — state
 
-Reap finds sessions by their `.meta`, so nothing may write a sidecar once the
-`.meta` is gone: `update_meta`, `update_agent` and `update_state` all check
-for it first (`update_state` still runs its closure, so an observer gets its
-answer, and writes nothing). Until 2026-09-30 `update_state` did not, and an
-observer that detected an agent just before a reap recreated `<pid>.state`
-and `<pid>.lock` that no reap would ever remove — and that a later wrapper
-given the same pid inherited. `reap` also sweeps such orphans: a `<pid>.state`,
-`.lock`, `.agent`, `.raw` or `.raw.tmp` with no `<pid>.meta`, once that pid is
-dead (a live one may be a wrapper that has opened its tee and not yet written
-its `.meta`) — which also takes the pre-`.meta`-era `.raw` leftovers.
+**herdr detects the state.** It owns each agent's terminal and classifies its
+screen with its per-agent rule manifests (self-updating from herdr.dev,
+maintained upstream); `status::collect()` asks for every agent at once —
+`herdr agent list` — and matches them to sessions by terminal id. herdr's
+`idle`/`done` read as idle (herdr's own done marker is not used, §2),
+`working`, `blocked` (with its rule, from `herdr agent explain --json`,
+fetched only for a blocked agent), `unknown` (also: herdr does not see the
+agent — still starting, or suspended).
 
-### 3. `seagents status` — detection
+**The dialogs herdr misses** (`status::agent_status`, the one place anything
+asks): an adapter's `[screen] dialogs` lists screen text that means the agent
+waits at a dialog herdr does not read as one — Codex's folder-trust question,
+which herdr 0.9.0 reads as idle. While one shows, the agent counts as
+`blocked` (rule `seagents_dialog`) to `status`, `wait`, `send`, the seed and
+`stop` alike: anything typed there answers it, and an Enter there trusts the
+folder (§11). The match (`screen::shows_any`) drops box-drawing characters
+and treats any run of whitespace as one space, so a question drawn in a box,
+wrapped across rows or overdrawn still matches; and a screen that cannot be
+read counts as one — what cannot be checked is not typed into. Costs one
+`herdr pane read` per look at an agent whose adapter lists dialogs.
 
-Classification is **herdr's manifest engine, vendored** at
-`src/vendor/herdr_detect/` (from herdr v0.7.3; AGPL — see License below). Per
-agent, a TOML manifest of rules is evaluated against *regions* of the screen
-(`prompt_box_body`, `after_last_horizontal_rule`, `osc_title`, …) with
-priorities — e.g. a `❯` in the prompt box is a *950-priority idle* signal that
-outranks loose blocked heuristics, which is what kills the "chat text says
-'would you like to…' → blocked" class of false positives our old hand rules had.
+This replaced the vendored copy of herdr's engine (`src/vendor/herdr_detect`,
+from herdr v0.7.3, with seagents' patches), deleted 2026-10-12. Its two
+patches: Claude's `background_shell_working` re-weight is obsolete (herdr
+deleted the rule, `987b070f`, in 0.9.0); Codex's trust-dialog rule became the
+`[screen] dialogs` entry above. `herdr agent explain <pane>` shows herdr's
+verdict and the rule that matched (what `debug-screen` did).
 
-- Inputs we feed it: the **vt100-rendered screen** from the raw tail, plus the
-  last non-empty **OSC title** (`current_title`). **Rendering is
-  geometry-sensitive** — wrong cols/rows → garbled screen → detection silently
-  fails. We read the child's **live** terminal size from
-  `/proc/<child_pid>/fd/0` via `TIOCGWINSZ` (falling back to meta, then 80×24).
-- The agent is identified from the recorded argv basename
-  (`identify_agent("claude")`), so any of herdr's ~18 supported agents (codex,
-  gemini, cursor, copilot, …) is detected if launched via `seagents run`.
-- **Rules self-update**: manifests are fetched from
-  `https://herdr.dev/agent-detection/index.toml` (shelling to `curl`), cached
-  under `~/.local/state/seagents/agent-detection/`, version-gated (never
-  downgrade, engine-version-checked). The HUD refreshes them in the background
-  at most daily; `seagents update-manifests` forces it. Local overrides:
-  `~/.config/seagents/agent-detection/<agent>.toml`.
+**Fused with the turn ledger** (§6) by `status::settle`, exactly as before:
+for a hook agent, blocked wins; else in a turn → working; else herdr's
+verdict.
 
 ### 4. `seagents focus` — jump to the agent's i3 window
 
 **Exact handles only — no fuzzy matching.** X11 can't be asked "which window
 hosts this pty" (Terminator shares one process across windows, so
-`_NET_WM_PID` is useless); the only honest strategy is correlation at moments
-we *know* the user is interacting with the agent:
+`_NET_WM_PID` is useless). `run` records the window's `con_id` + **X window
+id** in the meta at launch, on a thread, while the agent starts — strongest
+source first:
 
-- **At launch**: the focused terminal's `con_id` + **X window id** go into
-  the meta (`seagents run` was just typed there).
-- **On every input burst** (throttled to 1/min): typing proves the agent's
-  terminal is focused, so the input pump re-captures both ids — healing
-  stale handles within one keystroke of real use.
-
-**Most terminals make all that correlation unnecessary**, and two paths ahead of
-it try to say so:
+**Most terminals make correlation unnecessary**, and two paths try those
+first:
 
 1. **`window_ids_from_env()`** — the terminal simply tells its child which
    window it is: `ALACRITTY_WINDOW_ID`, or the old xterm `WINDOWID`. Measured on
@@ -659,21 +699,20 @@ it try to say so:
    windows for one pid and abstains rather than guessing. `xdotool` is optional;
    without it this yields nothing and the paths below carry on.
 
-Under alacritty either path answers directly and the "type into the agent once"
-caveat disappears.
+3. **The handle** `restore`/`spawn` put on a window they open
+   (`seagents-<tag>`, `window_ids_for_handle`, polled up to 5 s while the
+   window maps).
+4. **The focused terminal** — right when a human just typed the command into
+   it (guarded: only a terminal-class window, never the HUD). Captured while
+   the agent starts, not after: a start takes seconds, in which the user may
+   move on.
 
-Resolution: con_id (`i3-msg [con_id=N] focus`; fast, dies on an i3 *restart*)
-→ X window id (survives restarts; heals con_id when used) → a clear error
-telling the user to type into the agent once. The old title-matching fallback
-(parse the tee for the OSC title, fuzzy-match the i3 tree) was cut out
-entirely: it was ambiguous between idle agents and read the `.raw` stream for
-something that isn't a detection concern.
-
-Why con_id and not PID: i3 on X11 doesn't expose a usable per-window PID, and
-**Terminator shares one process across all its windows**, so PID→window is
-impossible. At `seagents run` time the launching terminal is the focused i3 window,
-so we capture its `con_id` then (guarded: only if the focused window is a
-terminal-class window, so a stray dialog doesn't get recorded).
+Under alacritty the first two answer directly. Resolution: con_id (`i3-msg
+[con_id=N] focus`; fast, dies on an i3 *restart*) → X window id (survives
+restarts; heals con_id when used) → a clear error. The pty wrapper also
+re-captured the ids on every input burst (typing proved the window focused);
+with herdr's attach in the window there is no input pump, so on Terminator a
+window identified wrongly at launch stays so (§ Limitations).
 
 ### 5. `seagents hud` — the floating panel
 
@@ -686,16 +725,17 @@ to. Meant to run as an i3 floating + sticky window (see setup).
 **Rows are named by directory, conversation title, or both (`t`).** The title is
 the one Claude generates for the session — the human-readable line
 `claude --resume` lists — which it also stamps into the terminal title behind a
-state glyph (`✳ Detection update`). `read_session()` already parses that title
-for the detection engine, so surfacing it costs nothing extra: it is
-glyph-stripped by `status::conversation_title()` and carried on `Session.title`
+state glyph (`✳ Detection update`); herdr reports it per agent
+(`terminal_title_stripped`), so surfacing it costs nothing extra: it is
+cleaned by `status::conversation_title()` and carried on `Session.title`
 (also emitted by `status --json`, for widget frontends). Two consequences worth
 knowing:
 
 - A session that hasn't named its conversation yet shows Claude's own banner
-  (`Claude Code`), which says less than the directory does — that placeholder
-  comes back **empty**, and the row falls back to the directory. Same for the
-  stray punctuation-only titles some live tees carry.
+  (`Claude Code`), or the command line the shell put in the title before the
+  agent set its own (`claude --model haiku`), which say less than the
+  directory does — those come back **empty**, and the row falls back to the
+  directory. Same for stray punctuation-only titles.
 - Titles are sentences where directories are words, so the row layout is a
   **ladder of candidate layouts** (`session_line`) rather than a fixed set of
   columns: the first that fits the width wins, and the optional columns drop
@@ -713,30 +753,22 @@ knowing:
   every row, so the columns line up; a frame in which no agent has named its
   conversation draws no title column at all rather than a block of blanks.
 
-**Lineage.** `lineage()` turns the sorted list into a forest: every spawned
-agent directly under its parent, its name behind `└ ` (two more columns per
-generation). The marker sits *in the name column*, so the dot, state and time
-columns stay aligned. The sort still decides, one level at a time, but a family
-is placed where its **highest-sorted member** would be: under urgency a child
-blocked on a prompt lifts its whole family to the top rather than hiding under
-an idle parent. A child whose parent is not live is a top-level row, and a
-parent cycle (only a hand-edited `.meta` could make one) costs no row.
-
 **Tags.** The name column shows `@tag` when somebody chose the tag
 (`spawn --tag reviewer`) and the directory when `run` minted it
 (`registry::minted_from`: the directory's tag base plus four hex digits, which
-says nothing the directory doesn't). Spawned children usually run in their
-parent's directory, so without the tag a fleet reads as N rows all named
-`seagents`. Title mode is unchanged: the title names the row.
+says nothing the directory doesn't). Spawned agents usually run in their
+spawner's directory, so without the tag a fleet reads as N rows all named
+`seagents`. Title mode is unchanged: the title names the row. Rows are flat:
+there is no lineage (decided 2026-10-12; the HUD's tree went with it).
 
-**Send / stop from the HUD** (`p`, `x`) go through `send::ask`, the one socket
-client `seagents send`/`stop` also use, on a background thread (a send is held
-until the agent is idle; a stop takes its grace periods), and the outcome lands
-in the footer: `sent to @w · stops 3` (the `wait --after` baseline), `stopped
-@w`, or the wrapper's own refusal text. The HUD is a human caller, so the
-lineage rule never refuses it; the blocked refusal still applies, and `p` on a
-blocked row says so at once rather than after the prompt is typed — Enter
-jumps to the window, where the gate is answered. There is deliberately no
+**Send / stop from the HUD** (`p`, `x`) run `send::prompt_target` /
+`send::stop_target` — the code `seagents send`/`stop` run — on a background
+thread (a send is held until the agent is idle; a stop takes its grace
+periods), and the outcome lands in the footer: `sent to @w · stops 3` (the
+`wait --after` baseline), `stopped @w`, or the refusal's own text. The
+blocked refusal applies, and `p` on a blocked row says so at once rather than
+after the prompt is typed — Enter jumps to the window, where the gate is
+answered. There is deliberately no
 answer-the-gate key: what `1` picks differs per gate, and approving one
 unseen from a list row is the thing the blocked refusal exists to prevent.
 The target is fixed when the input opens, since rows move under the urgency
@@ -744,17 +776,13 @@ sort. Bracketed paste is on, so a pasted multi-line prompt arrives whole
 (newlines show as `↵` in the one-line input); typed prompt text is never
 written to `SEAGENTS_HUD_LOG`.
 
-Verified live (tmux, 120×40, scratch HOME): `run --tag p bash`, `run --tag c
---parent p bash` and a haiku `run --tag w --parent p claude` render as `@p`
-with `└ @w`/`└ @c` under it; `p` on `@w` sent a prompt (footer `sent to @w ·
-stops 0`), the row read `working` for the ~5 s the plain-text answer streamed
-(the ledger, not the screen — Claude shows no spinner there) and `status
---json` went to `stops: 1`; `x`, `y` on `@c` → `stopped @c`, row gone.
+Verified 2026-10-12, headless (a pty harness, an isolated herdr session):
+the HUD lists the agents, `x` then `y` stops the selected one, `q` quits. If
+no herdr server is running the footer says so at start.
 
 Both view modes persist in `state_dir()` — one word per file (`hud-sort`,
 `hud-label`: `urgency|dir|recent`, `both|title|dir`) — so the setting survives
-closing the HUD window. `draw()` is covered headlessly through ratatui's
-`TestBackend` (the *event loop* still needs a real terminal).
+closing the HUD window. The HUD needs a real terminal.
 
 ### 6. `seagents snapshot` / `restore` — surviving a reboot
 
@@ -765,10 +793,9 @@ you the processes but not the layout or the context. Three problems:
 **The layout must outlive the processes.** `~/.cache/seagents/` self-reaps — the
 first `status` after a boot deletes every `.meta` whose child pid is gone, which
 is all of them. So the snapshot lives at `state_dir()/layout.json` and is written
-*continuously*: every wrapper's monitor thread offers a capture each tick,
-globally throttled by the file's own mtime to one write per 30 s. The HUD's poll
-loop and every `status` invocation offer one too — which is what covers agents
-whose wrappers were started before this existed and so never call it themselves.
+*continuously*: every `run`'s monitor thread offers a capture each tick,
+globally throttled by the file's own mtime to one write per 30 s. The HUD's
+poll loop and every `status` invocation offer one too.
 An unplanned reboot loses at most 30 s of layout change, and there is no command
 to remember.
 
@@ -798,8 +825,10 @@ overwrites on the first repaint. Restored windows are therefore launched
 carrying a minted handle, `seagents-<tag>`, and the placeholder swallows on that
 alone.
 
-The tag is the agent's own (§2), recorded per agent in `layout.json` along
-with its `parent` and `depth`.
+The tag is the agent's own (§2), recorded per agent in `layout.json`; a tag
+captured before tags had to start with a letter is folded on the way in
+(`snapshot::fold_tags` → `registry::fold_tag`: `20260612-sme-3f2a` →
+`d20260612-sme-3f2a`), the same for the placeholder and the launch.
 *Which* X11 property carries the handle is the terminal's business — Terminator
 has `--role` and no `--class`; alacritty (and most others) are the reverse — so
 the **stored layout is terminal-agnostic**: leaves keep a `tag`, and the swallow
@@ -829,8 +858,14 @@ handle — `handle_for(tag)` — instead of by focus**. Focus-based capture is a
 reaches `run` while the terminal is still mapping, so several restored agents
 would all record whichever window was focused *before* — one con_id shared by
 many sessions. (Capture guards against that anyway: when two live sessions name
-one window, the earliest launch keeps it and the rest are reported unplaced,
-which the input-driven re-capture heals on the next keystroke.)
+one window, the earliest launch keeps it and the rest are reported unplaced.)
+
+**herdr's own persistence.** A herdr server brings its workspaces and tabs
+back when it restarts, empty (the processes are gone) — measured, including a
+tab that had been closed. `run` takes such a tab when one at the agent's cwd
+is labelled with its tag (`run::place`), so a restore after a herdr restart
+does not pile up empty tabs; ones no restore claims stay until closed in
+herdr.
 
 **A window must know which conversation it was.** The agent says so itself.
 For an agent whose adapter takes hooks (`[hooks] inject`,
@@ -838,9 +873,11 @@ For an agent whose adapter takes hooks (`[hooks] inject`,
 extra flag (Claude: `--settings`; Codex: `-c hooks=…`, §11) carrying three hooks — `SessionStart`, `UserPromptSubmit`, `Stop` — each
 running `'<abs path of this binary>' __hook` (absolute, so the agent's `PATH`
 doesn't matter). Every payload carries `session_id` and `transcript_path`;
-`__hook` finds its session by walking its own `/proc` ancestry (hook sh →
-claude → `__lead` → wrapper) to the first pid with a live `.meta`
-(`registry::enclosing_session`), and records the event in `.agent`. The
+`__hook` finds its session from the environment herdr gives everything in the
+agent's pane — `HERDR_PANE_ID` and `HERDR_SOCKET_PATH` — matched against the
+`.meta`s (`registry::by_pane`; a pane moved since has a new id, but the agent
+keeps the old one in its environment and so does `.meta`), and records the
+event in `.agent`. The
 snapshot capture copies `.agent`'s `session_id` into the layout, and `restore`
 resumes it (`resume_argv`, per the adapter's `[restore]`: the stale
 selection words dropped — Claude's `--resume`/`-r`/`--continue`/`-c`, Codex's
@@ -862,10 +899,14 @@ Details that matter:
   settings files are left alone (seagents never writes the user's config), and
   a `--settings X` the user passed (inline JSON or a path, `--settings X` or
   `--settings=X`) is loaded, has our three entries appended to its
-  `hooks.<Event>` arrays, and goes back as ONE inline flag in its place. An X
-  that can't be read or isn't a settings object passes through untouched and
-  the agent runs without hooks, with a warning on stderr. Our flag goes right
-  after `argv[0]`: anything after a `--` is the agent's positional text.
+  `hooks.<Event>` arrays, and goes back as ONE flag in its place — written to
+  `<runtime dir>/hooks-<key>.json` (0600, removed with the session) and passed
+  by path (decision D5): herdr starts the agent by typing its command line
+  into the pane's shell, where inline JSON would show in the window and land
+  in the shell's history. An X that can't be read or isn't a settings object
+  passes through untouched and the agent runs without hooks, with a warning
+  on stderr. Our flag goes right after `argv[0]`: anything after a `--` is
+  the agent's positional text.
 - **`claude --bare` skips hooks**, so nothing is injected under it (the
   adapter's `hookless_flags`); `.agent` stays empty.
 - **`.meta` `argv` is the user's argv**, without the injected flag: `restore`
@@ -873,10 +914,11 @@ Details that matter:
 - **`__hook` must never change the agent**: it always exits 0 (a `Stop` hook
   exiting 2 *keeps Claude from stopping*), prints nothing on stdout (hook
   stdout can be read as a decision), catches its own panics, and parses any
-  arguments without error. It is one ancestry walk, one small read and one
-  rename — no i3, no detection. Failures go to `~/.cache/seagents/hook.log`
-  only under `SEAGENTS_DEBUG`. The wrapper forks the agent before its `.meta`
-  exists, so a miss is retried for up to ½ s.
+  arguments without error. It is one directory scan, one small read and one
+  rename — no i3, no herdr. Failures go to `~/.cache/seagents/hook.log`
+  only under `SEAGENTS_DEBUG` (in the hook's environment, which is the pane's:
+  `run` passes `SEAGENTS_DEBUG` on to a new pane). A miss is retried for up to
+  ½ s.
 - **Every event refreshes identity**, not only `SessionStart`: a lost
   `SessionStart` heals at the next prompt. `source` comes only from
   `SessionStart`.
@@ -897,8 +939,16 @@ all). Its stamps are **milliseconds** — a prompt in the same second as the las
   newest first, stopping at the first record older than the prompt (and not
   parsing at all when the marker isn't in the tail). The screen does **not**
   otherwise end a turn: Claude 2.1.284 streams a plain-text answer with no
-  spinner and an idle title, so the detector says `idle` mid-answer, and a
-  turn Esc'd before the detector ever saw it `working` would never have ended.
+  spinner and an idle title (the old vendored detector said `idle`
+  mid-answer; herdr 0.9.0 reads it working), and a turn Esc'd before the
+  detector ever saw it `working` would never have ended.
+
+herdr's own `agent wait` / `agent prompt --wait` were measured against this
+(2026-10-12, isolated session) and do not replace it: called right after
+`agent prompt` it returned the *previous* idle 0.4 s before `working` showed,
+a timeout tells the caller nothing, an Esc'd turn looks finished, and its
+`state_change_seq` is one counter for the whole server, reset when it
+restarts. So turns, `stops`, `interrupted` and the final message stay ours.
 - **Screen adapters**: prompted after the last `Stop`, and `.state` not `idle`
   since the prompt.
 
@@ -915,152 +965,82 @@ writes neither an interrupt record nor a `Stop`, fires no hook (the binary's
 event list has no cancel), and the transcript records after the prompt
 (`last-prompt`, `mode`, `permission-mode`, …) are the ones every turn writes
 at its start. There is no exact trace, so `turn.rs` reads the absence of
-everything a live turn does: the detector's own screen verdict (`.state`'s
-`screen`) is idle, the tee has been silent for 10 s since the prompt, and the
+everything a live turn does: herdr's own screen verdict (`.state`'s
+`screen`) is idle, the screen has not changed for 10 s since the prompt
+(`.state`'s `screen_changed_ms`: `run`'s monitor hashes the screen every tick
+while the agent sits idle in a turn — it used to be the tee's mtime), and the
 transcript has no assistant record (text, reasoning, tool call) since it
 (`transcript::responded_since`). Thinking and a slow first token show a
-spinner whose timer repaints every second (working, and the tee grows); a
-streamed answer grows the tee; a tool call is an assistant record (a 25 s
-foreground command, verified, is not taken for a drop); a permission prompt
-is `blocked`. Such a turn then ends — `wait` says `interrupted` (verified:
-rc 5, ~12 s after the Esc) and the agent reads idle. Since nothing changes on
-disk at that moment, the monitor re-looks every tick while its agent is
-`working` rather than only when the tee or `.agent` changed. Codex never
+spinner whose timer repaints every second (working); a streamed answer
+changes the screen; a tool call is an assistant record; a permission prompt
+is `blocked`. Such a turn then ends — `wait` says `interrupted` (verified
+through herdr 2026-10-12: rc 5, 10.8 s after the Esc) and the agent reads
+idle. Codex never
 meets the rule: it records `turn_aborted` even then, and its turn timer
 repaints every second. After a dropped turn the prompt is still in the
 input box, and a paste lands after it — the two used to arrive as one
 prompt (`…the seaReply with exactly: …`, verified); `send` now clears it
 first (§9).
 
-**One-time cost of the hook cutover.** Wrappers started by a pre-hook binary
-have no `.agent` (and the conversation id an old capture cached in their
-`.meta` is no longer read), so a reboot before they are restarted restores them
-*without* `--resume` — fresh conversations in the right windows. Restart those
-agents once; every agent launched since carries its hooks.
-
 `restore` is safe to run twice and safe to run when only half the agents died:
 a restored agent comes back under its captured tag, so **a captured agent whose
 tag is live is already on screen and is skipped** — tag identity alone makes
-restore idempotent. Lineage comes back too: a child is relaunched with
-`--parent` when its parent is live or restored earlier in the same run (each
-workspace launches parents first, and waits up to 10 s for a parent's `.meta`);
-a parent that is gone, or that restores on a later workspace than its child,
-drops the lineage rather than failing the launch.
-
-**One-time cost of the tag cutover.** Agents started by a pre-tag binary carry
-no tag. A capture by the new binary backfills one into their `.meta`
-(`registry::backfill_tags`), but their own (old-binary) monitor threads keep
-writing the old layout format, whose tags are conversation-id prefixes /
-`p<pid>` that match no live tag — so a `restore` run while such wrappers are
-still alive can relaunch them as duplicates, and an old-format tag that happens
-to be all digits is refused and not restored. Restart those agents (or reboot
-and restore) once; after that every agent is tagged at launch.
+restore idempotent.
 
 ### 7. `seagents spawn` — starting an agent on a prompt
 
-The first command where seagents *acts* rather than observes, drawn narrowly:
-it only launches, through the same launcher `restore` uses. Its primary
-caller is another agent (ORCHESTRATION-SPEC), so every bound is derived from
-something the caller can't casually change:
+The command that starts an agent on a prompt, through the same launcher
+`restore` uses. Its primary caller is another agent (ORCHESTRATION-SPEC),
+but there is **no lineage** (decided 2026-10-12): no parent, no depth, no
+fan-out caps, no permission ceiling from the caller, no `--arg` checks. Once
+herdr owns the agents an agent can call `herdr` directly, so those checks
+only guarded the seagents path; what guards an agent is its own permission
+prompts (an agent running `seagents spawn` runs a shell command).
 
-1. **Who is calling** = `registry::enclosing_session(own pid)`: the first
-   `/proc` ancestor that is a live wrapper. None, with the whole ancestry
-   read up to init → a human; a link that can't be read refuses the spawn
-   rather than treating it as uncapped (§9). (Not an
-   environment variable: everything an agent runs inherits and can edit
-   those. An agent that deliberately escapes its tree — `setsid`,
-   `systemd-run` — looks human; that is the threat model's line.)
-2. **Caps and tag, under `tags.lock`** (`registry::claim_spawn`): for an
-   agent caller the child is its child (`parent` = its tag, depth + 1), and
-   depth ≤ 3, ≤ 4 live children per parent and ≤ 12 live agent-spawned
-   agents machine-wide, counting other spawns' reservations; the refusal
-   names the children in the way. A human's spawn has no parent and no caps.
-   The caps are the user's, in `~/.config/seagents/config.toml` (beside the
-   adapter overrides; `Caps::configured()`):
-   ```toml
-   [spawn]
-   max_depth = 3
-   max_children = 4
-   max_spawned = 12
-   ```
-   each defaulting when absent; a file that doesn't parse or names an unknown
-   key is an error. **Never the environment**: the caller is the agent the
-   caps bound, and until 2026-09-30 `SEAGENTS_MAX_SPAWNED=999 seagents spawn`
-   lifted them. (`XDG_CONFIG_HOME` still moves the file — like editing it,
-   that is deliberate, not a confused agent's slip.) The caps are **one
-   check** (`registry::admit_child`) made by every claim that gives an agent
-   a parent: `spawn`'s reservation and `run --parent`'s `claim_tag` alike —
-   so a hand-typed `run --parent P` can't go round them (exit 2) — with a
-   spawn's own reservation not counted again when its `run` takes the tag. A
-   requested `--tag` must be free of live agents, reservations **and the
-   saved layout(s)** — unlike `run --tag`, which restore needs to reuse them.
-3. **Permission mode**: from an agent, always explicit — the parent's own
-   hook-reported `permission_mode` by default (bounded by its own argv for
-   Codex, whose hooks report only its approval policy, §11), refused above it (the adapter's
-   `permission_modes` order, least privileged first), the least privileged
-   when the parent's is unknown. From a human, passed only if given (the
-   tool's configured default otherwise, as when typing `claude`). The reason
-   for the asymmetry: this machine's default mode is `bypassPermissions`.
-   The mode becomes argv through the adapter's `[launch.permission_argv]`
-   (Claude: `--permission-mode <m>`; Codex: an `-a`/`-s` pair, §11). Every
-   bundled adapter names its modes in Claude's words, because every bundled
-   tool's hooks report the parent's mode in them — so either tool bounds a
-   child of either tool. The cap would mean nothing if `--arg` could say
-   otherwise, so an agent's `--arg`s are checked against the adapter's
-   `[launch.privileged]` (`Launch::privileged_arg`): `flags` (Claude's
-   `--permission-mode`, `--dangerously-skip-permissions`, `--settings`,
-   `--allowedTools`, `--add-dir`, `--mcp-config`, `-p`, …; Codex's `-a`,
-   `-s`, `--dangerously-bypass-approvals-and-sandbox`, `--profile`, `-C`,
-   `--enable`/`--disable`, …) in any spelling — `--flag`, `--flag=v`, and a
-   one-letter flag also glued to its value or inside a cluster (`-cp`);
-   `commands` (subcommands that change the user's config or act on other
-   sessions: `claude mcp`, `codex exec`, …) as bare words; and
-   `config_keys` behind the adapter's `config_flags` (Codex's `-c
-   approval_policy=…`, `sandbox_mode`, `shell_environment_policy`, `hooks`,
-   `mcp_servers`, … and anything under them). Each list entry carries its
-   one-line reason in the TOML, as do the flags judged harmless. Refused
-   before anything is claimed or opened, naming the argument and pointing
-   at `--permission-mode`; a human's `--arg`s are not checked (they could
-   type the same command into a terminal). Matching errs toward refusing (a
-   refused word is refused even as another flag's value).
+1. **The agent** must be one herdr can start (`--agent`, default `claude`).
+2. **The tag** (`registry::pick_tag`): a requested `--tag` must be free of
+   live agents, herdr's agent names **and the saved layout(s)** — unlike
+   `run --tag`, which restore needs to reuse them; else one is minted. Not
+   held: the window's `run` claims it, and refuses it there if another took
+   it meanwhile.
+3. **`--permission-mode M`** becomes argv through the adapter's
+   `[launch.permission_argv]` (Claude: `--permission-mode <m>`; Codex: an
+   `-a`/`-s` pair, §11); none asked for, none passed — the tool's configured
+   default, as when typing the command.
 4. **`--worktree`**: `git worktree add <repo>/.seagents/worktrees/<tag> -b
    seagents/<tag>`, refusing an existing path or branch, with `.seagents/` in
    the repo's local `info/exclude`. Inside the repo because Claude's
    folder-trust dialog blocks every never-trusted directory (any mode), and a
    subdirectory inherits its parent's trust.
-5. **The prompt** goes to `$XDG_RUNTIME_DIR/seagents/seed-<tag>` (0600;
-   `registry::runtime_dir()`, §2, so `/tmp/seagents-<uid>` when that can't
-   be used). `run --seed-file`
-   reads and deletes it first thing and appends the adapter's `seed_prompt`
-   (Claude and Codex: `-- <text>`, submitted as the first turn) to the
-   **child's** argv only — never `.meta`'s, which `restore` replays. Under the
-   adapter's `seed_by = "file"` (both bundled adapters) `<text>` is **not the
-   prompt**: the prompt goes to the session's prompt file,
-   `<cwd>/.seagents/prompts/<wrapper_pid>-0-<hex>.md` (0600, the same mechanism
-   as a long `send`, deleted with the session), and `<text>` is the one line
-   telling the agent to read it and naming who sent it. The agent's
-   `/proc/<pid>/cmdline` is readable by every local user; the prompt must not
-   be there. Verified live 2026-09-30: Claude (default mode) and Codex
-   (read-only sandbox) read the file without a permission prompt and carry it
-   out. `seed_by = "inline"` (an override's choice) puts the prompt itself in
-   argv, with that exposure. Adapters with no template, and inline prompts of
-   128 KiB or more (one argv string's limit), are refused before a window
-   opens; the spec's paste-once-idle path isn't built, since no bundled adapter
-   needs it.
+5. **The prompt** goes to `<runtime dir>/seed-<tag>` (0600), which `run
+   --seed-file` reads and deletes first thing. It reaches the agent **once
+   the agent has read idle for 1.5 s** (`run::deliver_seed`) — past any
+   dialog it opened on the way up, which is answered in its window — through
+   `send::submit`, **always by reference**: written to
+   `<cwd>/.seagents/prompts/<key>-0-<hex>.md` (0600, deleted with the
+   session) and submitted as the one line telling the agent to read it. A
+   prompt submitted through herdr travels on a `herdr` command line, which
+   every local user can read in `/proc`; the prompt must not be there. The
+   settle time is measured: right after a folder-trust dialog closes Claude
+   reads idle while still settling, and the Enter of a prompt pasted then was
+   lost (2026-10-12) — `send` also presses Enter once more if the prompt's
+   hook does not report it and the box still holds exactly its text (§9).
+   A seed that finds the box holding someone's draft, or the agent busy or
+   at a dialog, keeps waiting — it is never dropped (verified: held behind a
+   draft, delivered once it was cleared). The seed thread prints nothing (the
+   window's terminal is the agent's screen); with `SEAGENTS_DEBUG` it logs to
+   `~/.cache/seagents/run.log`.
+   The cwd must be writable (or `--worktree`), checked before a window opens.
 6. **Launch** via `launch::spawn_terminal` with `keep_shell: false`, in the
-   terminal class of the caller's own window (the focused one for a human;
-   `SEAGENTS_TERMINAL` overrides), then **return** once the child's `.meta`
-   exists (≤ 15 s; normally ~0.1 s) with its handle JSON. `run` writes the
-   `.meta` right after forking the agent, with the window ids unknown, and
-   only then looks for its window (the handle poll can take 5 s, and all 5
-   where there is no i3 — which used to outlast `spawn`'s wait, so a spawn
-   that had worked reported failure); the ids land in the `.meta` a moment
-   later, and until then the agent is unplaced, as before its first
-   keystroke. It does not wait for the agent to
-   start: a never-trusted `--cwd` sits at Claude's trust dialog before any
-   hook fires, which the detector calls `blocked` — `wait` reports it.
+   terminal class of the caller's own window (found from the herdr pane it
+   runs in; the focused one for a human; `SEAGENTS_TERMINAL` overrides), then
+   **return** once the agent has started in herdr — its `.meta` has a pid
+   (≤ 150 s; ~4 s measured) — with `{"tag","pid","pane_id","cwd","stops":0}`.
+   A `.meta` that appears and goes again is a start that failed; the window
+   says why. An agent stopped at a dialog on the way up counts as started
+   (the seed waits); `wait` reports it `blocked`.
 
-Errors exit 1 with the reason on stderr; stdout carries only the JSON.
+Errors exit 1 with the reason on stderr; stdout carries only the JSON.Errors exit 1 with the reason on stderr; stdout carries only the JSON.
 
 ### 8. `seagents wait` — the turn a caller is waiting on
 
@@ -1075,8 +1055,8 @@ never sees a sub-tick turn as working at all. The caller holds a baseline N —
 | `turn` | 0 | `stops > N`: the turn after N ended; `last_message` is its final text (wins even if the agent has since exited) |
 | `idle` | 0 | no `--after`, not in a turn, alive and not at a gate: nothing to wait for, the last result at once |
 | `timeout` | 2 | `--timeout` (default 5m; `30s`/`5m`/`1h`/seconds) passed — call again with the same N; nothing is consumed |
-| `blocked` | 3 | `.state` is `blocked` (a permission prompt, the trust dialog); `rule` names the gate |
-| `exit` | 4 | `/proc/<child_pid>` is gone (not `.meta`, which only goes when someone reaps) — also for a reaped agent, from its tombstone (§2), for a day |
+| `blocked` | 3 | the agent waits at a dialog — herdr's verdict, or one of the adapter's `[screen] dialogs` (`status::agent_status`, asked at most once a second); `rule` names it |
+| `exit` | 4 | the session fails the liveness rule (§2) — also for an ended agent, from its tombstone, for a day |
 | `interrupted` | 5 | a turn opened since the last `Stop` is no longer running (Esc, or dropped before its first response, §6): it has no final message. Its own code so `wait && …` doesn't treat an abandoned turn as done |
 | `no_hooks` | 6 | the agent was handed hooks and given a prompt ≥ 20 s ago, and none has reported (`.agent` has no `session_id`): no turn will ever be seen to end. `message` names the adapter and `hook.log` |
 
@@ -1086,7 +1066,7 @@ only. Without `--after`, a running turn is waited on (N = current `stops`);
 with no turn running the agent's condition is the answer at once, by the same
 rules — `blocked` at a gate (the trust dialog comes before any prompt, so no
 turn is open there), `exit` when gone, else `idle`. `wait::decide()` is the
-whole table, a pure function over one look, tested row by row.
+whole table, a pure function over one look.
 An exited agent is answered for by the same table: its ledger is final (from
 its files while they last, then its tombstone — a waiter that had the session
 in hand when a reap came reads the tombstone), so a turn past N is still
@@ -1100,9 +1080,9 @@ hooks never fire — a future Codex hashing hook trust differently from the
 copy seagents reproduces, a Claude changing what `--settings` means, a user's
 `disableAllHooks` — keeps an empty ledger, and a `wait` would block to its
 timeout with no clue. So `run` records in `.meta` that it injected hooks
-(`hooks`), and when the agent was first given a prompt (`engaged_at`: the
-monitor, once a seeded agent is past any gate — idle or working; the control
-thread, on a submitted `send`); ≥ 20 s after that with no `session_id` —
+(`hooks`), and `send` when the agent was first given a prompt (`engaged_at`:
+a submitted `send`, the seed among them); ≥ 20 s after that with no
+`session_id` —
 which every hook event carries — the hooks are silent. "Given a prompt", not
 "seen working": Codex's screen reads `working` while it boots an MCP server,
 before any prompt, and its first hook fires only at the first prompt
@@ -1110,147 +1090,106 @@ before any prompt, and its first hook fires only at the first prompt
 `claude --settings '{"disableAllHooks":true}'` seeded: `wait --after 0` →
 `no_hooks`, rc 6.
 
-The gate verdict has one source: `.state`, written by the wrapper's monitor
-(the one process that sees every byte the agent prints), read by `wait`,
-`send`'s gate and `stop`. Its 2 s tick would leave `blocked` standing for up
-to a tick after a gate is answered, so input into a gated agent hurries it
-(`wrapper/monitor.rs::Wake`): the control thread and the input pump nudge the
-monitor, which then looks every 100 ms for a second — the agent repaints once
-it has read the key, not when it is written — and `send --answer-permission`
-replies only once the monitor has seen the gate go (≤ 1 s). A `wait` issued
-the instant that returns gets the turn, not the answered gate (tested). The
-alternative, `wait`/`send` rendering `.raw` themselves, was rejected: a
-second detector per waiting process (a 1 MB vt100 render per poll while a
-turn streams) that would still race the repaint.
+The dialog verdict comes from herdr, asked directly (at most once a second),
+not from `.state`: `.state` lags by up to a monitor tick, and right after a
+dialog is answered it would still say `blocked`. `send --answer-permission`
+replies once the dialog is seen gone (≤ 1 s), so a `wait` issued the instant
+it returns gets the turn, not the answered dialog (verified 2026-10-12).
 
 ### 9. `seagents send` / `stop` — driving an agent
 
-Only the wrapper holds the agent's PTY master, so it is the wrapper that
-writes: each listens on `<runtime dir>/<wrapper_pid>.sock` (§2), one JSON
-request line in, one reply line out (`send.rs` has the format; any client
-that speaks it is treated like the CLI).
+herdr writes into the agent's pane: `herdr agent prompt` (a paste the way the
+agent takes one — bracketed when it asked for it — then Enter), `pane
+send-text` (a paste without Enter, `--no-submit`), `pane send-keys` (herdr's
+key names). What herdr does not do, `send.rs` does around every write, in the
+calling process — the CLI, the HUD, or `run`'s seed thread. There is no
+control socket and no authorization: any agent may drive any agent (decided
+2026-10-12).
 
-**Authorization is the wrapper's**, per request, from `SO_PEERCRED`: the
-connecting pid's `/proc` ancestry names the calling agent
-(`registry::enclosing_session`, as for `spawn`). A human may send to and stop
-anyone and answer gates — and "human" is a finding, never the absence of
-one: the whole ancestry read up to init with no wrapper in it, by a peer
-still alive once it was read. The pid is a number fixed at `connect`, so the
-wrapper pins the peer the moment it takes the connection (`SO_PEERPIDFD`, the
-kernel's own pidfd from `connect`; `pidfd_open` only on a kernel without it),
-walks, then checks the pidfd is still live and a second walk finds the same
-chain. A peer that exited (or whose pid was reused), or any link that can't be
-read, is `caller identity unknown` → `forbidden`. Until 2026-09-30 an
-unreadable ancestry read as "no wrapper", i.e. human: a process that connected,
-forked and exited let its child `stop --force` any agent (reproduced: an
-unrelated agent `evil` stopped `top`; now refused — verified with the same
-fork-and-exit in a unit test at the time, and in a live tmux run). An agent may act only
-on its own descendants — walking the target's `parent` chain by tag, over live
-`.meta`s, must reach the caller — so never on itself, its parent, a sibling or
-a stranger (and A→B→A ping-pong can't happen), and may never
-`--answer-permission`. Refusal: `forbidden`, exit 5. Also checked: the peer's
-uid is ours.
+**One at a time.** Every `send` and `stop` holds the session's
+`<key>.send.lock` for its whole length (`registry::send_lock`), so two never
+interleave, from any processes.
 
-**Submit when idle.** A `send` is held (up to `--timeout`, 5 min) until the
-agent is out of its turn (`turn::Ledger::in_turn`, the one definition) and its
-`.state` reads idle; then the body is written and the reply carries the
-ledger's `stops` at that instant, `paired: true` — nothing else is in flight,
-so `wait --after <stops>` returns the turn it started. Measured live
-2026-09-29: a second `send` issued while the first's turn ran was held ~4 s
-and each was answered by its own turn. Submissions are serialized in the
-wrapper, and one counts as in flight until the agent's `UserPromptSubmit` hook
-fires for it (or 5 s pass), so two back-to-back sends can't both see "idle"
-and fold into one turn — and the reply itself waits for that hook (≤ 5 s),
-so a `wait --after <stops>` issued the instant `send` returns sees the new
-turn open. Without that, after an Esc'd turn the ledger still read
-"prompted, no longer running" until the hook landed, and such a `wait`
-returned `interrupted` for the *old* turn (found live on Codex). `--now` writes at once (`paired: false`: a prompt sent
-mid-turn is answered by its own later `Stop`, verified, but `wait --after N`
-returns the running turn's). A **blocked** agent is refused at once — reason
-`blocked`, exit 3, with the gate's `rule` from `.state` — even with `--now`,
-since whatever is typed into a permission menu answers it;
-`--answer-permission` (humans only) is the way through, usually with
-`--keys` (e.g. `--keys 1 --no-submit` picks "Yes" on Claude's menu, verified),
-and replies once the gate is seen gone (≤ 1 s, §8). An agent no
-detector knows (a plain shell) can't be seen to be idle: only `--now` sends
-to it (reason `unsupported` otherwise). Exit codes: 0 ok, 2 `busy_timeout`
-(nothing was sent), 3 `blocked`, 4 `exit`, 5 `forbidden`, 6 `draft`
-(below), 1 anything else.
+**Submit when idle.** herdr sends at once, and a prompt that lands mid-turn
+is folded into the running turn — its first answer lost (measured
+2026-10-12). So a `send` is held (up to `--timeout`, 5 min) until the agent is
+out of its turn (`turn::Ledger::in_turn`), herdr reads it idle (or done), and
+no earlier submission of ours is still landing (`.meta`'s `submitted_ms`:
+until the agent's `UserPromptSubmit` has fired since, or 5 s pass); then the
+body is written and the reply carries the ledger's `stops` at that instant,
+`paired: true`, so `wait --after <stops>` returns the turn it started. The
+reply waits for that hook (≤ 5 s), so a `wait --after <stops>` issued the
+instant `send` returns sees the new turn open — without that, after an Esc'd
+turn the ledger still read "prompted, no longer running" and such a `wait`
+returned `interrupted` for the *old* turn (found live on Codex). If the hook
+does not come and the input box still holds exactly the text, its Enter was
+lost — an agent still settling after a trust dialog drops one — and Enter is
+pressed once more. A human starting a turn between the check and the write is
+an accepted race (herdr has no "prompt only if idle"). Verified 2026-10-12:
+two back-to-back sends were answered by their own turns (`ONE`, `TWO`).
+`--now` writes at once (`paired: false`). A **blocked** agent — herdr's
+verdict, or one of the adapter's `[screen] dialogs` — is refused at once,
+reason `blocked`, exit 3, with the dialog's `rule`, even with `--now`: whatever
+is typed into a dialog answers it. `--keys` into one is refused too unless
+`--answer-permission` is given (`--answer-permission --keys 1` picks "Yes" on
+Claude's permission menu, verified), which then replies once the dialog is
+seen gone (≤ 1 s, §8). Exit codes: 0 ok, 2 `busy_timeout` (nothing was sent),
+3 `blocked`, 4 `exit`, 6 `draft` (below), 1 anything else.
 
 **The input box.** A paste lands after whatever the agent's input box
 already holds: a prompt Claude put back after a turn dropped before its
-first response (§6), or a human's half-typed draft. So before any paste
-(not `--keys`, not into a gate) the wrapper looks (`control::make_room`):
-`detect::input_box` renders the tee at the live size and takes the last row
-starting with the adapter's `[send] input_glyph` (Claude `❯`, Codex `›`)
-and the rows under it up to a blank row or a rule. The empty box's
-placeholder (`Try "…"`, `Ask Codex to do anything`) is drawn dim, which
-vt100 0.15 does not record, so the cursor tells it apart: both tools park it
-where typing goes — at the text's start in an empty box (measured) — and a
-box the cursor is not in counts as "nothing to go by" (send as before), so a
-placeholder never reads as a draft. Text that is, whitespace aside, the last
-prompt this wrapper submitted (a `send`'s paste, or the seed) is ours: the
-adapter's `input_clear` (Ctrl+U for both: to the line's start, then the
-newline before it — never Ctrl+C, which on an empty box starts exiting) is
-pressed, one at a time and re-looked after each repaint, until the box reads
+first response (§6), or a human's half-typed draft. So before any paste (not
+`--keys`) `send` looks (`make_room`): `herdr pane read --format ansi`, and
+`screen::input_box` takes the last row starting with the adapter's `[send]
+input_glyph` (Claude `❯`, Codex `›`) and the rows under it up to a blank row
+or a rule. herdr keeps the styling, and the empty box's placeholder (`Try
+"…"`, a suggested prompt, `Ask Codex to do anything`) is drawn **dim**
+(SGR 2) where typed text is not, so only text that is not dim counts as typed
+— which also closes the old gap of a draft whose cursor was moved to its
+start reading as empty. Text that is, whitespace aside, the last prompt
+seagents submitted (`.meta`'s `last_prompt`: a `send`'s, or the seed's) is
+ours: the adapter's `input_clear` keys (`ctrl+u` for both: to the line's
+start, then the newline before it — never Ctrl+C, which on an empty box
+starts exiting) are pressed, re-reading after each, until the box reads
 empty. Anything else is refused, `draft`, rc 6, `--now` or not — the human is
-typing; the reply gives its length, never its words. `stop` makes the same
-check before its exit sequence, and with a draft there goes straight to
-SIGTERM (`/exit` typed after it would be submitted as a prompt). Verified
-live, Claude 2.1.284: a dropped one-line, two-line and by-reference prompt
-were each cleared and the next send arrived alone; a tmux-typed draft was
-refused (rc 6, also with `--now`); `stop` after a drop exited via `/exit` in
-1.2 s. Codex 0.152.0 does not put an Esc'd prompt back, but its composer
-takes a draft, refused the same way. Known gap: a one-line draft whose
-cursor was moved to its start reads as empty.
-
-**Framing** (`wrapper/inject.rs`, copied from herdr): text is a bracketed
-paste (`ESC[200~…ESC[201~`, the end marker stripped from the body) when the
-agent has enabled DECSET 2004, raw otherwise; the adapter's `pre_send` nudge
-(`focus_gained` → `ESC[I`) first; the body is one write under the writer lock,
-so the human's keystrokes (the input pump locks per chunk) can't land inside
-it; then the lock is released, `submit_delay_ms` (300) passes, and Enter is
-written — `\r`, or `CSI 13 u` when the agent has pushed kitty keyboard flags
-that report every key (flag 8; the output pump tracks the flag stacks per
-screen). modifyOtherKeys isn't tracked: it never changes an unmodified Enter.
-`--keys` writes bytes verbatim after decoding `\e \r \n \t \0 \\ \xNN`
-(in the wrapper, so a raw client gets the same syntax); `--no-submit` skips
-the Enter. Verified live on Claude 2.1.284: a multi-line body with both quote
-kinds, backticks, `$` and backslashes arrives exactly. Prompt text is never
-logged.
+typing; the reply gives its length, never its words. Verified 2026-10-12
+through herdr: a put-back prompt was cleared and the next send arrived alone;
+a typed draft was refused (rc 6) for Claude and Codex.
 
 **Long bodies go by reference.** Claude files a large paste in its transcript
 as `<pasted_content id="…">…`, and current models treat that as data "that may
-contain instructions the user did not write" — haiku declined to act on one in
-Phase 2; a raw unbracketed burst is treated the same. Measured (2.1.284, haiku,
-bracketed paste + 300 ms + Enter): one line of 700 chars and 2 short lines
-land inline, as the user's words; one line of 900 chars, or 7 short lines, are
-wrapped. So the adapter says when (`[send] long_prompt = "file"`,
-`inline_max_chars = 700`, `inline_max_lines = 2` for Claude; every other
-adapter pastes everything): past either limit the wrapper writes the body to
-`<agent cwd>/.seagents/prompts/<wrapper_pid>-<stops>-<4 hex>.md` (0600,
-`registry::write_prompt`; `.seagents/` goes into the repo's `info/exclude`
-first, through the same helper `--worktree` uses) and pastes one line instead:
-`Read the file .seagents/prompts/<name>.md (relative to your working
-directory) and carry out the instructions in it. They were sent to you through
-seagents by <@caller | the user>.` A Read inside the agent's cwd needs no
-permission — verified in `--permission-mode default`, where one outside it
-would stop at a prompt. The files are the session's: the wrapper deletes them
-when its agent exits (so on `stop`), and `reap` for one that died harder —
-only names with that wrapper's pid prefix. `--keys` is untouched. Seed prompts
-need none of this: on the command line they arrive inline at any size
-(verified: 50 lines, ~5000 chars).
+contain instructions the user did not write". Measured (2.1.284, haiku,
+bracketed paste + 300 ms + Enter, which is what herdr's `agent prompt`
+sends): one line of 700 chars and 2 short lines land inline, as the user's
+words; one line of 900 chars, or 7 short lines, are wrapped. So the adapter
+says when (`[send] long_prompt = "file"`, `inline_max_chars = 700`,
+`inline_max_lines = 2` for Claude; every other adapter pastes everything):
+past either limit the body is written to `<agent cwd>/.seagents/prompts/<key>-<stops>-<4 hex>.md`
+(0600, `registry::write_prompt`; `.seagents/` goes into the repo's
+`info/exclude` first) and one line is submitted instead: `Read the file
+.seagents/prompts/<name>.md (relative to your working directory) and carry out
+the instructions in it. They were sent to you through seagents.` A Read inside
+the agent's cwd needs no permission. The files are the session's, deleted
+with it. A body that goes inline travels on herdr's command line (128 KiB at
+most; one longer is refused) — visible in `/proc` while that call runs, which
+the pty wrapper's socket was not; seeds always go by reference for that
+reason (§7).
 
-**`stop`** types the adapter's `exit_sequence` (Claude: `/exit`, ~1 s) as a
-`--now` paste and gives it 5 s; then SIGTERMs the PTY's foreground process
-group (the agent's, via `tcgetpgrp` on the master) and continues it, then
-SIGKILLs it and the anchor, 5 s apart; it replies once the agent is gone.
-`--force` skips the exit sequence. So does a **blocked** agent — `/exit` +
-Enter typed into a permission menu would pick an answer — which goes straight
-to SIGTERM (verified: the gated command never ran). The lineage rule applies;
-the blocked refusal does not. The wrapper exits with its agent, so
-`Control::finish()` lets in-flight requests reply (≤ 2 s) before the socket is
-removed.
+**`stop`** submits the adapter's `[stop] exit_sequence` (Claude and Codex:
+`/exit`) and gives it 5 s; then closes the agent's herdr pane (which hangs
+it up) and gives that 5 s; then SIGKILLs its process group. It takes the
+send lock only for up to 2 s: a `send` can hold it for minutes waiting on a
+busy agent, so past that `stop` goes straight to closing the pane, and the
+held `send` ends with `exit` once the agent is gone, typing nothing
+(verified: `stop` in 2.5 s, the held send rc 4). It replies once
+the agent is gone, and `run`, which holds its window, then closes the window
+too. `--force` skips the exit sequence. So does an agent at a dialog —
+herdr's, or one of the adapter's `[screen] dialogs` (`/exit` + Enter typed
+there would answer it: verified 2026-10-12, Codex at its trust question, which
+herdr reads as idle — `stop` closed the pane and its config gained no trust
+entry) — and one whose box holds someone's draft (the sequence would be
+submitted as part of it). A prompt seagents sent that the agent put back is
+cleared first (verified: `stop` then exited via `/exit` in 1.4 s).
 
 ### 10. `seagents read` — the conversation
 
@@ -1347,22 +1286,30 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   dotted `-c 'hooks.state."…".trusted_hash=…'` does not work (Codex splits
   keys on every `.`), hence the one inline table. A user's own `-c hooks…`
   overrides are applied in order, as Codex would, and merged into it.
-- **Seed**: `codex -- <prompt>` submits it as the first turn. **Exit**:
-  `/exit` (or `/quit`), instant. **Paste**: bracketed paste + 300 ms + Enter
-  submits; a large paste shows as `[Pasted Content N chars]` but is
-  submitted whole as the user's words (4,392 chars / 31 lines, acted on), so
-  Codex takes no prompt files.
+- **Exit**: `/exit` (or `/quit`), instant. **Paste**: bracketed paste +
+  300 ms + Enter (herdr's `agent prompt`) submits; a large paste shows as
+  `[Pasted Content N chars]` but is submitted whole as the user's words
+  (4,392 chars / 31 lines, acted on), so Codex takes no prompt files — its
+  seed does, as every seed (§7). Its `-c hooks={…}` goes on the command line
+  herdr types into the pane, quoted by herdr (verified: the hooks fire).
 - **Esc** fires `Interrupt` and no `Stop`, and writes `turn_aborted` to the
   rollout — even pressed before the first token (Claude's known gap). The
   ledger reads the rollout record (`codex::interrupted_since`), the same
   seam as Claude's, so the `Interrupt` hook is not injected.
 - **Session variables** a Codex shell tool sees: `CODEX_CI`,
   `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_PERMISSION_PROFILE`,
-  `CODEX_SANDBOX*`, … — stripped by the launcher; `CODEX_HOME` is the user's.
+  `CODEX_SANDBOX*`, … — stripped by the launcher; `CODEX_HOME` is the user's,
+  and passed on to the agent's pane (`pass_env`, §1).
 - **Folder trust**: a never-trusted directory opens on "Do you trust the
   contents of this directory?"; answering writes `[projects."…"]` into
-  config.toml. The detector must call it `blocked` (patched, §3) — typed
-  input answers it.
+  config.toml. herdr 0.9.0 reads it as **idle** (seen 2026-10-12; upstream's
+  rule misses it drawn over an update notice too), so the adapter lists it in
+  `[screen] dialogs` and seagents counts the agent blocked there (§3): no
+  seed, no send, no `/exit` goes in (verified by `tools/test-orchestration.sh
+  --codex`, step 7b). A bug report to herdr is the user's call.
+- **Update notice**: an outdated Codex opens on "Update available!" with a
+  menu, which herdr reads as blocked; `send --answer-permission --keys 2`
+  skips it.
 - **Resume**: `codex resume <id> …` takes every TUI option, and a `-c`
   before the subcommand still applies (our hooks fire in the resumed
   session).
@@ -1374,26 +1321,8 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   approval request — verified live: a write prompt stopped at Codex's "Would
   you like to run" gate, `wait` rc 3, no file), `acceptEdits` → `-a
   on-request -s workspace-write`, `bypassPermissions` → `-a never -s
-  danger-full-access`. Measured for every pair: the hooks' `permission_mode`
-  follows `-a` alone — `on-request` → `default`, `never` →
-  `bypassPermissions`, whatever `-s` — so no mode short of bypass may use
-  `never`. So a Codex parent reads as `default` in any on-request setup,
-  and its children are capped at `default` even if it runs
-  `workspace-write`. The other direction — a Codex a human started with `-a
-  never -s read-only` reports `bypassPermissions` but can write nothing — is
-  closed by reading the parent's own `.meta` argv as well
-  (`Launch::bound_mode`, enabled by the adapter's `[launch.argv_mode]`):
-  `permission_argv` in reverse, a flag's value ranking as the most
-  privileged mode that uses it (`-s read-only` → `default`, `-s
-  workspace-write` → `acceptEdits`, `-a never` → bypass; a value no mode
-  uses → the least), plus the long spellings, `-c approval_policy=` /
-  `sandbox_mode=`, and the whole-mode flags (`--dangerously-bypass-…`,
-  `--yolo`, `--full-auto`); the parent's mode is the lesser of that and
-  its hooks' word. So that parent's children get at most `default`. A mode
-  changed mid-session (`/permissions`) or set by a `-p` profile is not on
-  the command line; the lesser still holds. Claude has no `argv_mode`: its
-  hooks report the mode whole and current (Shift+Tab changes it after
-  launch).
+  danger-full-access`. The hooks' `permission_mode` follows `-a` alone —
+  `on-request` → `default`, `never` → `bypassPermissions`.
 - **The rollout** is a log, not a tree: no uuids, no parents. Nodes are its
   lines (uuid = byte offset + 1), chained; `thread_rolled_back {num_turns}`
   hangs off the node before the user turns it drops, so they become a side
@@ -1406,42 +1335,88 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ## Key design decisions (and why)
 
-- **pty-tee, not screen-scraping** — can't read another process's PTY; pty-tee is
-  terminal-agnostic. (kitty introspection was the alternative, no kitty here.)
-- **Vendored herdr detection (2026-07-08)** — we first wrote our own rules, hit
-  the false-positive wall (chat text tripping "blocked"), and replaced them with
-  herdr's engine + manifests wholesale. Rationale: rules are maintained upstream
-  and self-update at runtime; only an engine-version bump (currently v2) ever
-  requires re-syncing the vendored code. **This commits seagents to
-  AGPL-3.0-or-later permanently** (LICENSE added; the "maybe relicense MIT"
-  option is gone). Re-sync procedure: `src/vendor/herdr_detect/VENDORED.md`.
+- **herdr owns the agents; i3 windows are views (2026-10-12)** — the pty-tee
+  wrapper made the window the only way into an agent, so nothing could reach
+  it from another machine. Speaking herdr's remote protocol ourselves was
+  rejected (herdr is installed here and the stand-in would take its name; its
+  surface encoding and libghostty rendering would have to be reproduced), and
+  so was growing our own remote attach (a second remote client next to
+  herdr). With herdr owning the agents, `herdr --remote ssh` works as it is,
+  and seagents lost its relay, its vendored detector and its control socket.
+  HERDR-BACKEND-SPEC.md has the reasoning and every decision (D1–D7).
+- **One process holds the window (`run`)**, as the parent of the attach — not
+  an `exec` into it — because the window and its agent live and die together
+  (closing the window must close the pane), and a detach must be undone.
+- **The hook turn ledger stays** — herdr's `wait` has no baseline and cannot
+  tell an interrupted turn from a finished one (§6).
+- **No lineage** — once any agent can call `herdr` directly, seagents-side
+  family rules, caps and permission ceilings only guard the seagents path.
+- **The herdr CLI, not its socket API** — the CLI is the surface herdr keeps
+  stable across versions; everything goes through `src/herdr.rs`.
 - **focus by recorded con_id** — the only reliable window handle given Terminator's
   shared PID and colliding idle titles.
 - **self-reaping cache** — a fully-exited agent isn't interesting; "idle" already
   means finished-and-waiting-at-prompt (still alive).
+- **License**: seagents was AGPL-3.0-or-later because it vendored herdr's
+  detection code. That code is gone; the license is the user's choice again
+  (left as it is for now, decision D7).
 
 ---
 
 ## Limitations & gotchas
 
+- **The agent runs under the herdr server's environment, not `run`'s.**
+  `FOO=bar seagents run claude` does not reach Claude; only the adapter's
+  `pass_env` (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) and `SEAGENTS_DEBUG` are
+  passed to a new pane (as `--env`, so paths only — herdr's command line is
+  visible in `/proc`). A tab `run` reuses (§1) keeps the environment its shell
+  has. Start the herdr server from the environment you want agents to have,
+  or let `run` start it (`herdr::ensure_server`).
+- **herdr starts the agent by typing its command into the pane's shell** —
+  so it runs your shell's rc files and aliases (the `claude` alias is fine,
+  §1), it shows in the shell's history, and `run /abs/path/claude` loses its
+  path: herdr types the kind's bare executable, so the one on the pane
+  shell's `PATH` runs. A shell that does not reach a prompt (zsh with no
+  `.zshrc` opens its new-user wizard) swallows it: the test harness gives its
+  scratch HOME an empty `.zshrc` for that reason. herdr refuses agent
+  arguments holding control characters (a newline in an argument fails the
+  start).
+- **herdr takes `--session` out of its own argv, anywhere before a `--`**
+  (herdr 0.9.0, `session.rs`): a `send` text — or anything else seagents
+  hands the herdr CLI as one argument — that is exactly `--session` (and the
+  argument after it) or starts with `--session=` is consumed as herdr's
+  option, not passed on. A `--` does not help (the CLI then pastes it as
+  text), so it is left as a known edge; agent arguments to `agent start` sit
+  after its `--` and are safe.
+- **herdr may resume an agent itself after its server restarts** — its own
+  Codex resume (only for argv exactly `resume <id>`, so not one seagents
+  started with hooks) or its Claude integration if installed — and that
+  agent then holds its name. `restore` leaves such a tag to herdr and says so
+  ("herdr already runs an agent named …"), rather than open a window whose
+  `run` would refuse the tag.
+- **Ctrl+B is herdr's attach prefix** in an agent's window (fixed in 0.9.0):
+  Claude's own Ctrl+B is Ctrl+B Ctrl+B. Ctrl+B q (detach) is undone.
+- **Start latency**: herdr's `agent start` settles for ≥ 3 s, so a window
+  shows `starting <tag>…` for a few seconds before the agent.
+- **Text submitted inline travels on a `herdr` command line** (visible in
+  `/proc` while it runs); seeds and long bodies go by reference instead (§9).
+- **Agents started by the pre-herdr binary are not tracked** after
+  installing this one — restart them.
 - **Codex leaves empty `.git`/`.codex`/`.agents` directories in its cwd** (its
   Linux sandbox's mount points) when the cwd is not already a repo root. Claude
   then reads that `.git` as the root of a separate, never-trusted project, so
   the next Claude started there opens on the folder-trust dialog (`wait` reports
   it as `blocked`). Mixing both tools in one non-root directory hits this; the
   integration test runs Codex in a directory of its own for that reason.
-- **Existing sessions need relaunching after upgrades** — the tee/`con_id` only
-  exist for agents started via `seagents run`. Agents already running, or started
-  before a change, won't be tracked/fixed until relaunched.
 - **Multiple agents as tabs in one Terminator window** share one `con_id` (one X
   window); i3 can't focus a tab within a window, so that case is ambiguous.
   Separate windows work perfectly.
-- **Window identity needs one interaction — on a shared-process terminal
-  only.** Under alacritty the `_NET_WM_PID` lookup answers exactly and this
-  does not arise. Under Terminator, if a dialog steals focus at the
-  `run` instant, the ids are recorded as `null` — the first keystroke into the
-  agent heals them (input-driven re-capture). A session never typed into and
-  never focused can't be focused from the HUD until then.
+- **Window identity on a shared-process terminal (Terminator)** comes from
+  the handle (windows seagents opened) or the focused window at launch; if a
+  dialog steals focus at that instant the ids are recorded as `null` or
+  wrong, and — with no input pump since the move to herdr — nothing heals
+  them until the agent is relaunched. Under alacritty identity is exact
+  (`ALACRITTY_WINDOW_ID`).
 - **Mouse flicker on HUD preview** — with i3's default `mouse_warping output`, each
   preview warps the mouse to the agent's monitor and back. Setting `mouse_warping
   none` in i3 removes it, but that's a *global* i3 behavior change (undecided).
@@ -1450,6 +1425,9 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   a container that already holds live windows. The post-reboot case (nothing
   alive) is exact — verified by `tools/test-restore.sh`. Restoring alongside
   survivors puts the missing windows at workspace level instead, and says so.
+- **herdr keeps empty tabs** of agents that ended across its own restart;
+  `restore` reuses those labelled with a restored tag, the rest stay until
+  closed in herdr.
 - **Only `terminator`, `alacritty` and `alacritty-daemon` have built-in launch
   recipes.** All three are verified by `tools/test-restore.sh`.
   `alacritty-daemon` needs a daemon already running (`alacritty --daemon`) and
@@ -1463,105 +1441,104 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   than the live `layout.json` — so if you skip restoring after a reboot and
   then lose terminals in the new boot, `restore` brings back the *old* boot
   (dedup by tag keeps it from duplicating anything live). Delete or rename the
-  file to fall back to the live layout. Boot identity is `btime`, which a large
-  wall-clock step after boot shifts; a capture made before such a step can be
-  mistaken for a previous boot's (harmless: it is set aside and restore
-  dedups by tag).
+  file to fall back to the live layout.
 - **Floating agents restore tiled** — placeholder matching is per-container, and
   an agent that comes back tiled is a smaller surprise than one that doesn't.
 - **Restored windows land on whichever workspace is focused when they spawn**,
-  so don't switch workspaces during a restore. (`restore` focuses each target
-  workspace before appending and spawning; it can't stop you moving.)
-- **Detection covers herdr's agent roster** — any agent with a bundled manifest
-  (claude, codex, gemini, cursor, copilot, …) is classified when launched via
-  `seagents run <agent>`; unrecognized commands show as ⚪ unknown.
-- **`bg` on a suspended agent is a deferred `fg`, by design** — resuming in a
-  background pgrp can't re-enter raw mode (SIGTTOU would re-stop the job), and a
-  backgrounded fullscreen TUI is useless anyway, so the wrapper holds the agent
-  stopped until it owns the terminal again. `fg` unwinds everything.
+  so don't switch workspaces during a restore.
 - **keyd `overload(meta, esc)` kills the HUD on `$mod`+drag** — mouse buttons
   don't pass through keyd, so a capslock(meta)+mouse-drag counts as a *tap* and
   emits Esc into the focused window on release; the HUD quits via its Esc
-  binding (looks like a crash, exit 0). Same stray Esc also interrupts a focused
-  Claude Code when dragging its window. Fix on each keyd machine:
+  binding (looks like a crash, exit 0). Fix on each keyd machine:
   `[global] overload_tap_timeout = 200` in `/etc/keyd/default.conf`, then
-  `keyd reload`. (Done on the laptop 2026-07-08; check other machines.) The HUD
-  additionally ignores an Esc that arrives with more input pending, so torn
-  mouse escape sequences can't fake a quit.
+  `keyd reload`. The HUD additionally ignores an Esc that arrives with more
+  input pending, so torn mouse escape sequences can't fake a quit.
 
 ---
 
 ## Open items / backlog / next steps
 
-- **Merge** `refactor/phase0` (orchestration) into `main`.
+- **Merge** `feat/herdr-backend` into `main` once the hand checks
+  (HERDR-BACKEND-SPEC § Verification) pass on the real desktop; install;
+  restart running agents.
+- `seagents hud` / `status` / `wait` / `send` **against another machine**
+  through herdr's `--machine` API forwarding (needs a saved herdr machine
+  profile) — HERDR-BACKEND-SPEC § Later.
+- A bug report to herdr for Codex's trust question reading idle (the user's
+  call; herdr's contributor rules allow a reproducible bug report, not a PR).
+- Decide the **license** now that nothing of herdr's is vendored (D7).
 - Decide the **mouse_warping** question for the HUD preview.
 - **README.md** for the repo landing page (not written yet).
-- ~~**License** decision~~ — settled 2026-07-08: vendoring herdr's detector
-  locks AGPL-3.0-or-later; LICENSE file added.
 - Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once
   it has been through a real reboot, or keep running it by hand.
 - Optional: **eww** port of the HUD for a prettier always-on widget.
-- Optional: read **herdr's socket API** to fold herdr-hosted agents into the same
-  HUD (the user runs both herdr and seagents).
 
 ---
 
 ## Dev workflow
 
 ```bash
-cargo build            # or --release
+cargo build --release
 cargo run -- status    # etc.
 
-# Inspect detection against a real capture (state + matched rule; --json for
-# the full evaluated-rule breakdown, like herdr's `agent explain`):
-seagents debug-screen ~/.cache/seagents/<pid>.raw <cols> <rows> [--json]
-# get <cols>/<rows> from: stty size < /proc/<child_pid>/fd/0
-# SEAGENTS_DEBUG=1 surfaces manifest-update warnings on stderr
+# herdr's verdict on an agent's screen, and the rule that matched:
+herdr agent explain <pane> [--json]
+herdr pane read <pane> --source visible [--format ansi]
 
-# Regression-test the Ctrl+Z suspend/resume chain headlessly (scripted pty
-# driving an interactive bash — run after touching anything in src/wrapper/):
-python3 tools/test-jobctl.py
+# Try seagents against an isolated herdr session, never the one you work in:
+HERDR_SESSION=sgtest herdr server &        # (strip CLAUDECODE & co. first)
+HERDR_SESSION=sgtest XDG_STATE_HOME=/tmp/sgstate seagents run claude …
+HERDR_SESSION=sgtest herdr server stop; herdr session delete sgtest
+# (XDG_CONFIG_HOME must stay: herdr keeps its socket under it, and a long
+#  path overflows sun_path. The cache, ~/.cache/seagents, is shared — test
+#  tags leave tombstones there for a day.)
 
 # Debug the HUD post-mortem (its terminal vanishes with it):
 SEAGENTS_HUD_LOG=/tmp/hud-events.log seagents hud
 # appends every crossterm input event + the exit reason
 # Tests that open windows run inside a nested, isolated desktop — headless
 # weston + rootful Xwayland on :9 + its own i3, with HOME and XDG_RUNTIME_DIR
-# pointed at a scratch dir — set up by tools/lib-nested-desktop.sh, which each
+# pointed at a scratch dir (and so a herdr server of its own: herdr keeps its
+# socket under HOME) — set up by tools/lib-nested-desktop.sh, which each
 # sources (nd_init <terminal>; nd_start; cleanup on exit kills every window in
-# it, then the desktop).
+# it, the herdr server, then the desktop).
 #
-# Regression-test snapshot/restore. Agents are `sleep`, so nothing real is
-# launched. Fails with a tree diff, and refuses to pass if the pre-restore
-# kill left anything alive (a restore that does nothing would otherwise
-# compare equal). Run it for each terminal recipe.
+# Regression-test snapshot/restore. Each window runs a real `claude --model
+# haiku`, never prompted (it waits at its trust dialog). Fails with a tree
+# diff, and refuses to pass if the pre-restore kill left anything alive (a
+# restore that does nothing would otherwise compare equal). Run it for each
+# terminal recipe.
 tools/test-restore.sh terminator
 tools/test-restore.sh alacritty
 tools/test-restore.sh alacritty-daemon
 
-# Integration-test spawn → wait → status → send (idle-paired; multi-line and
-# > 700-char bodies by reference, carried out in --permission-mode default;
-# a Bash permission gate: wait says blocked, send --answer-permission, and an
+# Integration-test spawn (herdr lists the agent by its tag) → wait → status →
+# send (idle-paired; multi-line and > 700-char bodies by reference, carried
+# out in --permission-mode default; a Bash permission gate: wait says
+# blocked, send and bare --keys refused, --answer-permission --keys 1, and an
 # immediate wait gets the turn) → read (--json holds every answer and the
 # gated call; --from its cursor after one more turn gives just that turn) →
 # a prompt Esc'd before its first response (interrupted; the next send clears
 # it from the input box and arrives alone) → a draft in the box (send rc 6) →
-# lineage/caps and the socket's lineage rule → focus → stop, with a real
-# Claude (`--model haiku`, one-line prompts: a few cents a run) in
+# focus → the trust dialog → stop (its herdr pane gone, the window closed) →
+# closing a window ends its agent → the tombstone, with a real Claude
+# (`--model haiku`, one-line prompts: a few cents a run) in
 # target/sg-it/orchestration, whose folder trust it inherits from the repo.
 # Keeps the real CLAUDE_CONFIG_DIR for auth, and runs as if from inside a
 # Claude session (stand-ins for any of its session variables not already set),
-# checking the agent's /proc/<pid>/environ holds none of them — the launcher's
-# job, not the script's. PASS/FAIL per step.
+# checking the agent's /proc/<pid>/environ holds none of them. PASS/FAIL per step.
 tools/test-orchestration.sh [alacritty|terminator|alacritty-daemon] [--codex]
 # --codex: the same loop with a real Codex (gpt-5.6-luna, low effort) in a
-# scratch CODEX_HOME that links the real auth.json only — seeded turn,
-# capabilities, send, a 41-line paste, Esc → interrupted then a fresh turn,
-# a draft in its composer (send rc 6), read, stop. Skipped with a note when codex isn't installed.
+# scratch CODEX_HOME that links the real auth.json only (update check off) —
+# seeded turn, capabilities, send, a 41-line paste, Esc → interrupted then a
+# fresh turn, a draft in its composer (send rc 6), read, stop; then Codex at
+# its folder-trust question: blocked (seagents_dialog), its seed held back,
+# stop closes the pane, no trust written. Skipped with a note when codex
+# isn't installed.
 ```
 
-The HUD and interactive relay need a real terminal — they can't be driven from a
-pipe/CI, so validate those by hand.
+The HUD and an agent's window need a real terminal — validate them by hand
+(or with a pty harness), not in a pipe.
 
 ---
 
@@ -1577,6 +1554,6 @@ pipe/CI, so validate those by hand.
 
 ## Environment (dev machine — may differ on yours)
 
-Arch Linux, i3wm, Terminator terminal, no kitty. The other laptop also runs i3wm.
-Cargo/rustc were 1.96. seagents assumes X11 i3 (uses `i3-msg -t get_tree`); it has
+Arch Linux, i3wm, Terminator and alacritty, no kitty, herdr 0.9.0. The other
+machine also runs i3wm. Cargo/rustc were 1.96. seagents assumes X11 i3 (uses `i3-msg -t get_tree`); it has
 not been tested on sway/Wayland.

@@ -3,9 +3,11 @@
 Design spec for moving seagents' agents out of its own pty wrapper and into a
 **herdr server**, with each i3 terminal becoming a *view* of one agent.
 
-Status: **spec only, nothing implemented.** Written 2026-10-12 on branch
-`refactor/phase0`. The approach was proven by hand the same day (see
-*Verified*); everything else here is a plan with its open questions marked.
+Status: **implemented** on branch `feat/herdr-backend` (2026-10-12), not yet
+merged or installed. Written the same day, the approach proven by hand first
+(see *Verified*); the decisions below were taken before building, and
+*Decisions D1–D7* during it. Where this and the code disagree, the code and
+[`HANDOFF.md`](./HANDOFF.md) win.
 
 Related: [`HANDOFF.md`](./HANDOFF.md) (what is built), [`ORCHESTRATION-SPEC.md`](./ORCHESTRATION-SPEC.md)
 (spawn / wait / send / stop / read, which this reshapes).
@@ -93,17 +95,17 @@ So the alias keeps working and the window looks as it does today.
 | seagents today | after | notes |
 |---|---|---|
 | pty-tee wrapper (`src/wrapper/`: pumps, lead, monitor, inject, control) | **deleted** | herdr owns the PTY; `run` becomes the launcher above |
-| state detection (`detect.rs`, `vendor/herdr_detect/`, `update-manifests`) | **deleted** → `herdr agent list/get` | loses `manifest/patches.rs` (our Codex trust-dialog rule): must go upstream or be re-checked |
+| state detection (`detect.rs`, `vendor/herdr_detect/`, `update-manifests`, `debug-screen`) | **deleted** → `herdr agent list`, `agent explain` | the Codex trust-dialog patch became the adapter's `[screen] dialogs` (question 5) |
 | `status` / `hud` rows | herdr state + our window records | herdr's `idle`/`done`/`working`/`blocked`/`unknown` |
 | `send` / `stop` (control socket, lineage rule, submit-when-idle, input-box check) | `herdr agent prompt` / `send-keys`, behind our idle hold and draft check | lineage rule deleted (question 4) |
-| `wait` (hook turn ledger, §8) | `herdr agent wait`, or keep the ledger | herdr waits on lifecycle state, not a turn; see open questions |
+| `wait` (hook turn ledger, §8) | **kept**: the ledger, plus herdr's dialog verdict | herdr waits on lifecycle state, not a turn (question 3) |
 | `read` (transcript, §10) | **kept** | reads the agent's own JSONL; independent of the wrapper |
-| `spawn` (§7) | `herdr agent start` + an i3 window | caps and permission bounding deleted with lineage |
+| `spawn` (§7) | an i3 window running `run`, which does `herdr agent start` | caps and permission bounding deleted with lineage; the seed goes in once idle, by reference |
 | `focus` (§4) | kept | the window is the attach window; identity recorded at `run` |
-| `snapshot` / `restore` (§6) | kept, reduced | herdr has its own persistence (`src/persist/`, `agent_resume.rs`); restore may only need to reopen attach windows |
-| hooks (`hook.rs`, `[hooks] inject`) | open | herdr ships its own Claude/Codex integrations (`herdr integration`) |
+| `snapshot` / `restore` (§6) | **kept**: relaunches through `run` with `--resume` | windows and agents die together (question 2), so herdr's persistence restores no agent; `run` reuses the empty tab herdr brings back |
+| hooks (`hook.rs`, `[hooks] inject`) | **kept**, injected through `herdr agent start -- …`, found by `HERDR_PANE_ID` | Claude's settings by file path (D5); herdr's own integration optional (question 3) |
 | Codex adapter | kept for transcript/spawn bits | herdr already identifies Codex |
-| session cache (`registry.rs`) | reshaped | keyed by herdr agent name / pane id, not wrapper pid |
+| session cache (`registry.rs`) | reshaped | keyed by the herdr terminal id (stable across pane moves, unique across servers), not wrapper pid |
 
 ## Open questions (decide before building)
 
@@ -161,8 +163,9 @@ So the alias keeps working and the window looks as it does today.
      misses the trust dialog drawn over an update notice, so it reads as idle
      or unknown, never blocked. A herdr override would have to replace all of
      `codex.toml`, freezing upstream Codex fixes, so it is not used. Instead,
-     `stop` reads the screen through herdr and refuses to type `/exit` while
-     "Do you trust the contents of this directory?" is showing. herdr's
+     the question is listed in the Codex adapter's `[screen] dialogs`, so
+     seagents counts the agent blocked while it shows — no `/exit`, no seed,
+     no send goes into it (see *Decisions*). herdr's
      contributor rules allow a bug report (not a PR); filing one is the
      user's call.
 6. ~~**Reboot.**~~ **Follows from 2:** a window and its agent die together,
@@ -177,6 +180,95 @@ So the alias keeps working and the window looks as it does today.
    agent. Fix: `seagents run` inside a herdr pane (`HERDR_ENV=1`) execs the
    command directly (same pid, so herdr sees `claude`), so the alias stays.
 
+## Decisions D1–D7 (2026-10-12, taken while building)
+
+- **D1 — a detach is undone.** In an agent's window Ctrl+B is herdr's attach
+  prefix (fixed in 0.9.0) and Ctrl+B q detaches. Since a window and its
+  agent die together (question 2), a detach is neither "kill" nor "leave
+  running": `run` starts the attach again at once. `run` stays the attach's
+  parent and tells the cases apart: the window closing (SIGHUP, or stdin
+  polls hung up) closes the agent's pane; the attach exiting 0 with the
+  window still there is a detach; `terminal attach taken over` (another
+  client's `--takeover`) is respected — the window says so and waits,
+  never taking the agent back and never using `--takeover` itself; 3
+  failures within 10 s end the session with the error. herdr 0.9.0's attach
+  exits 0 on a detach and 1 (its reason on stderr) on a takeover or a
+  server shutdown.
+- **D2 — Ctrl+B** stays herdr's (not configurable in 0.9.0): Ctrl+B Ctrl+B
+  sends one. Documented, not worked around.
+- **D3 — `run` starts only agents herdr knows** (`herdr::kind_for`; exit 2
+  otherwise). `run sleep` etc. are gone; the restore test runs real,
+  unprompted `claude` instead.
+- **D4 — tags start with a letter** (herdr's agent-name rule
+  `[a-z][a-z0-9_-]{0,31}`; the tag is the herdr agent name). A directory
+  whose name starts otherwise mints `d<name>-<hex>`, and `restore` folds a
+  captured old tag the same way, for the placeholder and the launch.
+- **D5 — Claude's hook settings by file**: `<runtime dir>/hooks-<key>.json`
+  (0600, removed with the session), passed as `--settings <path>`, since
+  herdr types the agent's command line into the pane's shell (and its
+  history). Codex's `-c hooks=…` stays inline.
+- **D6 — start, then attach**: `run` prints `starting <tag>…` and attaches
+  once `agent start` has returned, so a start failure shows in the window.
+- **D7 — the license** stays as it is for now; with the vendored detector
+  gone it is the user's to choose.
+
+Found while building, and resolved the way most consistent with the above:
+
+- **The agent runs under the herdr server's environment, not `run`'s.** An
+  adapter's `[launch] pass_env` (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) and
+  `SEAGENTS_DEBUG` are passed to a new pane with `herdr tab create --env`
+  (paths only: herdr's command line is visible in `/proc`). Found when a
+  test's `CODEX_HOME` did not reach Codex.
+- **Codex's trust question reads as idle to herdr** — so the seed, too (not
+  only `stop`), would have answered it. The `stop`-only guard became one
+  adapter list, `[screen] dialogs`, read by `status::agent_status`, through
+  which `status`, `wait`, `send`, the seed and `stop` all count the agent
+  `blocked` (rule `seagents_dialog`) while one shows.
+- **A seed pasted right after a trust dialog closes lost its Enter** —
+  Claude reads idle while still settling. The seed waits for 1.5 s of idle,
+  and any prompt whose hook does not report it, with exactly its text still
+  in the box, gets Enter once more.
+- **Session key = herdr terminal id**, not pane id: stable across pane moves
+  and unique across herdr servers (the plan keyed by pane id).
+- **The draft check reads herdr's ANSI screen** (`screen::input_box`): dim
+  text is the placeholder — verified for Claude and Codex.
+- **herdr brings closed tabs back too** on a server restart; `place()`
+  reuses a tab labelled with the tag in any workspace at the cwd.
+
+Fixed after an independent review of the cutover (2026-10-12): `reap` no
+longer touches a session whose `run` is alive (it deleted the `.meta` of an
+agent that had just exited, stranding its window), and the monitor ends the
+window when the `.meta` goes anyway; `stop` waits for a held `send` at most
+2 s; `run` starts the agent only once the pane's shell is in the
+foreground, retrying `agent_pane_busy`; the dialog match normalises boxes,
+wrapping and whitespace and fails closed on an unreadable screen; window-id
+variables are stripped for a new server and a new terminal; a seed is never
+dropped and never printed over the window; `wait`/`send` judge liveness on
+the current `.meta`; the hook settings file is written after the `.meta`; a
+half-made workspace is closed; Ctrl+C no longer ends a window that only
+waits; `restore` leaves a tag herdr already holds to herdr.
+
+## Verification
+
+Verified 2026-10-12: by hand against an isolated herdr session (a pty
+harness standing in for the window): start through the alias's in-pane
+exec, hooks found by pane, send/wait pairing, back-to-back sends,
+by-reference bodies, the draft refusal and clearing, a detach undone, a
+takeover respected, window close ending the agent, `stop` (graceful,
+`--force`, `/exit` typed in the window), the trust dialog with a seed, a
+permission gate answered with `--answer-permission --keys 1`, the
+dropped-turn rule (10.8 s), spawn from inside an agent's pane (no pane or
+session variables leaked), the HUD's `x`, tab reuse after a server restart,
+Codex's trust question and `stop`. In a nested desktop:
+`tools/test-orchestration.sh alacritty --codex` and `tools/test-restore.sh`
+with terminator, alacritty and alacritty-daemon — all pass.
+
+Still to check by hand on the real desktop (HANDOFF § Open items): typing
+`claude` in a fresh Terminator window with no herdr server running; the
+HUD's preview and jump; `focus` on Terminator; `herdr --remote ssh` from the
+PC against agents seagents started, with the window sizes differing; and a
+real reboot through `restore`.
+
 ## Cutover shape
 
 Per `CLAUDE.md`, no wrapper and herdr paths side by side. The wrapper is the
@@ -189,11 +281,7 @@ their own before the cutover, and new paths are verified by running them.
 The `tools/` end-to-end scripts stay and are updated for the new design. `read` and the
 transcript layer are untouched.
 
-**Decided (2026-10-12): full rewrite, one cutover.** The size of the change
-is accepted; do not shrink it, stage it behind flags or keep the wrapper
-alongside. Before starting:
-- settle the open questions above;
-- run one more hand test of the hardest item (3 or 4) against herdr.
+**Decided (2026-10-12): full rewrite, one cutover** — done that way.
 
 ## Later
 

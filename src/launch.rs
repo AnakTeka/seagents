@@ -185,10 +185,9 @@ pub(crate) fn matcher_for(class: &str) -> WindowMatch {
 }
 
 /// What a window seagents opens runs: `argv` under `seagents run --tag <tag>`
-/// (with `--parent` and `--seed-file` when given).
+/// (with `--seed-file` when given).
 pub(crate) struct Run<'a> {
     pub(crate) tag: &'a str,
-    pub(crate) parent: Option<&'a str>,
     /// A prompt file `run` delivers to the agent and deletes (`spawn`).
     pub(crate) seed_file: Option<&'a Path>,
     pub(crate) argv: &'a [String],
@@ -202,8 +201,8 @@ pub(crate) struct Run<'a> {
 /// Launch one terminal window running `run`, carrying the handle minted from
 /// its tag. The one launcher `restore` and `spawn` share.
 ///
-/// The agent runs under `seagents run` so the session is teed and tracked
-/// from its first byte.
+/// The agent runs under `seagents run`, which starts it in herdr and shows
+/// it in the window.
 ///
 /// `SEAGENTS_TERMINAL_CMD` overrides the whole invocation for terminals without
 /// a built-in recipe; `{handle}` (alias `{role}`), `{cwd}` and `{cmd}` are
@@ -212,19 +211,20 @@ pub(crate) struct Run<'a> {
 /// The window starts as a user's shell would, not as a child of whoever
 /// calls this: an agent running `spawn` carries its own session's variables
 /// (the adapters' `session_env` — Claude's session id, messaging socket and
-/// token, …), and a Claude that inherits them never writes its transcript
-/// outside tmux. They are dropped twice over — from the terminal's own
-/// environment, and by an `unset` at the head of the line it runs, which
-/// covers a window hosted by a terminal daemon started with them.
+/// token, …), which a herdr server `run` might start would hand every pane
+/// (and a Claude that inherits them never writes its transcript), and the
+/// variables naming the herdr pane it runs in (`herdr::PANE_ENV`), with which
+/// the new window's `run` would take itself for an agent herdr started and
+/// exec the command untracked. They are dropped twice over — from the
+/// terminal's own environment, and by an `unset` at the head of the line it
+/// runs, which covers a window hosted by a terminal daemon started with them.
 pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), String> {
     let handle = handle_for(run.tag);
     // This very binary, by absolute path: the new window's shell has whatever
     // PATH its rc files give it, and the one it finds need not be us.
     let exe = std::env::current_exe().map_err(|e| format!("locating seagents: {e}"))?;
-    let vars: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .collect();
-    let strip = crate::adapter::session_env(vars.iter().map(String::as_str));
+    let mut strip = crate::adapter::own_session_env();
+    strip.extend(crate::herdr::PANE_ENV.iter().filter(|v| std::env::var_os(v).is_some()).map(|v| v.to_string()));
     let inner = inner_command(&exe, run, &strip);
     let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
@@ -232,7 +232,7 @@ pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), St
     };
 
     let mut cmd = Command::new(program);
-    for name in &strip {
+    for name in strip.iter().map(String::as_str).chain(crate::window::WINDOW_ENV) {
         cmd.env_remove(name);
     }
     cmd.args(rest)
@@ -246,9 +246,9 @@ pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), St
 }
 
 /// The `sh -c` line the terminal runs: `unset` of `strip` (names the adapter
-/// validated, safe unquoted), then `run`. `--tag` so the wrapper identifies
-/// its own window by `handle_for(tag)` rather than by winning a focus race it
-/// cannot win.
+/// validated, safe unquoted), then `run`. `--tag` so `run` identifies its own
+/// window by `handle_for(tag)` rather than by winning a focus race it cannot
+/// win.
 fn inner_command(exe: &Path, run: &Run, strip: &[String]) -> String {
     let unset = if strip.is_empty() {
         String::new()
@@ -260,9 +260,6 @@ fn inner_command(exe: &Path, run: &Run, strip: &[String]) -> String {
         shell_quote(&exe.to_string_lossy()),
         shell_quote(run.tag)
     );
-    if let Some(parent) = run.parent {
-        inner.push_str(&format!(" --parent {}", shell_quote(parent)));
-    }
     if let Some(seed) = run.seed_file {
         inner.push_str(&format!(" --seed-file {}", shell_quote(&seed.to_string_lossy())));
     }

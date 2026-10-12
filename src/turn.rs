@@ -18,14 +18,15 @@
 //! cancel), and the transcript's records after the prompt — `last-prompt`,
 //! `mode`, … — are the ones every turn writes at its start (all measured on
 //! 2.1.284). What is left is the absence of everything a live turn does, so
-//! that is the rule: the detector's own verdict on the screen (before the
-//! ledger is folded in, `.state`'s `screen`) is idle, the tee has been
-//! silent for [`DROPPED_AFTER`], and the agent has written nothing of its own
-//! — no assistant text, reasoning or tool call — since the prompt. Each
-//! clause is something a running turn cannot hide: thinking and a slow first
-//! token show a spinner (working, and its timer repaints every second), a
-//! streamed answer grows the tee, a tool call or a finished text block is an
-//! assistant record, a permission prompt is `blocked`. Codex needs none of
+//! that is the rule: herdr's own verdict on the screen (before the ledger is
+//! folded in, `.state`'s `screen`) is idle, the screen has not changed for
+//! [`DROPPED_AFTER`] (`.state`'s `screen_changed_ms`, which `run`'s monitor
+//! keeps while the agent sits idle in a turn), and the agent has written
+//! nothing of its own — no assistant text, reasoning or tool call — since the
+//! prompt. Each clause is something a running turn cannot hide: thinking and
+//! a slow first token show a spinner (working, and its timer repaints every
+//! second), a streamed answer changes the screen, a tool call or a finished
+//! text block is an assistant record, a permission prompt is `blocked`. Codex needs none of
 //! this (it records `turn_aborted` even then) and never meets it: its
 //! running-turn timer repaints every second.
 //!
@@ -33,14 +34,13 @@
 //! there is: prompted after the last `Stop`, and not seen `idle` since.
 
 use std::path::Path;
-use std::time::UNIX_EPOCH;
 
 use crate::adapter::Turns;
-use crate::registry::{AgentRecord, Files, StateRecord};
+use crate::registry::{AgentRecord, StateRecord};
 use crate::transcript::Format;
 
-/// How long the tee must be silent, with the screen idle and nothing
-/// answered, before a prompt counts as dropped (ms).
+/// How long the screen must stay unchanged, idle and with nothing answered,
+/// before a prompt counts as dropped (ms).
 const DROPPED_AFTER: u64 = 10_000;
 
 /// Where one session's turn edges come from — resolved once per read from
@@ -62,7 +62,7 @@ enum Ask {
     Responded,
 }
 
-/// The tee's last write and the time now, Unix ms.
+/// The screen's last change and the time now, Unix ms.
 #[derive(Clone, Copy, Debug)]
 struct Output {
     last_ms: Option<u64>,
@@ -81,15 +81,10 @@ impl Ledger {
         }
     }
 
-    /// Is the agent in a turn? `state` is the session's `.state`, `files`
-    /// its sidecars (the tee's age is read from them).
-    pub(crate) fn in_turn(&self, agent: &AgentRecord, state: Option<&StateRecord>, files: &Files) -> bool {
+    /// Is the agent in a turn? `state` is the session's `.state`.
+    pub(crate) fn in_turn(&self, agent: &AgentRecord, state: Option<&StateRecord>) -> bool {
         let output = Output {
-            last_ms: std::fs::metadata(&files.raw)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64),
+            last_ms: state.and_then(|s| s.screen_changed_ms),
             now_ms: crate::clock::unix_now_ms(),
         };
         in_turn_with(self.turns, agent, state, output, |ask, path, since| {
@@ -105,7 +100,7 @@ impl Ledger {
     }
 }
 
-/// [`Ledger::in_turn`] with the clock, the tee's age and the transcript
+/// [`Ledger::in_turn`] with the clock, the screen's age and the transcript
 /// passed in.
 fn in_turn_with(
     turns: Turns,

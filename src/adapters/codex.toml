@@ -3,20 +3,10 @@
 # measured on codex-cli 0.152.0 (2026-09-29), live in tmux.
 
 [launch]
-# `codex [PROMPT]` starts the interactive TUI and submits the prompt as the
-# first turn; clap takes `--`, so a prompt starting with `-` stays a prompt
-# (verified).
-seed_prompt      = ["--", "{prompt}"]
-# The prompt goes to a 0600 prompt file in the agent's cwd, and {prompt} is
-# only the line telling it to read that file: argv is readable by every
-# local user in /proc/<pid>/cmdline. Reading a file in its cwd takes no
-# permission, in any mode (verified 2026-09-30).
-seed_by          = "file"
 # Codex has no permission-mode flag: an approval policy (-a) and a sandbox
 # (-s) instead, mapped from Claude's mode words under
-# [launch.permission_argv] — those words because Codex's hooks report a
-# parent's mode in them, so a Claude parent and a Codex parent bound their
-# children alike.
+# [launch.permission_argv], so `spawn --permission-mode` reads the same for
+# either tool.
 permission_modes = ["plan", "default", "acceptEdits", "bypassPermissions"]
 identity         = "hook"
 turns            = "hook"
@@ -33,17 +23,16 @@ session_env      = [
   "CODEX_NETWORK_PROXY_ACTIVE",
   "CODEX_ESCALATE_SOCKET",
 ]
-# `-c key=value` overrides one configuration key (its value TOML);
-# checked against [launch.privileged] config_keys.
-config_flags     = ["-c", "--config"]
+# The agent runs under the herdr server's environment, not `run`'s: where
+# Codex keeps its config (and auth) is passed on to its pane.
+pass_env         = ["CODEX_HOME"]
 
 # `-a` takes on-request | never (0.152 refuses untrusted/on-failure); `-s`
 # read-only | workspace-write | danger-full-access. What the hooks then
 # report as `permission_mode` (measured, every pair, 2026-09-29) follows the
 # approval policy alone: on-request → "default", never →
 # "bypassPermissions", whatever the sandbox (and no flags, the configured
-# on-request, → "default"). So nothing short of bypass may use `-a never`:
-# its child would read as bypass and its own children inherit that.
+# on-request, → "default"). So nothing short of bypass uses `-a never`.
 # No mode has an exact twin, and each takes the nearest that is not more
 # privileged:
 #   plan, default — read-only sandbox; any write, and anything the sandbox
@@ -57,63 +46,6 @@ plan              = ["-a", "on-request", "-s", "read-only"]
 default           = ["-a", "on-request", "-s", "read-only"]
 acceptEdits       = ["-a", "on-request", "-s", "workspace-write"]
 bypassPermissions = ["-a", "never", "-s", "danger-full-access"]
-
-# What a running Codex may pass on is also read off its own command line
-# (`.meta` argv), since its hooks report the approval policy alone: a Codex
-# a human started as `-a never -s read-only` reports bypassPermissions, but
-# may write nothing. The lesser of the two bounds its children. The flags
-# above count in reverse — a value ranks as the most privileged mode using
-# it (`-s read-only` → default, `-a never` → bypassPermissions) — plus these.
-# A mode changed mid-session (/permissions) is not on the command line; the
-# lesser of the two still holds. A `-p` profile's contents are not read.
-[launch.argv_mode]
-aliases     = { "--ask-for-approval" = "-a", "--sandbox" = "-s" }
-config_keys = { approval_policy = "-a", sandbox_mode = "-s" }
-flags       = { "--dangerously-bypass-approvals-and-sandbox" = "bypassPermissions", "--yolo" = "bypassPermissions", "--full-auto" = "acceptEdits" }
-
-# What an agent calling `spawn` may not pass with `--arg`: its child's mode
-# comes from `spawn --permission-mode` (the -a/-s pair above), capped at its
-# own, and each of these reaches past that cap. A human may pass anything.
-# From `codex --help` (0.152.0) and the config keys its binary knows, one
-# reason each. Not listed, touching no permission: -m, -i, --oss,
-# --local-provider, --no-alt-screen, --strict-config, and `-c` keys such as
-# model / model_reasoning_effort.
-[launch.privileged]
-flags = [
-  "-a", "--ask-for-approval",                    # the approval half of the mode
-  "-s", "--sandbox",                             # the sandbox half of the mode
-  "--dangerously-bypass-approvals-and-sandbox",  # bypassPermissions
-  "--yolo",                                      # its alias
-  "--full-auto",                                 # older Codex: on-request + workspace-write in one flag
-  "--approve-for-me",                            # approvals answered by a reviewer model, not a human
-  "--dangerously-bypass-hook-trust",             # runs the user's unreviewed hooks
-  "--add-dir",                                   # more writable roots for the sandbox
-  "-C", "--cd",                                  # moves the workspace the sandbox lets it write (spawn --cwd is the way)
-  "-p", "--profile",                             # a profile carries its own approval_policy / sandbox_mode
-  "--enable", "--disable",                       # features: guardian_approval, exec_permission_approvals, hooks, …
-  "--remote",                                    # a remote app server runs under its own permissions
-]
-config_keys = [
-  "approval_policy", "approvals_reviewer",       # who approves, and whether anyone is asked
-  "sandbox_mode", "sandbox_workspace_write",     # the sandbox, its writable roots and network
-  "sandbox_permissions", "permissions", "default_permissions", "permission_profile",
-  "shell_environment_policy",                    # what environment commands inherit
-  "profile", "profiles",                         # a profile carries its own approval/sandbox
-  "features",                                    # as --enable/--disable
-  "hooks",                                       # a hook runs a command with no approval
-  "notify",                                      # a command run at every turn's end
-  "mcp_servers",                                 # an MCP server is a command started with no approval
-  "projects",                                    # trust_level: skips the folder-trust dialog
-  "network",                                     # proxy and socket allowances
-]
-# Subcommands that run something other than the interactive, approval-bound
-# agent (a command in the sandbox, a diff applied, a server), change the
-# user's configuration, or act on sessions that are not the child's.
-commands = [
-  "exec", "e", "review", "sandbox", "apply", "a", "mcp", "mcp-server", "app-server",
-  "exec-server", "remote-control", "plugin", "login", "logout", "cloud", "queue",
-  "archive", "delete", "unarchive", "migrate-rollouts", "update", "agents", "features",
-]
 
 [hooks]
 # Codex's hooks are Claude's (same events, same payload fields, and
@@ -130,10 +62,6 @@ events           = ["SessionStart", "UserPromptSubmit", "Stop"]
 hookless_flags   = []
 
 [send]
-submit_delay_ms  = 300
-pre_send         = ""
-# Exits at once (verified; `/quit` too).
-exit_sequence    = "/exit"
 # Every paste is taken as the user's words: a bracketed paste of 4,392
 # chars on 31 lines shows as `[Pasted Content 4392 chars]` in the composer
 # and is submitted whole — the UserPromptSubmit `prompt` and the rollout's
@@ -145,7 +73,22 @@ long_prompt      = "paste"
 # draft may sit there. Ctrl+U as in Claude: to the line's start, then the
 # newline before it.
 input_glyph      = "›"
-input_clear      = "\\x15"
+input_clear      = ["ctrl+u"]
+
+[stop]
+# Exits at once (verified; `/quit` too).
+exit_sequence    = "/exit"
+
+[screen]
+# The folder-trust dialog Codex 0.152 opens in a never-trusted directory
+# reads as idle (or unknown) to herdr 0.9.0, never blocked: drawn over an
+# update notice its first row renders as `>─You are in …──╮`, which herdr's
+# `trust_directory` rule misses (and on this machine it read idle even
+# without one, 2026-10-12). Anything typed there answers it: `/exit` + Enter,
+# or a seed prompt's Enter, picks "1. Yes, continue" and writes the folder's
+# trust into config.toml (reproduced 2026-09-30). So while the question is
+# on screen the agent counts as blocked.
+dialogs          = ["Do you trust the contents of this directory?"]
 
 [read]
 # The rollout JSONL under $CODEX_HOME/sessions/YYYY/MM/DD/, path reported by

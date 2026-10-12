@@ -49,7 +49,7 @@ const TAIL: u64 = 256 * 1024;
 const INTERRUPT: &str = "[Request interrupted by user";
 
 pub(super) fn interrupted_since(transcript: &Path, since_ms: u64) -> bool {
-    crate::status::read_tail(transcript, TAIL).is_some_and(|tail| scan(&tail, since_ms))
+    crate::fsutil::read_tail(transcript, TAIL).is_some_and(|tail| scan(&tail, since_ms))
 }
 
 /// Newest line first, stopping at the first one stamped before `since_ms`:

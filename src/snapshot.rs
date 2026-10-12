@@ -10,7 +10,7 @@
 //!    self-reaping — the first `status` after a boot deletes every `.meta`
 //!    whose child pid is gone, which is precisely all of them. So the snapshot
 //!    lives in `state_dir()/layout.json`, written *continuously* (each
-//!    wrapper's monitor thread offers a capture every tick, globally throttled
+//!    `run`'s monitor thread offers a capture every tick, globally throttled
 //!    to one write per [`SNAPSHOT_INTERVAL_SECS`]). An unplanned reboot loses
 //!    at most that interval, and there is no command to remember. The first
 //!    capture of the next boot sets the old boot's layout aside before
@@ -23,7 +23,7 @@
 //!    role, and show a title Claude overwrites on the first repaint. So
 //!    restored windows are launched carrying a minted handle,
 //!    `seagents-<tag>`, and the placeholder swallows on that alone. (Same
-//!    handle ORCHESTRATION-SPEC mints for `spawn`.) *Which* X11 property
+//!    handle `spawn` opens its windows with.) *Which* X11 property
 //!    carries it is the terminal's business — a role for Terminator, a
 //!    WM_CLASS instance for most others — so the stored layout keeps the tag
 //!    and the criterion is built at restore time. See [`WindowMatch`].
@@ -32,6 +32,12 @@
 //!    itself: the `SessionStart` hook `run` injects records the conversation
 //!    id in the session's `.agent` (again after every `/clear`), and the
 //!    capture copies it into the layout for `restore` to resume.
+//!
+//! The agents themselves live in a herdr server, which keeps its workspaces
+//! and tabs across its own restart but not the processes in them: after a
+//! reboot every agent is gone, and `restore` relaunches each through
+//! `seagents run --tag <its tag>`, which takes back the tab herdr kept for it
+//! (`run::place`).
 //!
 //! The layout JSON is emitted here rather than by shelling to `i3-save-tree`,
 //! and installing that tool would not change it. It dumps a workspace whole —
@@ -55,7 +61,7 @@ use crate::i3;
 use crate::launch::{self, WindowMatch};
 use crate::registry::Session;
 
-/// One layout write per this many seconds, across all wrappers. Short enough
+/// One layout write per this many seconds, across all `run`s. Short enough
 /// that moving a window between workspaces is captured before you walk away,
 /// long enough that twenty monitor threads offering a capture every 2s cost
 /// nothing (all but one see a fresh file and return immediately).
@@ -83,7 +89,7 @@ const RESTORED: &str = "layout.restored.json";
 /// The state dir, private (`fsutil::private_dir`): the layout names every
 /// agent's directory and conversation.
 fn layout_dir() -> PathBuf {
-    let dir = crate::vendor::herdr_detect::config::state_dir();
+    let dir = crate::fsutil::state_dir();
     let _ = crate::fsutil::private_dir(&dir);
     dir
 }
@@ -397,6 +403,34 @@ fn leaf_tag(node: &Value) -> Option<String> {
     node["tag"].as_str().map(str::to_string)
 }
 
+/// Every tag a snapshot records, folded into today's charset
+/// (`registry::fold_tag`): a layout captured before tags had to start with a
+/// letter is restored under the folded tag, the same one for the
+/// placeholder and the launch.
+fn fold_tags(snapshot: &mut Value) {
+    fn fold_nodes(nodes: &mut Value) {
+        for node in nodes.as_array_mut().into_iter().flatten() {
+            if let Some(tag) = node["tag"].as_str().map(crate::registry::fold_tag) {
+                node["tag"] = json!(tag);
+            }
+            fold_nodes(&mut node["nodes"]);
+        }
+    }
+    for ws in snapshot["workspaces"].as_array_mut().into_iter().flatten() {
+        for a in ws["agents"].as_array_mut().into_iter().flatten() {
+            if let Some(tag) = a["tag"].as_str().map(crate::registry::fold_tag) {
+                a["tag"] = json!(tag);
+            }
+        }
+        fold_nodes(&mut ws["layout"]);
+    }
+    for a in snapshot["unplaced"].as_array_mut().into_iter().flatten() {
+        if let Some(tag) = a["tag"].as_str().map(crate::registry::fold_tag) {
+            a["tag"] = json!(tag);
+        }
+    }
+}
+
 /// Turn the stored layout into what i3's `append_layout` expects: every leaf's
 /// `tag` becomes a swallow criterion on whichever property this terminal
 /// actually sets.
@@ -428,16 +462,14 @@ fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<
 
 /// Every agent tag the snapshots on disk record — the live one and a previous
 /// boot's still awaiting restore: the names a pending restore will relaunch
-/// under, which a newly minted tag must not take.
+/// under (folded, [`fold_tags`]), which a newly minted tag must not take.
 pub(crate) fn captured_tags() -> HashSet<String> {
-    captured_tags_in(&layout_dir())
-}
-
-fn captured_tags_in(dir: &Path) -> HashSet<String> {
+    let dir = layout_dir();
     [LAYOUT, PREV_BOOT]
         .iter()
         .filter_map(|name| read_layout(&dir.join(name)))
-        .flat_map(|snapshot| {
+        .flat_map(|mut snapshot| {
+            fold_tags(&mut snapshot);
             snapshot["workspaces"]
                 .as_array()
                 .into_iter()
@@ -462,7 +494,7 @@ fn capture_due() -> bool {
         .unwrap_or(false)
 }
 
-/// Offered by every wrapper's monitor thread, every tick, and by `status`.
+/// Offered by every `run`'s monitor thread, every tick, and by `status`.
 /// Globally throttled by the snapshot file's own mtime, so exactly one caller
 /// pays for a capture per interval and the rest return after a single `stat`.
 pub(crate) fn maybe_capture() {
@@ -484,7 +516,7 @@ pub(crate) fn maybe_capture_async() {
 /// Build the snapshot and write it atomically. Returns it for callers that
 /// want to report on what was captured.
 fn capture() -> Result<Value, String> {
-    let mut sessions = crate::registry::list();
+    let sessions = crate::registry::list();
     let tree = i3::tree().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
     let (places, by_xid) = index_tree(&tree);
 
@@ -495,9 +527,9 @@ fn capture() -> Result<Value, String> {
     // `--role` only covers windows seagents launched. At most one of them can
     // be right and nothing here can say which, so the earliest launch keeps
     // the window (the later one is the one that read stale focus) and the rest
-    // are reported unplaced. Typing into them re-captures and heals it.
-    let mut located: HashMap<u64, u64> = HashMap::new();
-    let mut owner: HashMap<u64, (u64, u64)> = HashMap::new(); // con_id -> (started, wrapper)
+    // are reported unplaced.
+    let mut located: HashMap<String, u64> = HashMap::new();
+    let mut owner: HashMap<u64, (u64, String)> = HashMap::new(); // con_id -> (started, key)
     for s in &sessions {
         // Recorded con_id first; the X window id survives an i3 restart and
         // heals it, which is the same order `focus` resolves in.
@@ -510,28 +542,22 @@ fn capture() -> Result<Value, String> {
             continue;
         };
         match owner.get(&con_id) {
-            Some((started, prev)) if *started <= s.meta.started => {
-                let _ = prev;
-                continue;
-            }
+            Some((started, _)) if *started <= s.meta.started => continue,
             Some((_, prev)) => {
                 located.remove(prev);
             }
             None => {}
         }
-        owner.insert(con_id, (s.meta.started, s.meta.wrapper_pid));
-        located.insert(s.meta.wrapper_pid, con_id);
+        owner.insert(con_id, (s.meta.started, s.meta.key.clone()));
+        located.insert(s.meta.key.clone(), con_id);
     }
     // Which conversation each agent is running, as its own SessionStart hook
-    // reported it. None for agents without hooks and for wrappers started by
-    // a pre-hook binary: those restore fresh, without `--resume`.
-    let session_ids: HashMap<u64, Option<String>> = sessions
+    // reported it. None for agents without hooks: those restore fresh,
+    // without `--resume`.
+    let session_ids: HashMap<&str, Option<String>> = sessions
         .iter()
-        .map(|s| (s.meta.wrapper_pid, crate::registry::read_agent(&s.files).session_id))
+        .map(|s| (s.meta.key.as_str(), crate::registry::read_agent(&s.files).session_id))
         .collect();
-    // A placeholder needs a name; sessions from a pre-tag wrapper get theirs
-    // now, in their `.meta`, so the restore that reads it back knows them.
-    crate::registry::backfill_tags(&mut sessions, &captured_tags());
 
     // con_id → tag, for the agents we can actually locate on screen.
     let mut tags: HashMap<u64, String> = HashMap::new();
@@ -540,18 +566,13 @@ fn capture() -> Result<Value, String> {
     let mut unplaced: Vec<Value> = Vec::new();
 
     for s in &sessions {
-        // (An untagged session is one whose `.meta` vanished mid-backfill.)
-        let Some(con_id) = located
-            .get(&s.meta.wrapper_pid)
-            .copied()
-            .filter(|_| !s.meta.tag.is_empty())
-        else {
+        let Some(con_id) = located.get(&s.meta.key).copied().filter(|_| !s.meta.tag.is_empty()) else {
             unplaced.push(json!({
                 "tag": s.meta.tag,
                 "cwd": s.meta.cwd,
                 "dir": s.meta.dir(),
                 "argv": s.meta.argv,
-                "session_id": session_ids[&s.meta.wrapper_pid],
+                "session_id": session_ids[s.meta.key.as_str()],
             }));
             continue;
         };
@@ -577,15 +598,11 @@ fn capture() -> Result<Value, String> {
             .map(|s| {
                 json!({
                     "tag": s.meta.tag,
-                    "parent": s.meta.parent,
-                    "depth": s.meta.depth,
                     "cwd": s.meta.cwd,
                     "dir": s.meta.dir(),
                     "argv": s.meta.argv,
-                    "session_id": session_ids[&s.meta.wrapper_pid],
-                    "terminal_class": located
-                        .get(&s.meta.wrapper_pid)
-                        .map(|c| places[c].class.clone()),
+                    "session_id": session_ids[s.meta.key.as_str()],
+                    "terminal_class": located.get(&s.meta.key).map(|c| places[c].class.clone()),
                 })
             })
             .collect();
@@ -701,7 +718,7 @@ fn summarize(snapshot: &Value) {
     let unplaced = snapshot["unplaced"].as_array().unwrap_or(&empty);
     if !unplaced.is_empty() {
         println!(
-            "\n{} agent{} not captured (window never identified — type into it once):",
+            "\n{} agent{} not captured (window never identified):",
             unplaced.len(),
             if unplaced.len() == 1 { "" } else { "s" }
         );
@@ -726,10 +743,11 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
         );
         return 1;
     };
-    let Ok(snapshot) = serde_json::from_str::<Value>(&text) else {
+    let Ok(mut snapshot) = serde_json::from_str::<Value>(&text) else {
         eprintln!("seagents: {} is not readable as a snapshot", path.display());
         return 1;
     };
+    fold_tags(&mut snapshot);
 
     if prev_boot {
         println!("from the previous boot's layout ({})", path.display());
@@ -744,6 +762,12 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
         .map(|s| s.meta.tag)
         .filter(|t| !t.is_empty())
         .collect();
+    // An agent herdr runs under one of the captured tags without a seagents
+    // window — herdr resumed it itself after its server restarted (its own
+    // Codex resume, or its Claude integration) — holds the name, and `run
+    // --tag` would be refused after its window had opened. Left to herdr,
+    // and said so.
+    let in_herdr: HashSet<String> = crate::herdr::agent_names().unwrap_or_default().into_iter().collect();
 
     let empty = Vec::new();
     let mut skipped = 0usize;
@@ -758,10 +782,16 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
             let tag = a["tag"].as_str().unwrap_or_default();
             if live.contains(tag) {
                 skipped += 1;
+            } else if in_herdr.contains(tag) {
+                eprintln!(
+                    "seagents: {}: herdr already runs an agent named {tag} (resumed by herdr itself?); \
+                     not restored — find it in herdr, or stop it there and restore again",
+                    a["dir"].as_str().unwrap_or("?")
+                );
             } else if !crate::registry::valid_tag(tag) {
-                // Only a layout captured by a pre-tag binary can hold one: its
-                // tags were conversation-id prefixes, and `run` would refuse
-                // an all-digits one after the window had already opened.
+                // Folding makes every tag valid but an empty one (a session
+                // captured before it had a tag), which `run` would refuse
+                // after the window had already opened.
                 eprintln!(
                     "seagents: {}: captured tag {tag:?} is not a valid tag; not restored",
                     a["dir"].as_str().unwrap_or("?")
@@ -770,21 +800,11 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
                 todo.push(a);
             }
         }
-        // Parents before children, so a child's `--parent` can find its parent
-        // live. Launch order within a workspace is free: i3 swallows by
-        // criteria, not by order.
-        todo.sort_by_key(|a| a["depth"].as_u64().unwrap_or(0));
         if !todo.is_empty() {
             plan.push((name, ws, todo));
         }
     }
-    let restoring: HashSet<&str> = plan
-        .iter()
-        .flat_map(|(_, _, todo)| todo.iter().filter_map(|a| a["tag"].as_str()))
-        .collect();
-
     let mut launched = 0usize;
-    let mut started: HashSet<&str> = HashSet::new();
     for (name, ws, todo) in &plan {
         let keep: HashSet<String> = todo
             .iter()
@@ -812,12 +832,7 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
         );
         for a in todo {
             let cmd = resume_argv(a);
-            let lineage = match a["parent"].as_str() {
-                Some(p) if live.contains(p) || restoring.contains(p) => format!("  (under {p})"),
-                Some(p) => format!("  ({p} is not running: restored without a parent)"),
-                None => String::new(),
-            };
-            println!("  {:<24}  {}{lineage}", a["dir"].as_str().unwrap_or("?"), cmd.join(" "));
+            println!("  {:<24}  {}", a["dir"].as_str().unwrap_or("?"), cmd.join(" "));
         }
         if dry_run {
             launched += todo.len();
@@ -839,24 +854,14 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
             }
             let tag = a["tag"].as_str().unwrap_or_default();
             let cwd = a["cwd"].as_str().unwrap_or_default();
-            let parent = a["parent"]
-                .as_str()
-                .filter(|p| parent_is_up(p, &live, &started));
             let argv = resume_argv(a);
-            let run = launch::Run {
-                tag,
-                parent,
-                seed_file: None,
-                argv: &argv,
-                keep_shell: true,
-            };
+            let run = launch::Run { tag, seed_file: None, argv: &argv, keep_shell: true };
             if let Err(e) =
                 launch::spawn_terminal(&run, cwd, a["terminal_class"].as_str().unwrap_or_default())
             {
                 eprintln!("seagents: {}: {e}", a["dir"].as_str().unwrap_or("?"));
                 continue;
             }
-            started.insert(tag);
             launched += 1;
         }
     }
@@ -978,31 +983,6 @@ fn argv_without_resume(argv: &[String], drop: &[String]) -> Vec<String> {
         out.push(arg.clone());
     }
     out
-}
-
-/// Whether a restored agent can be launched under `parent`: `run --parent`
-/// refuses a parent that is not live, so it must be running already or have
-/// been launched earlier in this restore — in which case its terminal may
-/// still be starting, and it is given a moment to register. Otherwise the
-/// lineage is dropped rather than failing the child's launch. (A parent that
-/// restores *after* its child, on a later workspace, is the case this loses.)
-fn parent_is_up(parent: &str, live: &HashSet<String>, started: &HashSet<&str>) -> bool {
-    if live.contains(parent) {
-        return true;
-    }
-    if !started.contains(parent) {
-        return false;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if crate::registry::list().iter().any(|s| s.meta.tag == parent) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
 }
 
 /// Focus the workspace, put it on the output it came from, and append the

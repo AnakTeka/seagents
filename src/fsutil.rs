@@ -1,16 +1,17 @@
 //! Files and directories other processes read while seagents writes them,
 //! and nobody else may read at all: the one atomic-write helper, the one
 //! owner-only file create, and the one owner/symlink-checked directory —
-//! for the cache, the state dir and the runtime dir alike.
+//! for the cache, the state dir and the runtime dir alike — and where the
+//! config and state dirs are.
 //!
-//! Private because of what they hold: the tee (`.raw`) is everything the
-//! agent put on screen, `.agent` and the tombstones its last message, the
-//! transcript index where conversations live. The directories are 0700 and
+//! Private because of what they hold: `.meta` the last prompt seagents sent,
+//! `.agent` and the tombstones the agent's last message, the transcript
+//! index where conversations live. The directories are 0700 and
 //! every file is created 0600 besides, so a file carried out of its
 //! directory (a copy, a restore from backup) stays private too.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -82,4 +83,42 @@ pub(crate) fn tmp_dir_in(tmp: &Path) -> Result<PathBuf, String> {
     let dir = tmp.join(format!("seagents-{}", unsafe { libc::getuid() }));
     private_dir(&dir)?;
     Ok(dir)
+}
+
+/// `$XDG_CONFIG_HOME/seagents` (default `~/.config/seagents`): the user's
+/// adapter overrides.
+pub(crate) fn config_dir() -> PathBuf {
+    xdg_dir("XDG_CONFIG_HOME", ".config")
+}
+
+/// `$XDG_STATE_HOME/seagents` (default `~/.local/state/seagents`): the
+/// layout snapshot and the HUD's remembered view.
+pub(crate) fn state_dir() -> PathBuf {
+    xdg_dir("XDG_STATE_HOME", ".local/state")
+}
+
+fn xdg_dir(env: &str, home_fallback: &str) -> PathBuf {
+    std::env::var_os(env)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(home_fallback)
+        })
+        .join("seagents")
+}
+
+/// Read at most `max` bytes from the end of a file — enough to hold its
+/// latest records without re-reading a long one every poll.
+pub(crate) fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > max {
+        f.seek(SeekFrom::Start(len - max)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }

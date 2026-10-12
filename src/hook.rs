@@ -17,11 +17,17 @@
 //! agent: it always exits 0 and writes nothing to stdout — a `Stop` hook
 //! exiting 2 *prevents Claude from stopping*, and stdout can be read as a hook
 //! decision. It runs synchronously on every prompt and every turn end, so it
-//! is one ancestry walk, one small read, one rename: no i3, no detection, no
+//! is one directory scan, one small read, one rename: no i3, no herdr, no
 //! snapshot. Errors go to `hook.log` in the cache dir, and only under
 //! `SEAGENTS_DEBUG`.
+//!
+//! **Which session.** The agent runs in a herdr pane, and herdr gives
+//! everything in it the pane's id and its server's socket
+//! (`HERDR_PANE_ID`, `HERDR_SOCKET_PATH`), which the hook inherits through
+//! the agent: the session `run` registered for that pane of that server
+//! ([`registry::by_pane`]).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -82,7 +88,7 @@ pub(crate) fn run() -> i32 {
             .read_to_string(&mut input)
             .map_err(|e| format!("stdin: {e}"))?;
         let payload: Value = serde_json::from_str(&input).map_err(|e| format!("payload: {e}"))?;
-        let session = find_session().ok_or("no enclosing seagents session")?;
+        let session = find_session().ok_or("no seagents session for this herdr pane")?;
         record(&session.files, &payload, crate::clock::unix_now_ms())
     });
     let err = match outcome {
@@ -90,22 +96,19 @@ pub(crate) fn run() -> i32 {
         Ok(Err(e)) => e,
         Err(_) => "panicked".to_string(),
     };
-    if std::env::var_os("SEAGENTS_DEBUG").is_some() {
-        if let Ok(mut log) = crate::fsutil::create_private(&registry::cache_dir().join("hook.log"), true) {
-            let _ = writeln!(log, "{} pid {}: {err}", crate::clock::unix_now(), std::process::id());
-        }
-    }
+    registry::debug_log("hook", &err);
     0
 }
 
-/// The session this hook's agent runs in. The wrapper forks the agent before
-/// it writes the `.meta` (the child pid is part of it), so an agent that fires
-/// `SessionStart` very early could beat it; a miss is retried briefly. A hook
-/// only ever runs under a wrapper that injected it, so a miss is rare, and
-/// the common path pays nothing.
+/// The session this hook's agent runs in, by the herdr pane it inherited.
+/// `run` writes the `.meta` before it starts the agent, so a miss is rare (a
+/// hook of an agent seagents did not start, or one from before herdr); it is
+/// retried briefly all the same, and the common path pays nothing.
 fn find_session() -> Option<registry::Session> {
+    let pane = std::env::var("HERDR_PANE_ID").ok().filter(|p| !p.is_empty())?;
+    let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
     for attempt in 0..10 {
-        if let Ok(Some(s)) = registry::enclosing_session(u64::from(std::process::id()), None) {
+        if let Some(s) = registry::by_pane(&pane, &socket) {
             return Some(s);
         }
         if attempt < 9 {
@@ -180,10 +183,19 @@ fn record(files: &Files, payload: &Value, now: u64) -> Result<(), String> {
 /// room for ours.
 ///
 /// How the one flag is written is the adapter's `[hooks] inject`:
-/// [`Inject::Settings`] a whole settings object as JSON (Claude),
-/// [`Inject::Config`] a `hooks=<TOML>` config override that also marks each
-/// hook we add as trusted (Codex, [`codex_trust`]).
-pub(crate) fn inject(argv: &[String], adapter: &Adapter, exe: &Path, cwd: &Path) -> (Vec<String>, Option<String>) {
+/// [`Inject::Settings`] a whole settings object as JSON (Claude), written to
+/// `settings_file` (0600) and passed by its path — herdr starts the agent by
+/// typing its command line into the pane's shell, where inline JSON would
+/// show and land in the shell's history; [`Inject::Config`] a `hooks=<TOML>`
+/// config override that also marks each hook we add as trusted (Codex,
+/// [`codex_trust`]).
+pub(crate) fn inject(
+    argv: &[String],
+    adapter: &Adapter,
+    exe: &Path,
+    cwd: &Path,
+    settings_file: &Path,
+) -> (Vec<String>, Option<String>) {
     let hooks = &adapter.hooks;
     let launch = &adapter.launch;
     let wanted = hooks.inject != Inject::None
@@ -201,7 +213,12 @@ pub(crate) fn inject(argv: &[String], adapter: &Adapter, exe: &Path, cwd: &Path)
         .collect();
     let merged = match hooks.inject {
         // The last one wins in the agent too, so it is the one merged into.
-        Inject::Settings => settings_value(mine.last().map(|o| o.value.as_deref()), cwd, &hooks.events, &command),
+        Inject::Settings => settings_value(mine.last().map(|o| o.value.as_deref()), cwd, &hooks.events, &command)
+            .and_then(|json| {
+                crate::fsutil::write_atomic(settings_file, json.as_bytes())
+                    .map(|()| settings_file.to_string_lossy().into_owned())
+                    .map_err(|e| format!("writing {}: {e}", settings_file.display()))
+            }),
         Inject::Config => config_value(&mine, &hooks.events, &command),
         Inject::None => unreachable!("not wanted"),
     };

@@ -86,7 +86,7 @@ pub(crate) fn responded_since(format: Format, transcript: &Path, since_ms: u64) 
         Format::Claude => claude::head,
         Format::Codex => codex::head,
     };
-    let Some(tail) = crate::status::read_tail(transcript, 256 * 1024) else {
+    let Some(tail) = crate::fsutil::read_tail(transcript, 256 * 1024) else {
         return false;
     };
     for line in tail.rsplit(|b| *b == b'\n').filter(|l| !l.is_empty()) {

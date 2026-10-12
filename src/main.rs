@@ -1,4 +1,4 @@
-//! seagents — observe coding agents running in your own terminal windows.
+//! seagents — your coding agents in herdr, each shown in its own i3 window.
 //!
 //! This file is the command line and nothing else: the clap definition and a
 //! dispatch to the module that owns each command.
@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand};
 
 mod adapter;
 mod clock;
-mod detect;
 mod fsutil;
+mod herdr;
 mod hook;
 mod hud;
 mod i3;
@@ -18,16 +18,16 @@ mod launch;
 mod procfs;
 mod read;
 mod registry;
+mod run;
+mod screen;
 mod send;
 mod snapshot;
 mod spawn;
 mod status;
 mod transcript;
 mod turn;
-mod vendor;
 mod wait;
 mod window;
-mod wrapper;
 
 /// See which of your coding agents is blocked, done or working, and jump to
 /// its i3 window.
@@ -44,28 +44,30 @@ enum Command {
     /// The floating agent HUD (also the default with no command)
     Hud,
 
-    /// Launch an agent, teeing its output (this is how tracking happens)
+    /// Start an agent in herdr and show it in this window (how tracking happens)
     ///
+    /// The agent runs in a herdr server (started if none is), in a tab of
+    /// the workspace for this directory; this window shows it alone, through
+    /// `herdr terminal attach`. Closing the window stops the agent; the agent
+    /// exiting ends `run`. Ctrl+B is herdr's attach prefix (Ctrl+B Ctrl+B
+    /// sends one); a detach (Ctrl+B q) is undone at once. From another
+    /// machine, `herdr --remote ssh <this one>` shows the same agents.
     /// Everything after the command's first word is passed to it untouched,
-    /// flags included: `seagents run claude --model opus`.
+    /// flags included: `seagents run claude --model opus`. The command must
+    /// be an agent herdr can start (claude, codex, gemini, opencode, …; exit
+    /// 2 otherwise). Inside a herdr pane, `run` just runs the command.
     Run {
-        /// The agent's name ([a-z0-9][a-z0-9-]{0,31}, not all digits); minted
-        /// as `<cwd basename>-<4 hex>` when omitted. Refused (exit 2) while a
-        /// live agent holds it. A terminal seagents opened carries the handle
-        /// `seagents-<TAG>`, which is how the wrapper finds its own window.
+        /// The agent's name ([a-z][a-z0-9_-]{0,31}), also its herdr agent
+        /// name; minted as `<cwd basename>-<4 hex>` when omitted. Refused
+        /// (exit 2) while a live agent holds it. A terminal seagents opened
+        /// carries the handle `seagents-<TAG>`, which is how `run` finds its
+        /// own window.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
 
-        /// The spawning agent's tag; must be live. Sets this agent's lineage
-        /// (depth = the parent's + 1), within the same fan-out caps as `spawn`
-        /// (exit 2 past them).
-        #[arg(long, value_name = "TAG")]
-        parent: Option<String>,
-
         /// A prompt to start the agent on (as `spawn` writes it): read,
-        /// deleted, and passed per the agent's adapter — for Claude, as a
-        /// positional prompt after `--` on the agent's command line, never in
-        /// the command line recorded for `restore`
+        /// deleted, and submitted once the agent is idle — by reference, as a
+        /// prompt file in its working directory
         #[arg(long, value_name = "FILE")]
         seed_file: Option<PathBuf>,
 
@@ -81,23 +83,19 @@ enum Command {
 
     /// Open a new terminal running an agent on a prompt; prints its handle
     ///
-    /// Prints `{"tag","child_pid","wrapper_pid","cwd","parent","depth","stops"}`
-    /// once the agent is registered (not once it has started working: follow
-    /// with `seagents wait <tag> --after 0`). Run from inside an agent, the
-    /// child is that agent's: its `parent` and depth come from the caller's
-    /// process ancestry, fan-out is capped (depth 3, 4 live children per
-    /// parent, 12 spawned in all; the user sets them in
-    /// ~/.config/seagents/config.toml, [spawn] max_depth / max_children /
-    /// max_spawned), and its permission mode never ranks above the caller's. The window closes when the agent
-    /// exits. Exit 1, with the reason on stderr, on any refusal.
+    /// Prints `{"tag","pid","pane_id","cwd","stops"}` once the agent has
+    /// started in herdr (not once it has started working: follow with
+    /// `seagents wait <tag> --after 0`). The prompt is submitted once the
+    /// agent is idle — after any dialog it opened on the way up, which is
+    /// answered in its window. The window closes when the agent exits. Exit
+    /// 1, with the reason on stderr, on any refusal.
     Spawn {
         /// Directory to run the agent in (default: this one)
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,
 
         /// The new agent's name (minted as `<dir>-<4 hex>` when omitted);
-        /// refused while live, reserved by another spawn, or recorded in the
-        /// saved layout
+        /// refused while live or recorded in the saved layout
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
 
@@ -106,9 +104,8 @@ enum Command {
         agent: String,
 
         /// Permission mode for the agent: plan, default, acceptEdits or
-        /// bypassPermissions (Codex gets the matching -a/-s pair). From an
-        /// agent: default the caller's own, never above it. From a human:
-        /// passed only if given
+        /// bypassPermissions (Codex gets the matching -a/-s pair); passed
+        /// only if given
         #[arg(long, value_name = "MODE")]
         permission_mode: Option<String>,
 
@@ -119,10 +116,7 @@ enum Command {
         worktree: bool,
 
         /// One extra argument for the agent, repeatable:
-        /// `--arg --model --arg haiku`. From an agent, none that sets
-        /// permissions or sandboxing (the adapter's `privileged` list, e.g.
-        /// --dangerously-skip-permissions, --settings, Codex's -a/-s/-c
-        /// approval_policy=…): use --permission-mode
+        /// `--arg --model --arg haiku`
         #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
         args: Vec<String>,
 
@@ -142,7 +136,7 @@ enum Command {
     /// `reason` and the exit code: `turn` 0 (stops passed N; `last_message` is
     /// that turn's final text), `idle` 0 (no --after and not in a turn: the last
     /// result, at once), `timeout` 2 (call again with the same N), `blocked` 3
-    /// (waiting on a human; `rule` names the gate), `exit` 4 (also for an
+    /// (waiting on a human; `rule` names the dialog), `exit` 4 (also for an
     /// agent that exited earlier, for a day), `interrupted` 5 (the turn after
     /// N was cut short, with no final message), `no_hooks` 6 (the agent was
     /// given a prompt at least 20 s ago and its hooks have never reported, so no turn
@@ -170,12 +164,11 @@ enum Command {
     ///
     /// Prints `{"ok","tag","stops","paired"}`: `wait <tag> --after <stops>`
     /// then waits for the turn this started. By default the text is held
-    /// until the agent is idle (out of its turn, the screen idle), so the
-    /// next turn to end is the one it opened (`paired: true`). A blocked agent
-    /// (a permission prompt, a trust dialog) is refused at once, with the
-    /// gate's `rule`. From inside an agent, only that agent's own descendants
-    /// can be sent to. The text goes in as a bracketed paste when the agent
-    /// takes one, then Enter 300 ms later. Text an agent would take as
+    /// until the agent is idle (out of its turn, herdr reading it idle), so
+    /// the next turn to end is the one it opened (`paired: true`). A blocked
+    /// agent (a permission prompt, a trust dialog) is refused at once, with
+    /// the dialog's `rule`. herdr submits it (`herdr agent prompt`: a paste
+    /// the way the agent takes one, then Enter). Text an agent would take as
     /// quoted data rather than as your words (Claude: over 700 characters or
     /// 2 lines) is written to `<its cwd>/.seagents/prompts/` instead, and it
     /// is sent one line telling it to read that file. A paste lands after
@@ -184,30 +177,29 @@ enum Command {
     /// first response), which is cleared first; anything else is someone's
     /// draft and is refused, --now too. Refusals print
     /// `{"ok":false,"reason","error"[,"rule"]}` and exit: 3 blocked, 2
-    /// busy_timeout (still busy at --timeout; nothing was sent), 4 exit, 5
-    /// forbidden, 6 draft (text someone typed is in the input box; nothing
-    /// was sent), 1 anything else (incl. `unsupported`: no detector knows
-    /// the agent, so only --now can send to it).
+    /// busy_timeout (still busy at --timeout; nothing was sent), 4 exit, 6
+    /// draft (text someone typed is in the input box; nothing was sent), 1
+    /// anything else.
     Send {
         /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
         target: String,
 
         /// Submit at once, even mid-turn (the agent may fold it into the
-        /// running turn: `paired: false`). Never past a gate
+        /// running turn: `paired: false`). Never past a dialog
         #[arg(long)]
         now: bool,
 
-        /// Write TEXT as raw keys, not a paste. Escapes: \e (Esc), \r, \n,
-        /// \t, \0, \\, \xNN; e.g. '\e[B' is Down
+        /// TEXT is key presses, by herdr's key names, space-separated:
+        /// `--keys 'down enter'`, `--keys esc`, `--keys 1`, `--keys ctrl+u`
         #[arg(long)]
         keys: bool,
 
-        /// Don't press Enter after the text
+        /// Paste the text without pressing Enter
         #[arg(long)]
         no_submit: bool,
 
-        /// Write even though the agent is blocked at a gate — to answer it
-        /// (usually with --keys). Humans only: refused from inside an agent
+        /// Let --keys go into an agent blocked at a dialog — to answer it
+        /// (`--keys 1` picks "Yes" on Claude's permission menu)
         #[arg(long)]
         answer_permission: bool,
 
@@ -224,23 +216,24 @@ enum Command {
         text: Option<String>,
     },
 
-    /// Make an agent exit: its exit command, then SIGTERM, then SIGKILL
+    /// Make an agent exit: its exit command, then closing its pane, then SIGKILL
     ///
     /// Types the agent's exit command (Claude: `/exit`) and gives it 5 s;
-    /// then SIGTERMs its process group, then SIGKILLs it, 5 s apart. A
-    /// blocked agent skips the exit command (typed into a permission menu,
-    /// its Enter would pick an answer), and so does one whose input box holds
-    /// a draft someone typed (the command would be submitted as part of it);
-    /// a prompt seagents sent that the agent put back is cleared first.
-    /// Prints `{"ok":true,"tag"}` once the agent is gone. From inside an
-    /// agent, only its own descendants. Exit 5 forbidden, 1 any other failure
-    /// — including an agent that had already exited (no live agent by that
-    /// name).
+    /// then closes its herdr pane (which hangs it up), then SIGKILLs its
+    /// process group, 5 s apart. A blocked agent skips the exit command
+    /// (typed into a permission menu, its Enter would pick an answer), and
+    /// so does one whose screen shows a dialog herdr does not read as one
+    /// (Codex's folder-trust question over an update notice), and one whose
+    /// input box holds a draft someone typed (the command would be submitted
+    /// as part of it); a prompt seagents sent that the agent put back is
+    /// cleared first. Its window closes with it. Prints `{"ok":true,"tag"}`
+    /// once the agent is gone. Exit 1 on any failure — including an agent
+    /// that had already exited (no live agent by that name).
     Stop {
         /// The agent: its tag (`reviewer` or `@reviewer`), or its `pid`
         target: String,
 
-        /// Skip the exit command: SIGTERM at once
+        /// Skip the exit command: close the pane at once
         #[arg(long)]
         force: bool,
     },
@@ -290,22 +283,10 @@ enum Command {
         raw: bool,
     },
 
-    /// The in-PTY job-control anchor `run` wraps around the agent (internal)
-    ///
-    /// The PTY session leader must not BE the agent: a lone process group in
-    /// its own session is "orphaned" and the kernel silently discards the
-    /// SIGTSTP it raises on Ctrl+Z. The anchor forks the agent into a second
-    /// process group (de-orphaning it), then relays stops/exits upward.
-    #[command(name = "__lead", hide = true, disable_help_flag = true)]
-    Lead {
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        cmd: Vec<String>,
-    },
-
     /// The agent's lifecycle hook `run` injects (internal)
     ///
-    /// Reads one hook event (JSON) on stdin and records it in the enclosing
-    /// session's `.agent`. Always exits 0 and prints nothing: a nonzero `Stop`
+    /// Reads one hook event (JSON) on stdin and records it in the `.agent` of
+    /// the session of the herdr pane it runs in. Always exits 0 and prints nothing: a nonzero `Stop`
     /// hook changes what the agent does. Any arguments are ignored, so no
     /// command line can make it a usage error.
     #[command(name = "__hook", hide = true, disable_help_flag = true, disable_version_flag = true)]
@@ -355,33 +336,6 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         workspace: Option<String>,
     },
-
-    /// Fetch fresh detection rules from herdr.dev now (the HUD also does this
-    /// in the background at most once a day)
-    UpdateManifests,
-
-    /// Dev tool: render a .raw capture and show the detection engine's verdict
-    DebugScreen {
-        /// The `.raw` tee to render
-        file: PathBuf,
-
-        /// Columns to render at (`stty size < /proc/<pid>/fd/0` gives the
-        /// live geometry)
-        #[arg(default_value_t = 80)]
-        cols: u16,
-
-        /// Rows to render at
-        #[arg(default_value_t = 24)]
-        rows: u16,
-
-        /// Which agent's rules to evaluate
-        #[arg(long, default_value = "claude")]
-        agent: String,
-
-        /// Add the full evaluated-rule breakdown
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 fn main() {
@@ -392,12 +346,7 @@ fn main() {
 fn dispatch(command: Command) -> i32 {
     match command {
         Command::Hud => hud::run(),
-        Command::Run {
-            tag,
-            parent,
-            seed_file,
-            cmd,
-        } => wrapper::run(cmd, tag, parent, seed_file),
+        Command::Run { tag, seed_file, cmd } => run::run(cmd, tag, seed_file),
         Command::Spawn {
             cwd,
             tag,
@@ -458,7 +407,6 @@ fn dispatch(command: Command) -> i32 {
             tail,
             raw,
         }),
-        Command::Lead { cmd } => wrapper::lead(cmd),
         Command::Hook { .. } => hook::run(),
         Command::Status { json: true, sort } => status::print_json(sort),
         Command::Status { json: false, sort } => status::print(sort),
@@ -469,13 +417,5 @@ fn dispatch(command: Command) -> i32 {
             stagger,
             workspace,
         } => snapshot::restore_cmd(dry_run, stagger, workspace),
-        Command::UpdateManifests => detect::update_manifests_now(),
-        Command::DebugScreen {
-            file,
-            cols,
-            rows,
-            agent,
-            json,
-        } => detect::debug_screen(&file, cols, rows, &agent, json),
     }
 }

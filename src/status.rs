@@ -1,22 +1,22 @@
-//! Milestone 2: derive each tracked agent's state from its teed output.
+//! Each tracked agent's state: herdr's verdict on its screen, fused with the
+//! turn ledger its hooks keep, and the transitions recorded in `.state`.
 //!
-//! Classification is herdr's vendored manifest engine (see
-//! `vendor/herdr_detect/`): we render the raw tail into a screen via vt100,
-//! extract the current OSC title from the stream, and hand both to
-//! `detect_agent_with_osc()`. The engine's per-agent TOML rules (bundled, plus
-//! self-updating from herdr.dev) decide idle/working/blocked.
+//! herdr detects the state — its per-agent rule manifests, kept current
+//! upstream, read the screen of the pane it owns — and seagents asks it for
+//! all agents in one `herdr agent list`. What herdr does not keep, seagents
+//! does: since when the agent has been in its state, whether a finished turn
+//! has been seen yet (the "done" marker), and — for a hook agent — whether it
+//! is mid-turn while its screen looks idle.
 
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-
+use crate::herdr;
 use crate::registry::{Files, StateRecord};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum State {
     Blocked,
-    /// Finished (engine says idle) but the user hasn't looked at it yet — an
-    /// unread marker, not a detection state. Downgrades to Idle on
-    /// acknowledgment (HUD preview/jump, or the agent's window gaining focus).
+    /// Finished (idle) but the user hasn't looked at it yet — an unread
+    /// marker, not a detection state. Downgrades to Idle on acknowledgment
+    /// (HUD preview/jump, or the agent's window gaining focus).
     Done,
     Working,
     Idle,
@@ -54,49 +54,46 @@ impl State {
             State::Unknown => "unknown",
         }
     }
-}
 
-impl From<crate::vendor::herdr_detect::AgentState> for State {
-    fn from(state: crate::vendor::herdr_detect::AgentState) -> Self {
-        use crate::vendor::herdr_detect::AgentState;
-        match state {
-            AgentState::Blocked => State::Blocked,
-            AgentState::Working => State::Working,
-            AgentState::Idle => State::Idle,
-            AgentState::Unknown => State::Unknown,
+    /// herdr's status as a screen verdict. herdr's `done` is idle with its
+    /// own unseen marker on it, which seagents does not use: idle.
+    fn of(status: herdr::Status) -> State {
+        match status {
+            herdr::Status::Idle | herdr::Status::Done => State::Idle,
+            herdr::Status::Working => State::Working,
+            herdr::Status::Blocked => State::Blocked,
+            herdr::Status::Unknown => State::Unknown,
         }
     }
 }
 
 pub(crate) struct Session {
-    /// Stable session id (the wrapper's pid — the cache-file key). External
-    /// consumers should treat it as opaque; a future herdr-socket source will
-    /// mint ids that are not pids.
-    pub(crate) id: u64,
+    /// Stable session id: the key of its cache files (its herdr terminal id).
+    pub(crate) id: String,
     pub(crate) state: State,
     pub(crate) dir: String,
     /// Full launch cwd (dir is its basename).
     pub(crate) cwd: String,
     pub(crate) cmd: String,
+    /// The agent's pid; 0 while it is still starting.
     pub(crate) pid: u64,
+    /// The herdr pane the agent is in now.
+    pub(crate) pane_id: String,
+    /// herdr's own word for the agent's state, before the turn ledger and the
+    /// done marker are folded in; None when herdr does not see the agent.
+    pub(crate) herdr_state: Option<&'static str>,
     /// Seconds the agent has been in its current state ("idle for" on green
     /// rows, "waiting on you for" on red ones). Tracked via observed state
-    /// *transitions* persisted in the `.state` sidecar — NOT output age: an
-    /// idle Claude still emits bytes when its window is merely focused (the
-    /// terminal's focus-in report triggers a repaint), so a preview from the
-    /// HUD would reset an output-mtime clock.
+    /// *transitions* persisted in the `.state` sidecar — herdr keeps no time.
     pub(crate) state_secs: u64,
     /// The conversation's own name, as the agent stamps it into the window
-    /// title: Claude writes its generated `aiTitle` there (behind a state
-    /// glyph), which is the human-readable line `claude --resume` lists. Glyph
-    /// stripped; empty when the agent hasn't named the conversation yet, so a
-    /// caller showing it can fall back to the directory.
+    /// title: Claude writes its generated `aiTitle` there, which is the
+    /// human-readable line `claude --resume` lists. Empty when the agent
+    /// hasn't named the conversation yet, so a caller showing it can fall
+    /// back to the directory.
     pub(crate) title: String,
     /// The agent's name — what every command addresses it by.
     pub(crate) tag: String,
-    /// Its spawner's tag, and its spawn generation (0 without a parent).
-    pub(crate) parent: Option<String>,
-    pub(crate) depth: u32,
     /// What the agent reports about itself (conversation, turn ledger); the
     /// empty record for an agent without hooks.
     pub(crate) agent: crate::registry::AgentRecord,
@@ -144,41 +141,42 @@ impl Sort {
 }
 
 /// Gather every tracked session in the given order. Shared by the `status`
-/// table and the HUD.
+/// table and the HUD. One `herdr agent list` for all of them; with no herdr
+/// server (or none reachable) every agent reads unknown.
 pub(crate) fn collect(sort: Sort) -> Vec<Session> {
     // Sessions whose agent has exited are dropped entirely — their files
     // reaped — rather than shown as corpses.
     crate::registry::reap();
-    let mut sessions: Vec<Session> =
-        crate::registry::list().iter().map(read_session).collect();
+    let agents = herdr::agents().unwrap_or_default();
+    let now = crate::clock::unix_now();
+    let mut sessions: Vec<Session> = crate::registry::list()
+        .iter()
+        .map(|s| read_session(s, agents.iter().find(|a| a.terminal_id == s.meta.key), now))
+        .collect();
     match sort {
         // Within a rank, longest-in-state first: the blocked agent you've
         // kept waiting longest tops the list.
-        Sort::Urgency => sessions.sort_by_key(|s| {
-            (
-                s.state.rank(),
-                std::cmp::Reverse(s.state_secs),
-                s.dir.clone(),
-                s.pid,
-            )
+        Sort::Urgency => sessions.sort_by(|a, b| {
+            (a.state.rank(), std::cmp::Reverse(a.state_secs), &a.dir, &a.id)
+                .cmp(&(b.state.rank(), std::cmp::Reverse(b.state_secs), &b.dir, &b.id))
         }),
-        Sort::Dir => sessions.sort_by_key(|s| (s.dir.clone(), s.state.rank(), s.pid)),
-        Sort::Recent => sessions.sort_by_key(|s| (s.state_secs, s.state.rank(), s.pid)),
+        Sort::Dir => sessions.sort_by(|a, b| (&a.dir, a.state.rank(), &a.id).cmp(&(&b.dir, b.state.rank(), &b.id))),
+        Sort::Recent => {
+            sessions.sort_by(|a, b| (a.state_secs, a.state.rank(), &a.id).cmp(&(b.state_secs, b.state.rank(), &b.id)))
+        }
     }
     sessions
 }
 
-/// Scan `~/.cache/seagents/*.meta`, classify each session, print a table.
+/// Every tracked session, one per line.
 pub fn print(sort: Sort) -> i32 {
     let sessions = collect(sort);
     // Cheap piggyback: any `status` invocation also keeps the reboot snapshot
-    // fresh, which matters for agents whose wrappers predate it.
+    // fresh.
     crate::snapshot::maybe_capture();
     if sessions.is_empty() {
         println!("no agents tracked");
-        return 0;
     }
-
     let tag_w = sessions.iter().map(|s| s.tag.len()).max().unwrap_or(3).max(3);
     let dir_w = sessions.iter().map(|s| s.dir.len()).max().unwrap_or(3).max(3);
     let cmd_w = sessions.iter().map(|s| s.cmd.len()).max().unwrap_or(3).max(3);
@@ -195,8 +193,8 @@ pub fn print(sort: Sort) -> i32 {
             cw = cmd_w,
         );
     }
-    if let Some(warning) = crate::detect::manifest_health_warning() {
-        eprintln!("⚠ {warning}");
+    if !sessions.is_empty() && !herdr::server_running() {
+        eprintln!("⚠ no herdr server is running: states are unknown");
     }
     0
 }
@@ -213,15 +211,15 @@ pub fn print_json(sort: Sort) -> i32 {
             serde_json::json!({
                 "id": s.id,
                 "state": s.state.word(),
+                "herdr_state": s.herdr_state,
                 "dir": s.dir,
                 "cwd": s.cwd,
                 "cmd": s.cmd,
                 "pid": s.pid,
+                "pane_id": s.pane_id,
                 "state_secs": s.state_secs,
                 "title": s.title,
                 "tag": s.tag,
-                "parent": s.parent,
-                "depth": s.depth,
                 "stops": s.agent.stops,
                 "in_turn": s.in_turn,
                 "hooks_ok": s.hooks_ok,
@@ -231,85 +229,79 @@ pub fn print_json(sort: Sort) -> i32 {
             })
         })
         .collect();
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into())
-    );
+    println!("{}", serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into()));
     0
 }
 
-/// Build a Session from one live session's `.meta` (and its sibling `.raw`).
-fn read_session(live: &crate::registry::Session) -> Session {
+/// Build a Session from one live session's `.meta` and what herdr reports
+/// of its agent (None: herdr does not see it — not started yet, or
+/// suspended).
+fn read_session(live: &crate::registry::Session, herdr_agent: Option<&herdr::Agent>, now: u64) -> Session {
     let meta = &live.meta;
-    let child_pid = live.child_pid();
-    let cwd = or_unknown(&meta.cwd);
     let cmd = or_unknown(meta.agent());
-
-    // Prefer the child's *live* pty size (accurate, survives resize and
-    // missing meta); fall back to meta, then a sane default.
-    let size = crate::procfs::live_pty_size(child_pid).or_else(|| Some((meta.rows?, meta.cols?)));
-    let (screen, title) = detect_screen(&live.files.raw, size, &cmd)
-        .unwrap_or((Screen { state: State::Unknown, rule: None }, String::new()));
-
-    let now = crate::clock::unix_now();
+    let screen = screen_of(herdr_agent, &cmd);
+    let herdr_state = herdr_agent.map(|a| State::of(a.status).word());
     let (state, record, agent, in_turn) = settle(&live.files, &cmd, screen, now);
     // Present unacknowledged completions as their own state.
-    let state = if state == State::Idle && !record.seen {
-        State::Done
-    } else {
-        state
-    };
-
+    let state = if state == State::Idle && !record.seen { State::Done } else { state };
     Session {
-        id: meta.wrapper_pid,
+        id: meta.key.clone(),
         state,
         dir: or_unknown(meta.dir()),
-        cwd,
+        cwd: or_unknown(&meta.cwd),
         cmd,
-        pid: child_pid,
+        pid: live.pid(),
+        pane_id: herdr_agent.map_or_else(|| meta.pane_id.clone(), |a| a.pane_id.clone()),
+        herdr_state,
         state_secs: now.saturating_sub(record.since),
-        title,
+        title: herdr_agent.map(|a| conversation_title(&a.title, meta.agent())).unwrap_or_default(),
         tag: meta.tag.clone(),
-        parent: meta.parent.clone(),
-        depth: meta.depth,
         hooks_ok: crate::hook::health(meta, &agent, now),
         agent,
         in_turn,
     }
 }
 
-/// The detector's verdict on one screen.
-struct Screen {
-    state: State,
-    /// For `blocked`: the id of the manifest rule that matched — which gate
+/// herdr's verdict on one agent's screen.
+pub(crate) struct Screen {
+    pub(crate) state: State,
+    /// For `blocked`: the id of the detection rule that matched — which dialog
     /// the agent is at (`live_blocked_form`, a permission prompt, …).
-    rule: Option<String>,
+    pub(crate) rule: Option<String>,
 }
 
-/// Classify the screen the tee's tail renders to, at `size` (rows, cols;
-/// 80×24 when unknown): the engine's verdict, and the conversation title the
-/// agent stamped into the window title — parsed once, used twice. None when
-/// there is no tee to read.
-fn detect_screen(raw: &Path, size: Option<(u16, u16)>, cmd: &str) -> Option<(Screen, String)> {
-    use crate::vendor::herdr_detect::{self as engine, manifest};
-    // 1 MB tail: big enough to contain a full screen repaint for rendering.
-    let buf = read_tail(raw, 1024 * 1024)?;
-    let (rows, cols) = size.unwrap_or((24, 80));
-    let screen = crate::detect::render(&buf, rows, cols);
-    let title = current_title(&buf).unwrap_or_default();
-    let agent = engine::identify_agent(cmd);
-    let state = State::from(engine::detect_agent_with_osc(agent, &screen, &title, "").state);
-    // The fast path reports no rule, and a blocked screen is rare, so the
-    // gate is named by a second, explaining pass only then.
-    let rule = agent.filter(|_| state == State::Blocked).and_then(|agent| {
-        let input = manifest::DetectionInput {
-            screen: &screen,
-            osc_title: &title,
-            osc_progress: "",
-        };
-        manifest::explain_with_input(agent, input).matched_rule.map(|r| r.id)
-    });
-    Some((Screen { state, rule }, conversation_title(&title)))
+/// The screen verdict for an agent of command `cmd` as herdr reports it,
+/// with the dialogs herdr misses ([`agent_status`]).
+pub(crate) fn screen_of(agent: Option<&herdr::Agent>, cmd: &str) -> Screen {
+    match agent_status(agent, cmd) {
+        Some((status, rule)) => Screen { state: State::of(status), rule },
+        None => Screen { state: State::Unknown, rule: None },
+    }
+}
+
+/// The rule a dialog from the adapter's `[screen] dialogs` is reported
+/// under.
+pub(crate) const DIALOG_RULE: &str = "seagents_dialog";
+
+/// herdr's status for an agent of command `cmd`, and for a blocked one the
+/// rule naming its dialog — corrected for the dialogs herdr does not read as
+/// one (the adapter's `[screen] dialogs`), which count as blocked under
+/// [`DIALOG_RULE`] — and so does a screen that could not be read, for an
+/// agent whose adapter lists dialogs: what cannot be checked is not typed
+/// into. The one place `status`, `wait`, `send`, `stop` and the seed ask
+/// whether an agent waits at a dialog. None: herdr does not see the agent.
+/// Costs a herdr call more for a blocked agent (its rule), and one for an
+/// agent whose adapter lists dialogs (its screen).
+pub(crate) fn agent_status(agent: Option<&herdr::Agent>, cmd: &str) -> Option<(herdr::Status, Option<String>)> {
+    let a = agent?;
+    if a.status == herdr::Status::Blocked {
+        return Some((a.status, herdr::blocked_rule(&a.pane_id)));
+    }
+    let dialogs = crate::adapter::for_command(cmd).map(|ad| ad.screen.dialogs).unwrap_or_default();
+    if !dialogs.is_empty() && herdr::read(&a.pane_id, false).ok().is_none_or(|s| crate::screen::shows_any(&s, &dialogs)) {
+        return Some((herdr::Status::Blocked, Some(DIALOG_RULE.to_string())));
+    }
+    Some((a.status, None))
 }
 
 /// Fold what the screen shows together with the turn ledger, record it in
@@ -317,13 +309,12 @@ fn detect_screen(raw: &Path, size: Option<(u16, u16)>, cmd: &str) -> Option<(Scr
 /// the agent is in a turn).
 ///
 /// For an agent whose turns come from hooks the ledger is exact where the
-/// screen is not — Claude streams a plain-text answer with no spinner, which
-/// the detector reads as idle — so: blocked (screen) wins; else in a turn →
-/// working; else the screen's verdict. Recording the fused state (rather
-/// than the raw one) is what keeps the done marker and the "finished"
-/// notification from firing mid-answer. Screen adapters record the screen,
-/// and their turn rule then reads it back.
-fn settle(
+/// screen is not, so: blocked (screen) wins; else in a turn → working; else
+/// the screen's verdict. Recording the fused state (rather than the raw one)
+/// is what keeps the done marker and the "finished" notification from firing
+/// mid-answer. Screen adapters record the screen, and their turn rule then
+/// reads it back.
+pub(crate) fn settle(
     files: &Files,
     cmd: &str,
     screen: Screen,
@@ -333,9 +324,18 @@ fn settle(
     let ledger = crate::turn::Ledger::for_command(cmd);
     if ledger.turns == crate::adapter::Turns::Hook {
         // The ledger's rule reads the screen only for a turn dropped before
-        // it began, and this pass's verdict is the freshest there is.
-        let raw = StateRecord { state: screen.state.word().to_string(), since: now, seen: true, rule: None, screen: None };
-        let in_turn = ledger.in_turn(&agent, Some(&raw), files);
+        // it began, and this pass's verdict is the freshest there is; the
+        // screen's clock is the one `.state` keeps.
+        let current = crate::registry::read_state(files);
+        let raw = StateRecord {
+            state: screen.state.word().to_string(),
+            since: now,
+            seen: true,
+            rule: None,
+            screen: None,
+            screen_changed_ms: current.and_then(|c| c.screen_changed_ms),
+        };
+        let in_turn = ledger.in_turn(&agent, Some(&raw));
         let seen = screen.state;
         let shown = if in_turn && screen.state != State::Blocked {
             Screen { state: State::Working, rule: None }
@@ -347,19 +347,19 @@ fn settle(
     } else {
         let state = screen.state;
         let record = observe_state(files, screen, state, now);
-        let in_turn = ledger.in_turn(&agent, Some(&record), files);
+        let in_turn = ledger.in_turn(&agent, Some(&record));
         (state, record, agent, in_turn)
     }
 }
 
-/// A `.meta` field for display, `?` when an older wrapper didn't record it.
+/// A `.meta` field for display, `?` when it wasn't recorded.
 fn or_unknown(s: &str) -> String {
     if s.is_empty() { "?" } else { s }.to_string()
 }
 
 /// Record `state` into the sidecar if it differs from what's there; returns
-/// the record for the current state. Multiple observers (wrapper monitor + an
-/// open HUD) may race on a transition — both write since≈now, so the
+/// the record for the current state. Multiple observers (`run`'s monitor and
+/// an open HUD) may race on a transition — both write since≈now, so the
 /// divergence is bounded by one poll interval. Harmless. (Each observer's
 /// read-decide-write is one locked registry update, so a race can only ever
 /// order two whole decisions, never interleave them.)
@@ -367,12 +367,12 @@ fn or_unknown(s: &str) -> String {
 /// A working→idle transition is stamped `seen: false` — the agent finished
 /// and nobody has looked yet (the "done" state) — whoever observes it. For a
 /// hook agent that edge is the ledger's (its `Stop`), which lands between
-/// two screen changes: the wrapper's monitor and an open HUD (every 750 ms)
-/// race to see it, and when only the monitor's sighting counted, a HUD that
-/// saw it first wrote plain idle and the done marker was lost.
+/// two screen changes: the monitor and an open HUD (every 750 ms) race to see
+/// it, and when only the monitor's sighting counted, a HUD that saw it first
+/// wrote plain idle and the done marker was lost.
 ///
-/// `seen` is the detector's own verdict, which `shown` may have overridden
-/// with the ledger; it is kept beside the state when the two differ
+/// `seen` is herdr's own verdict, which `shown` may have overridden with the
+/// ledger; it is kept beside the state when the two differ
 /// ([`StateRecord::screen`]) — what `wait` and `send` read to tell a turn
 /// dropped before it began (`turn`).
 fn observe_state(files: &Files, shown: Screen, seen: State, now: u64) -> StateRecord {
@@ -380,14 +380,14 @@ fn observe_state(files: &Files, shown: Screen, seen: State, now: u64) -> StateRe
     let screen = (seen != state).then(|| seen.word().to_string());
     crate::registry::update_state(files, |current| {
         if let Some(p) = current {
-            // A transient Unknown sample (a render caught mid-repaint, e.g.
-            // the focus-in repaint a HUD preview triggers) must not reset a
-            // known state's clock. Only a definite state replaces one.
+            // A transient Unknown sample (herdr not seeing the agent for a
+            // moment) must not reset a known state's clock. Only a definite
+            // state replaces one.
             if state == State::Unknown && p.state != "unknown" {
                 return p.clone();
             }
             if p.state == state.word() {
-                // Still blocked, at another gate: name the new one, but the
+                // Still blocked, at another dialog: name the new one, but the
                 // agent has been waiting on a human all along.
                 p.rule = rule;
                 // Likewise a transient Unknown under a known screen.
@@ -397,14 +397,14 @@ fn observe_state(files: &Files, shown: Screen, seen: State, now: u64) -> StateRe
                 return p.clone();
             }
         }
-        let finished_unwatched = state == State::Idle
-            && current.as_ref().is_some_and(|p| p.state == "working");
+        let finished_unwatched = state == State::Idle && current.as_ref().is_some_and(|p| p.state == "working");
         let record = StateRecord {
             state: state.word().to_string(),
             since: now,
             seen: !finished_unwatched,
             rule,
             screen,
+            screen_changed_ms: current.as_ref().and_then(|p| p.screen_changed_ms),
         };
         *current = Some(record.clone());
         record
@@ -412,9 +412,9 @@ fn observe_state(files: &Files, shown: Screen, seen: State, now: u64) -> StateRe
 }
 
 /// Mark a finished session as seen (done → idle). Called from the HUD when
-/// the user previews or jumps to the agent, and from the wrapper's monitor
-/// when the agent's own window gains focus. The state word and the clock pass
-/// through unchanged; only the seen bit flips.
+/// the user previews or jumps to the agent, and from `run`'s monitor when the
+/// agent's own window gains focus. The state word and the clock pass through
+/// unchanged; only the seen bit flips.
 pub(crate) fn ack_session_files(files: &Files) {
     crate::registry::update_state(files, |current| {
         if let Some(p) = current {
@@ -424,21 +424,18 @@ pub(crate) fn ack_session_files(files: &Files) {
 }
 
 /// Ack by session id (the HUD's handle).
-pub(crate) fn ack_session(id: u64) {
+pub(crate) fn ack_session(id: &str) {
     ack_session_files(&Files::of(id));
 }
 
-/// One detection pass over our *own* session, for the wrapper's monitor
-/// thread: re-classify from the teed tail and stamp the sidecar on
-/// transitions (marking a working→idle completion as unseen — the "done"
-/// state). This is what keeps "idle for" truthful while no HUD or status
-/// invocation is watching. Returns the state (the screen fused with the turn
-/// ledger, see `settle`) plus whether the completion has been
-/// seen, so the caller can notify and acknowledge.
-pub(crate) fn track_session(files: &Files, cmd: &str, child_pid: u64) -> Option<(State, bool)> {
-    let (screen, _) = detect_screen(&files.raw, crate::procfs::live_pty_size(child_pid), cmd)?;
-    let (state, record, _, _) = settle(files, cmd, screen, crate::clock::unix_now());
-    Some((state, record.seen))
+/// One pass over a session for `run`'s monitor: herdr's verdict fused with
+/// the ledger and stamped into `.state` (marking a working→idle completion as
+/// unseen — the "done" state). This is what keeps "idle for" truthful while
+/// no HUD or status invocation is watching. Returns the fused state, whether
+/// the completion has been seen, and whether the agent is in a turn.
+pub(crate) fn track(files: &Files, cmd: &str, agent: Option<&herdr::Agent>) -> (State, bool, bool) {
+    let (state, record, _, in_turn) = settle(files, cmd, screen_of(agent, cmd), crate::clock::unix_now());
+    (state, record.seen, in_turn)
 }
 
 /// Compact human duration for table/HUD cells: 42s, 7m, 1h05m, 3d.
@@ -458,105 +455,29 @@ pub(crate) fn humanize_secs(secs: u64) -> String {
     }
 }
 
-/// Read at most `max` bytes from the end of a file — enough to hold the most
-/// recent title without re-reading a long session every poll.
-pub(crate) fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len > max {
-        f.seek(SeekFrom::Start(len - max)).ok()?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    Some(buf)
-}
-
-/// The current window title: the most recent non-empty OSC title in the stream.
-/// Skipping empties matters for detection too: Claude clears the title
-/// transiently, and the engine's title rules should see the last real one.
-/// This is exactly what the terminal emulator mirrors into its X11 window title,
-/// so it's the handle seagents uses to locate the agent's i3 window.
-pub(crate) fn current_title(data: &[u8]) -> Option<String> {
-    all_titles(data)
-        .into_iter()
-        .rev()
-        .find(|t| !t.trim().is_empty())
-}
-
 /// Titles an agent shows before it has named the conversation: its own product
 /// banner, which says strictly less than the launch directory does. Treated as
 /// no title at all.
 const PLACEHOLDER_TITLES: &[&str] = &["Claude Code"];
 
-/// The conversation's display name, out of a raw window title.
+/// The conversation's display name, out of the window title herdr reports
+/// for an agent started as `cmd` (its command's first word).
 ///
-/// Claude stamps the conversation's generated `aiTitle` into the terminal title
-/// behind a state glyph, so dropping the glyph leaves exactly the line
-/// `claude --resume` lists. Comes back empty when there is nothing to show — a
-/// not-yet-named session's banner, or one of the punctuation-only titles Claude
-/// sometimes emits — so the caller can fall back to the directory.
-pub(crate) fn conversation_title(raw: &str) -> String {
-    let title = strip_title_glyph(raw);
-    if PLACEHOLDER_TITLES.contains(&title) {
+/// Claude stamps the conversation's generated `aiTitle` into the terminal
+/// title behind a state glyph, so dropping the glyph leaves exactly the line
+/// `claude --resume` lists. Comes back empty when there is nothing to show —
+/// a not-yet-named session's banner, the command line the shell put there
+/// before the agent set its own (`claude --model haiku`), or one of the
+/// punctuation-only titles Claude sometimes emits — so the caller can fall
+/// back to the directory.
+pub(crate) fn conversation_title(raw: &str, cmd: &str) -> String {
+    let title = raw
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'')
+        .trim();
+    let command_line = !cmd.is_empty() && (title == cmd || title.starts_with(&format!("{cmd} ")));
+    if PLACEHOLDER_TITLES.contains(&title) || command_line {
         String::new()
     } else {
         title.to_string()
     }
-}
-
-/// Strip the leading state glyph Claude prefixes onto its window title
-/// (`✳ `, `◐ `, …) so the remainder can be compared to a transcript's
-/// `aiTitle` — or shown as the conversation's name.
-pub(crate) fn strip_title_glyph(title: &str) -> &str {
-    title
-        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '"' && c != '\'')
-        .trim()
-}
-
-/// Collect the text of every OSC 0/1/2 (title) sequence in the stream, in order.
-fn all_titles(data: &[u8]) -> Vec<String> {
-    let mut titles = Vec::new();
-    let n = data.len();
-    let mut i = 0;
-    while i + 1 < n {
-        if data[i] == 0x1b && data[i + 1] == b']' {
-            let num_start = i + 2;
-            let mut j = num_start;
-            while j < n && data[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > num_start && j < n && data[j] == b';' {
-                let num: u32 = std::str::from_utf8(&data[num_start..j])
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(u32::MAX);
-                let text_start = j + 1;
-                // Terminator is BEL (0x07) or ST (ESC \).
-                let mut k = text_start;
-                let mut end: Option<(usize, usize)> = None;
-                while k < n {
-                    if data[k] == 0x07 {
-                        end = Some((k, k + 1));
-                        break;
-                    }
-                    if data[k] == 0x1b && k + 1 < n && data[k + 1] == b'\\' {
-                        end = Some((k, k + 2));
-                        break;
-                    }
-                    k += 1;
-                }
-                if let Some((text_end, after)) = end {
-                    if num <= 2 {
-                        if let Ok(s) = std::str::from_utf8(&data[text_start..text_end]) {
-                            titles.push(s.to_string());
-                        }
-                    }
-                    i = after;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    titles
 }

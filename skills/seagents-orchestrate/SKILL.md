@@ -6,9 +6,11 @@ description: Delegate work to other coding agents, each in its own terminal wind
 # Orchestrating agents with seagents
 
 `seagents` launches agents in real terminal windows the human can watch and
-type into, and lets you drive the ones **you** spawned. Every command prints
-JSON on stdout (read that, not stderr) and exits with a meaningful code.
-`seagents <cmd> --help` is the authoritative reference.
+type into (each agent runs in a herdr server, shown in its own window), and
+lets you drive them. Every command prints JSON on stdout (read that, not
+stderr) and exits with a meaningful code. `seagents <cmd> --help` is the
+authoritative reference. Drive only the agents you spawned: seagents does not
+stop you from driving others (the human's, a sibling's), but don't.
 
 ## Spawn, or do it yourself?
 
@@ -26,7 +28,8 @@ Write it for a stranger. It must say:
 - the task, and what **done** means (the exact deliverable, where it goes);
 - the relevant paths, commands, constraints and decisions — everything it
   needs, since it cannot ask you;
-- its tag and yours: "You are `<tag>`, spawned by `<your tag>` via seagents";
+- its tag and where it came from: "You are `<tag>`, spawned by an
+  orchestrating agent in `<your dir>` via seagents";
 - that **its final message is its report**: "End with a self-contained
   summary of what you did, what you found, and anything left undone — that
   final message is all I receive." Do not rely on it writing a file for you;
@@ -40,15 +43,18 @@ Long or multi-line prompts go in a file: `--prompt-file F`.
 
 ```sh
 seagents spawn --tag review-auth --cwd "$PWD" --prompt-file /tmp/seed.md
-# {"tag":"review-auth","child_pid":…,"wrapper_pid":…,"cwd":…,"parent":"<you>","depth":1,"stops":0}
+# {"tag":"review-auth","pid":…,"pane_id":"w2:p3","cwd":…,"stops":0}
 
 seagents wait review-auth --after 0 --timeout 100s
 # {"tag":"review-auth","reason":"turn","stops":1,"state":"idle","rule":null,
 #  "last_message":"<its report>","transcript_path":…}
 ```
 
-1. **spawn** returns once the agent is registered, not once it has worked.
-   `stops` is its count of finished turns: 0 now.
+1. **spawn** returns once the agent has started, not once it has worked.
+   `stops` is its count of finished turns: 0 now. The prompt reaches it once
+   it is idle — after any dialog it opened on the way up (a folder-trust
+   question), which the human answers in its window; `wait` says `blocked`
+   meanwhile.
 2. **wait `--after N`** blocks until the turn after N ends. N is 0 after
    spawn, and the `stops` that `send` returned after a send.
 3. **Timeouts are normal.** Keep `--timeout` below your shell tool's limit
@@ -69,8 +75,8 @@ seagents wait review-auth --after 0 --timeout 100s
 7. **stop** it when you are done with it: `seagents stop review-auth` →
    `{"ok":true,"tag":"review-auth"}` once it has exited (its window closes).
 
-`seagents status --json` lists every agent with `tag`, `parent`, `depth`,
-`state`, `stops`, `in_turn`.
+`seagents status --json` lists every agent with `tag`, `state`, `stops`,
+`in_turn`.
 
 ## What `wait` returns
 
@@ -79,7 +85,7 @@ seagents wait review-auth --after 0 --timeout 100s
 | `turn` | 0 | read `last_message`; continue |
 | `idle` | 0 | (no `--after`) nothing running; `last_message` is its last result |
 | `timeout` | 2 | call the same `wait` again |
-| `blocked` | 3 | **stop and tell the human**: which child (tag), and the gate (`rule`, e.g. a permission prompt or the folder-trust dialog). Never answer it yourself. Then wait again with the same N |
+| `blocked` | 3 | **stop and tell the human**: which child (tag), and the dialog (`rule`, e.g. a permission prompt or the folder-trust dialog). Never answer it yourself. Then wait again with the same N |
 | `exit` | 4 | the child is gone (crashed, stopped, or someone closed it); `last_message` is its last turn's result. `wait` and `read` keep answering for an exited child for a day (until its tag is reused); `send`/`stop` to it exit 1 (no live agent has that tag) |
 | `interrupted` | 5 | a human pressed Esc on that turn; it has no report. Ask the human, or `send` again |
 | `no_hooks` | 6 | seagents cannot see that child's turns (its hooks never reported); `message` says why. Tell the human; waiting again will not help |
@@ -89,15 +95,13 @@ without `--after` first to get your bearings.
 
 ## Refusals and limits
 
-- `spawn` exits 1 with the reason on stderr. **Caps**: depth ≤ 3, ≤ 4 live
-  children per parent, ≤ 12 spawned agents in total (the human's defaults;
-  they are the human's to change, not yours). The message names the
-  children in the way: `wait` on one and `stop` it before spawning more.
-  A taken `--tag`: pick another (or omit it; one is minted).
-- `send`/`stop` exit 5 (`forbidden`): you may only drive **your own
-  descendants** — never your parent, a sibling, or the human's own agents.
-  Reading (`wait`, `read`, `status`) works on anyone.
-- `send` exit 3 (`blocked`): the child waits at a gate; tell the human.
+- `spawn` exits 1 with the reason on stderr. A taken `--tag`: pick another
+  (or omit it; one is minted). Tags are `[a-z][a-z0-9_-]{0,31}`.
+- **No caps are enforced**, so keep yourself to a few children at a time
+  (say four live ones, none of them spawning more): every child is a window
+  on the human's screen and a bill. `wait` on one and `stop` it before
+  spawning more.
+- `send` exit 3 (`blocked`): the child waits at a dialog; tell the human.
   Exit 2 (`busy_timeout`): it stayed busy for all of `--timeout`; nothing was
   sent — wait for its turn, then send again. Exit 4: it exited while your
   `send` was held waiting for it (a child that had already exited is exit 1:
@@ -106,13 +110,16 @@ without `--after` first to get your bearings.
   (`draft`): someone (the human) has text typed in the child's input box;
   nothing was sent, and `--now` won't help — tell the human, or try again
   later.
-- A child's permission mode is yours by default and can never be higher.
-  Set it with `--permission-mode`; an `--arg` that touches permissions or
-  sandboxing (`--dangerously-skip-permissions`, `--settings`, `--allowedTools`,
-  Codex's `-a`/`-s`/`-c approval_policy=…`, …) is refused (exit 1, naming it).
-- **Never pass `--answer-permission`** (refused for agents anyway: gates are the
-  human's) **or `--now`** (it breaks the pairing between your prompt and the
-  turn `wait` returns) **without stating the reason** to the human.
+- A child starts in the tool's configured permission mode unless you pass
+  `--permission-mode` (`plan`, `default`, `acceptEdits`, `bypassPermissions`).
+  Pass one no higher than your own, and never an `--arg` that loosens
+  permissions or sandboxing (`--dangerously-skip-permissions`, `--settings`,
+  `--allowedTools`, Codex's `-a`/`-s`/`-c approval_policy=…`, …): nothing
+  refuses it, so it is on you.
+- **Never pass `--answer-permission`** (dialogs are the human's: what you
+  answer, they did not approve) **or `--now`** (it breaks the pairing between
+  your prompt and the turn `wait` returns) **without stating the reason** to
+  the human.
 
 ## Fan-out
 

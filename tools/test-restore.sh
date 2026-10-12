@@ -13,15 +13,30 @@
 # swallow criterion is chosen at restore time (window_role for Terminator, a
 # WM_CLASS instance for alacritty), so both paths need exercising.
 #
-# Requires what the nested desktop does, and the terminal under test. Agents
-# are `sleep`, so nothing here launches a real agent.
+# Requires what the nested desktop does, the terminal under test, and Claude
+# Code: `seagents run` starts only agents herdr knows, so each window runs a
+# real `claude --model haiku` that is never prompted (in /tmp, $HOME and /etc
+# it just waits at its folder-trust dialog). It keeps the real
+# CLAUDE_CONFIG_DIR, as tools/test-orchestration.sh does.
 #
 # Exits non-zero and prints a diff if the restored tree differs from the
 # captured one.
 set -u
 
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  export CLAUDE_CONFIG_DIR
+else
+  REAL_HOME=$HOME
+fi
+command -v claude >/dev/null || { echo "claude is not on PATH"; exit 1; }
+AGENT="claude --model haiku"
+
 . "$(dirname "$0")/lib-nested-desktop.sh"
 nd_init "${1:-terminator}"
+if [ -n "${REAL_HOME:-}" ]; then
+  ln -s "$REAL_HOME/.claude" "$HOME/.claude"
+  ln -s "$REAL_HOME/.claude.json" "$HOME/.claude.json"
+fi
 nd_start
 
 dump() {  # the shape of workspace 7: nesting, layouts, percentages
@@ -36,8 +51,8 @@ def walk(n,ws=None,d=0):
 walk(json.load(sys.stdin))"
 }
 
-launch() {  # handle, cwd, tag [, parent] — the handle is what `restore` mints: seagents-<tag>
-  local inner="seagents run --tag '$3' ${4:+--parent '$4'} -- sleep 3600"
+launch() {  # handle, cwd, tag — the handle is what `restore` mints: seagents-<tag>
+  local inner="seagents run --tag '$3' -- $AGENT"
   case $TERM_UNDER_TEST in
     terminator) terminator -u --role "$1" --working-directory="$2" \
                   -x /bin/sh -c "$inner" >/dev/null 2>&1 &
@@ -69,12 +84,12 @@ if [ "$TERM_UNDER_TEST" != terminator ]; then
   i3-msg 'workspace --no-auto-back-and-forth "8"' >/dev/null
   case $TERM_UNDER_TEST in
     alacritty) alacritty --class "Alacritty,seagents-t9" --working-directory /tmp \
-                 -e /bin/sh -c "seagents run -- sleep 3600" >/dev/null 2>&1 &
+                 -e /bin/sh -c "seagents run -- $AGENT" >/dev/null 2>&1 &
                ND_PIDS="$ND_PIDS $!" ;;
     alacritty-daemon)
                alacritty msg --socket "$ASOCK" create-window \
                  --class "Alacritty,seagents-t9" --working-directory /tmp \
-                 -e /bin/sh -c "seagents run -- sleep 3600" 2>/dev/null ;;
+                 -e /bin/sh -c "seagents run -- $AGENT" 2>/dev/null ;;
   esac
   for _ in $(seq 1 60); do
     i3-msg -t get_tree | grep -q "seagents-t9" && break
@@ -107,9 +122,9 @@ i3-msg 'workspace --no-auto-back-and-forth "7"' >/dev/null
 launch seagents-t1 /tmp t1
 launch seagents-t2 "$HOME" t2
 i3-msg 'split v' >/dev/null
-# t3 is t1's child: restore must bring the lineage back too.
-launch seagents-t3 /etc t3 t1
-sleep 1
+launch seagents-t3 /etc t3
+# Each `run` records its window once herdr has its agent up.
+sleep 6
 
 before=$(dump)
 echo "=== captured layout ==="; echo "$before"
@@ -145,7 +160,7 @@ echo "$out" | grep -qE 'restored 3 windows' || {
   echo "FAIL: restore did not launch 3 windows"; exit 1; }
 [ ! -e "$STATE/layout.prev-boot.json" ] && [ -f "$STATE/layout.restored.json" ] || {
   echo "FAIL: restoring from the previous boot's layout did not consume it"; exit 1; }
-sleep 4
+sleep 8
 after=$(dump)
 echo "=== restored layout ==="; echo "$after"
 
@@ -156,16 +171,16 @@ if [ "$before" != "$after" ]; then
 fi
 echo "PASS ($TERM_UNDER_TEST): restored tree matches the captured one"
 
-# The restored agents are the captured ones by name, lineage included.
+# The restored agents are the captured ones by name.
 tags=$("$SEA" status --json | python3 -c "
 import json,sys
-print(' '.join(sorted('%s:%s:%s' % (s['tag'], s['parent'], s['depth']) for s in json.load(sys.stdin))))")
-want="t1:None:0 t2:None:0 t3:t1:1"
+print(' '.join(sorted(s['tag'] for s in json.load(sys.stdin))))")
+want="t1 t2 t3"
 [ "$tags" = "$want" ] || { echo "FAIL: restored tags '$tags', want '$want'"; exit 1; }
-echo "PASS: restored agents carry their captured tags and lineage ($tags)"
+echo "PASS: restored agents carry their captured tags ($tags)"
 
 # Idempotent by tag: everything captured is live, so a second restore is a no-op.
-# It reads the live layout now; capture it (the restored wrappers' own offers
+# It reads the live layout now; capture it (the restored agents' own offers
 # are throttled behind the post-reboot one).
 "$SEA" snapshot >/dev/null || { echo "snapshot failed"; exit 1; }
 out=$("$SEA" restore --stagger=0) || { echo "second restore failed"; exit 1; }

@@ -2,12 +2,10 @@
 //!
 //! A ratatui panel meant to run in an i3 floating window. It polls the same
 //! session data as `seagents status`, colour-codes each agent by state, and on
-//! Enter or left-click focuses that agent's i3 window (milestone 3). Spawned
-//! agents sit under the agent that spawned them, and the selected row can be
-//! sent a prompt or stopped through the same control socket `seagents send` /
-//! `stop` use.
+//! Enter or left-click focuses that agent's i3 window (milestone 3). The
+//! selected row can be sent a prompt or stopped, through the same code
+//! `seagents send` / `stop` run.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::mpsc;
@@ -24,15 +22,12 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::send::{Mode, Reply, Request};
+use crate::send::Reply;
 use crate::status::{self, Session, State};
 
 const REFRESH: Duration = Duration::from_millis(750);
 
 pub fn run() -> i32 {
-    // Long-lived surface → good place to opportunistically refresh detection
-    // manifests (daily-throttled, background, silent).
-    crate::detect::spawn_manifest_update();
     if enable_raw_mode().is_err() {
         eprintln!("seagents: the HUD needs a terminal (try `seagents status` instead)");
         return 1;
@@ -108,9 +103,10 @@ impl Label {
 /// chose it (`@reviewer`), else the directory. A tag `run` minted is the
 /// directory plus four hex digits of noise — it says nothing the directory
 /// doesn't, and every hand-started agent has one — while a chosen tag is the
-/// name the agent is addressed by, and a spawned child usually runs in its
-/// parent's directory, where the directory would name every row of the fleet
-/// alike. `@` because that is how a target is spelled on the command line.
+/// name the agent is addressed by, and spawned agents usually run in their
+/// spawner's directory, where the directory would name every row of the
+/// fleet alike. `@` because that is how a target is spelled on the command
+/// line.
 fn name_of(s: &Session) -> String {
     if s.tag.is_empty() || crate::registry::minted_from(&s.tag, Path::new(&s.cwd)) {
         s.dir.clone()
@@ -128,21 +124,9 @@ fn label_of(s: &Session, labels: Label) -> String {
     }
 }
 
-/// How the socket client addresses a row: its tag, or its child pid for a
-/// session whose wrapper predates tags (the one resolver takes either).
+/// How a row is addressed: its tag (the one resolver takes it).
 fn target_of(s: &Session) -> String {
-    if s.tag.is_empty() {
-        s.pid.to_string()
-    } else {
-        s.tag.clone()
-    }
-}
-
-/// One line of the list: a session and how deep it sits in the lineage tree
-/// on screen (0 for a top-level row).
-struct Row {
-    s: Session,
-    level: usize,
+    s.tag.clone()
 }
 
 /// A keystroke-owning footer: while one is up, keys edit it instead of
@@ -157,7 +141,7 @@ enum Input {
 }
 
 struct App {
-    rows: Vec<Row>,
+    rows: Vec<Session>,
     list: ListState,
     sort: status::Sort,
     labels: Label,
@@ -181,7 +165,7 @@ impl App {
     fn new(sessions: Vec<Session>, sort: status::Sort, labels: Label, message: String) -> App {
         let (done_tx, done_rx) = mpsc::channel();
         let mut app = App {
-            rows: lineage(sessions),
+            rows: sessions,
             list: ListState::default(),
             sort,
             labels,
@@ -200,109 +184,8 @@ impl App {
     }
 
     fn selected(&self) -> Option<&Session> {
-        self.list.selected().and_then(|i| self.rows.get(i)).map(|r| &r.s)
+        self.list.selected().and_then(|i| self.rows.get(i))
     }
-}
-
-/// Order a sorted list as a lineage forest: every spawned agent directly
-/// under its parent, indented one level per generation. An agent whose parent
-/// is not live (or who has none) is a top-level row.
-///
-/// The sort still decides, one level at a time: a family is placed where its
-/// **highest-sorted member** would be, and siblings likewise. So under
-/// urgency a child blocked on a permission prompt lifts its whole family to
-/// the top, rather than hiding under an idle parent at the bottom — the HUD's
-/// one job is to show who needs you — and the families stay contiguous in
-/// every sort.
-fn lineage(sorted: Vec<Session>) -> Vec<Row> {
-    let n = sorted.len();
-    let parent: Vec<Option<usize>> = {
-        let at: HashMap<&str, usize> = sorted
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.tag.is_empty())
-            .map(|(i, s)| (s.tag.as_str(), i))
-            .collect();
-        sorted
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                s.parent
-                    .as_deref()
-                    .and_then(|p| at.get(p).copied())
-                    .filter(|&p| p != i)
-            })
-            .collect()
-    };
-    let mut children = vec![Vec::new(); n];
-    for (i, p) in parent.iter().enumerate() {
-        if let Some(p) = *p {
-            children[p].push(i);
-        }
-    }
-
-    // Each row is claimed by exactly one tree. Rows no root reaches — only a
-    // parent cycle, which tags make near-impossible but a hand-edited `.meta`
-    // could make — become roots themselves rather than vanishing.
-    struct Forest {
-        children: Vec<Vec<usize>>,
-        claimed: Vec<bool>,
-        /// Tree children, once claimed.
-        kids: Vec<Vec<usize>>,
-        /// The best sort position anywhere in the subtree.
-        key: Vec<usize>,
-    }
-    impl Forest {
-        fn claim(&mut self, i: usize) -> usize {
-            self.claimed[i] = true;
-            let mut key = i;
-            for c in self.children[i].clone() {
-                if !self.claimed[c] {
-                    self.kids[i].push(c);
-                    key = key.min(self.claim(c));
-                }
-            }
-            self.key[i] = key;
-            key
-        }
-
-        fn emit(&self, i: usize, level: usize, out: &mut Vec<(usize, usize)>) {
-            out.push((i, level));
-            let mut kids = self.kids[i].clone();
-            kids.sort_by_key(|&c| self.key[c]);
-            for c in kids {
-                self.emit(c, level + 1, out);
-            }
-        }
-    }
-    let mut forest = Forest {
-        children,
-        claimed: vec![false; n],
-        kids: vec![Vec::new(); n],
-        key: (0..n).collect(),
-    };
-    let mut roots = Vec::new();
-    for i in (0..n).filter(|&i| parent[i].is_none()) {
-        roots.push(i);
-        forest.claim(i);
-    }
-    for i in 0..n {
-        if !forest.claimed[i] {
-            roots.push(i);
-            forest.claim(i);
-        }
-    }
-    roots.sort_by_key(|&r| forest.key[r]);
-    let mut order = Vec::with_capacity(n);
-    for r in roots {
-        forest.emit(r, 0, &mut order);
-    }
-
-    let mut slots: Vec<Option<Session>> = sorted.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .filter_map(|(i, level)| slots[i].take().map(|s| Row { s, level }))
-        .collect()
 }
 
 /// A mouse report torn across a read boundary surfaces as a bare Esc key
@@ -350,11 +233,13 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
         status::collect(sort),
         sort,
         load_labels(),
-        // Surface detection-rule update problems where they'll be seen; the
-        // help line is one keypress away from rediscovery.
-        crate::detect::manifest_health_warning()
-            .map(|w| format!("⚠ {w}"))
-            .unwrap_or_else(help_line),
+        // No herdr server, no agents: say so where it'll be seen; the help
+        // line is one keypress away from rediscovery.
+        if crate::herdr::server_running() {
+            help_line()
+        } else {
+            "⚠ no herdr server is running".to_string()
+        },
     );
     let mut last_refresh = Instant::now();
 
@@ -470,8 +355,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
 
         if last_refresh.elapsed() >= REFRESH {
             refresh(&mut app);
-            // An open HUD keeps the reboot snapshot fresh even for agents
-            // whose wrappers predate it (they never call it themselves).
+            // An open HUD keeps the reboot snapshot fresh too.
             crate::snapshot::maybe_capture_async();
             last_refresh = Instant::now();
         }
@@ -479,10 +363,10 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
 }
 
 /// Open the send line for the selected row. A blocked row is turned away
-/// here rather than after the prompt is typed: the wrapper would refuse it
-/// anyway (only the window answers a gate — Enter jumps there), and losing a
-/// typed prompt to a refusal is worse than not starting one. The wrapper
-/// still decides; this only spares the typing.
+/// here rather than after the prompt is typed: `send` would refuse it anyway
+/// (only the window answers a dialog — Enter jumps there), and losing a typed
+/// prompt to a refusal is worse than not starting one. `send` still decides;
+/// this only spares the typing.
 fn open_prompt(app: &mut App) {
     let Some(s) = app.selected() else {
         return;
@@ -509,14 +393,7 @@ fn input_key(app: &mut App, k: KeyEvent) {
             KeyCode::Enter if text.trim().is_empty() => app.message = "nothing to send".into(),
             KeyCode::Enter => {
                 app.message = format!("sending to {name} · waits until it is idle");
-                dispatch(app, name, target, Request::Send {
-                    text,
-                    mode: Mode::Paste,
-                    submit: true,
-                    now: false,
-                    answer_permission: false,
-                    timeout_ms: Some(crate::send::DEFAULT_TIMEOUT.as_millis() as u64),
-                });
+                dispatch(app, name, target, Request::Prompt(text));
             }
             KeyCode::Esc if !torn_escape() => app.message = help_line(),
             KeyCode::Backspace => {
@@ -536,7 +413,7 @@ fn input_key(app: &mut App, k: KeyEvent) {
         Input::ConfirmStop { target, name } => {
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 app.message = format!("stopping {name}…");
-                dispatch(app, name, target, Request::Stop { force: false });
+                dispatch(app, name, target, Request::Stop);
             } else {
                 app.message = format!("left {name} running");
             }
@@ -544,42 +421,49 @@ fn input_key(app: &mut App, k: KeyEvent) {
     }
 }
 
-/// Carry a request to a wrapper off the event loop — a send is held until
-/// its agent is idle, a stop takes its grace periods — through the same
-/// client `seagents send`/`stop` use, and post the outcome to the footer.
+/// What a footer action asks of an agent.
+enum Request {
+    Prompt(String),
+    Stop,
+}
+
+/// Carry a request out off the event loop — a send is held until its agent
+/// is idle, a stop takes its grace periods — through the same code
+/// `seagents send`/`stop` run, and post the outcome to the footer.
 fn dispatch(app: &App, name: String, target: String, request: Request) {
     let done = app.done_tx.clone();
     std::thread::spawn(move || {
-        let bound = match &request {
-            Request::Send { timeout_ms, .. } => Duration::from_millis(timeout_ms.unwrap_or(0)),
-            Request::Stop { .. } => Duration::ZERO,
+        let outcome = match request {
+            Request::Prompt(text) => match crate::send::prompt_target(&target, text) {
+                // The baseline `wait --after` takes: the turn it opened ends
+                // at stops + 1.
+                Ok(r) if r.ok => format!("sent to {name} · stops {}", r.stops.unwrap_or(0)),
+                other => refused(&name, other),
+            },
+            Request::Stop => match crate::send::stop_target(&target) {
+                Ok(r) if r.ok => format!("stopped {name}"),
+                other => refused(&name, other),
+            },
         };
-        let reply = crate::send::ask(&target, &request, bound);
-        let _ = done.send(outcome(&request, &name, reply));
+        let _ = done.send(outcome);
     });
 }
 
-/// The footer line for a finished send/stop: what happened, or the wrapper's
-/// own words for why not (they name the gate, the lineage rule, …).
-fn outcome(request: &Request, name: &str, reply: Result<Reply, String>) -> String {
-    match (request, reply) {
-        (Request::Send { .. }, Ok(r)) if r.ok => {
-            // The baseline `wait --after` takes: the turn it opened ends at
-            // stops + 1.
-            format!("sent to {name} · stops {}", r.stops.unwrap_or(0))
-        }
-        (Request::Stop { .. }, Ok(r)) if r.ok => format!("stopped {name}"),
-        (_, Ok(r)) => format!("{name}: {}", r.error.unwrap_or_else(|| "refused".into())),
-        (_, Err(e)) => format!("{name}: {e}"),
+/// The footer line for a send/stop that did not happen, in its own words
+/// (they name the dialog, the draft, …).
+fn refused(name: &str, reply: Result<Reply, String>) -> String {
+    match reply {
+        Ok(r) => format!("{name}: {}", r.error.unwrap_or_else(|| "refused".into())),
+        Err(e) => format!("{name}: {e}"),
     }
 }
 
 fn refresh(app: &mut App) {
     // Follow the selected *session*, not its row index — under the urgency and
     // recent sorts, rows move as states change.
-    let selected_id = app.selected().map(|s| s.id);
-    app.rows = lineage(status::collect(app.sort));
-    let followed = selected_id.and_then(|id| app.rows.iter().position(|r| r.s.id == id));
+    let selected_id = app.selected().map(|s| s.id.clone());
+    app.rows = status::collect(app.sort);
+    let followed = selected_id.and_then(|id| app.rows.iter().position(|s| s.id == id));
     match followed {
         Some(i) => app.list.select(Some(i)),
         None if app.rows.is_empty() => app.list.select(None),
@@ -667,14 +551,14 @@ fn help_panel(height: u16) -> Paragraph<'static> {
 /// The HUD remembers its view across launches — one word per preference in a
 /// state file, so a setting survives the window being closed and reopened.
 fn read_pref(name: &str) -> Option<String> {
-    let path = crate::vendor::herdr_detect::config::state_dir().join(name);
+    let path = crate::fsutil::state_dir().join(name);
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
 }
 
 fn write_pref(name: &str, value: &str) {
-    let dir = crate::vendor::herdr_detect::config::state_dir();
+    let dir = crate::fsutil::state_dir();
     let _ = crate::fsutil::private_dir(&dir);
     let _ = crate::fsutil::write_atomic(&dir.join(name), value.as_bytes());
 }
@@ -731,9 +615,9 @@ fn preview_selected(app: &mut App) {
         return;
     };
     // Looking at it counts as seeing it: done → idle.
-    status::ack_session(s.id);
+    status::ack_session(&s.id);
     let name = label_of(s, app.labels);
-    match crate::window::preview_window(s.pid, app.hud_con_id) {
+    match crate::window::preview_window(&s.id, app.hud_con_id) {
         Ok(()) => app.message = format!("previewing {name} · enter to jump"),
         Err(e) => app.message = e,
     }
@@ -743,9 +627,9 @@ fn focus_selected(app: &mut App) {
     let Some(s) = app.selected() else {
         return;
     };
-    status::ack_session(s.id);
+    status::ack_session(&s.id);
     let name = label_of(s, app.labels);
-    match crate::window::focus_window(s.pid) {
+    match crate::window::focus_window(&s.id) {
         Ok(()) => app.message = format!("focused {name} ({})", s.cmd),
         Err(e) => app.message = e,
     }
@@ -797,12 +681,9 @@ fn draw(f: &mut Frame, app: &mut App) {
             .saturating_sub(2)
             .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16)
             as usize;
-        let cols = Cols::measure(app.rows.iter().map(|r| (&r.s, r.level)));
-        let items: Vec<ListItem> = app
-            .rows
-            .iter()
-            .map(|r| ListItem::new(session_line(&r.s, r.level, row_width, &cols, app.labels)))
-            .collect();
+        let cols = Cols::measure(&app.rows);
+        let items: Vec<ListItem> =
+            app.rows.iter().map(|s| ListItem::new(session_line(s, row_width, &cols, app.labels))).collect();
         let list = List::new(items)
             .block(agent_block(app.sort, app.labels, above, below))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -911,17 +792,6 @@ fn agent_block(
 /// the whole list, so it comes out of the space each row has to lay out in.
 const HIGHLIGHT_SYMBOL: &str = "▶ ";
 
-/// The lineage marker in front of a row's name: nothing at the top level,
-/// `└ ` under a parent, two more columns per further generation. In the name
-/// column rather than at the row's start, so the state and time columns stay
-/// aligned down the whole list.
-fn tree_prefix(level: usize) -> String {
-    match level {
-        0 => String::new(),
-        n => format!("{}└ ", "  ".repeat(n - 1)),
-    }
-}
-
 /// Column measurements taken once per frame and shared by every row, so the
 /// columns line up: sizing each row to its own contents makes the list ragged.
 struct Cols {
@@ -929,9 +799,8 @@ struct Cols {
     /// column that is never allowed to truncate.
     time_w: usize,
     /// Width of the name column when a title column sits beside it: the
-    /// longest name on screen (tree prefix included), capped so one deep
-    /// project name (they run to `20260612_doc_parser` here) can't eat the
-    /// title's space.
+    /// longest name on screen, capped so one deep project name (they run to
+    /// `20260612_doc_parser` here) can't eat the title's space.
     dir_w: usize,
     /// Whether any agent on screen has named its conversation. When none has,
     /// `both` draws no title column rather than a frame of blanks.
@@ -941,22 +810,11 @@ struct Cols {
 impl Cols {
     const DIR_CAP: usize = 18;
 
-    fn measure<'a>(rows: impl IntoIterator<Item = (&'a Session, usize)> + Clone) -> Cols {
+    fn measure(rows: &[Session]) -> Cols {
         Cols {
-            time_w: rows
-                .clone()
-                .into_iter()
-                .map(|(s, _)| crate::status::humanize_secs(s.state_secs).chars().count())
-                .max()
-                .unwrap_or(3),
-            dir_w: rows
-                .clone()
-                .into_iter()
-                .map(|(s, level)| tree_prefix(level).chars().count() + name_of(s).chars().count())
-                .max()
-                .unwrap_or(4)
-                .min(Cols::DIR_CAP),
-            any_title: rows.into_iter().any(|(s, _)| !s.title.is_empty()),
+            time_w: rows.iter().map(|s| crate::status::humanize_secs(s.state_secs).chars().count()).max().unwrap_or(3),
+            dir_w: rows.iter().map(|s| name_of(s).chars().count()).max().unwrap_or(4).min(Cols::DIR_CAP),
+            any_title: rows.iter().any(|s| !s.title.is_empty()),
         }
     }
 }
@@ -989,13 +847,12 @@ impl Cols {
 ///   directories are words, so it asks for a wider minimum.
 /// - **dir** — the original row.
 ///
-/// The name is [`name_of`] — the directory, or a chosen `@tag` — behind the
-/// row's [`tree_prefix`] at `level`, whichever column it lands in.
-fn session_line(s: &Session, level: usize, width: usize, cols: &Cols, labels: Label) -> Line<'static> {
+/// The name is [`name_of`] — the directory, or a chosen `@tag` — whichever
+/// column it lands in.
+fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'static> {
     let color = state_color(s.state);
     let time = crate::status::humanize_secs(s.state_secs);
-    let prefix = tree_prefix(level);
-    let name = format!("{prefix}{}", name_of(s));
+    let name = name_of(s);
 
     const DOT: usize = 2;
     const GAP: usize = 2;
@@ -1018,7 +875,7 @@ fn session_line(s: &Session, level: usize, width: usize, cols: &Cols, labels: La
 
     // The single flexible column, when no separate title column is drawn.
     let solo = match labels {
-        Label::Title if !s.title.is_empty() => format!("{prefix}{}", s.title),
+        Label::Title if !s.title.is_empty() => s.title.clone(),
         _ => name.clone(),
     };
     let solo_min = match labels {

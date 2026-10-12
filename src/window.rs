@@ -4,13 +4,14 @@
 //! here, next to the identity-capture strategies they depend on.
 //!
 //! X11 offers no query for "the window hosting this pty" (Terminator shares
-//! one process across all its windows, so `_NET_WM_PID` is useless). The only
-//! honest strategy is *correlation*: whenever we know the user is interacting
-//! with the agent — at `seagents run` launch, and on every input burst
-//! thereafter — the focused terminal window IS the agent's window, and we
-//! record its identity (i3 con_id + X window id) in the session meta. Focus
-//! then uses exact handles only: con_id first (fast, dies on i3 restart),
-//! X window id second (survives restarts), healing the con_id when used.
+//! one process across all its windows, so `_NET_WM_PID` is useless). So
+//! `seagents run` captures it at launch, strongest strategy first (the
+//! terminal's own window-id variable, `/proc` ancestry, the handle a window
+//! seagents opened carries, and last the focused terminal — which is the
+//! agent's when the user just typed the command into it), and records its
+//! identity (i3 con_id + X window id) in the session meta. Focus then uses
+//! exact handles only: con_id first (fast, dies on i3 restart), X window id
+//! second (survives restarts), healing the con_id when used.
 
 use std::process::Command;
 
@@ -22,8 +23,7 @@ use crate::registry::Files;
 /// front. `target` is anything [`crate::registry::resolve_target`] takes. CLI
 /// wrapper: prints any error and maps to an exit code.
 pub fn focus(target: &str) -> i32 {
-    let result = crate::registry::resolve_target(target)
-        .and_then(|s| focus_window(s.child_pid()));
+    let result = crate::registry::resolve_target(target).and_then(|s| focus_window(&s.meta.key));
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -40,12 +40,9 @@ pub fn focus(target: &str) -> i32 {
 /// an i3 *restart* (the tree is rebuilt); X window ids survive it. When the
 /// X-id path is used, the meta's con_id is healed so the fast path works
 /// again. There is deliberately no fuzzy fallback: window identity is captured
-/// at launch and re-captured on every input burst (typing proves the agent's
-/// terminal is focused), so a session the user has ever typed into has
-/// accurate handles.
-pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
-    let session = crate::registry::by_child_pid(child_pid)
-        .ok_or_else(|| format!("no tracked session with pid {child_pid}"))?;
+/// at launch, by exact means wherever the terminal allows.
+pub(crate) fn focus_window(key: &str) -> Result<(), String> {
+    let session = crate::registry::by_key(key).ok_or_else(|| format!("no tracked session {key}"))?;
 
     if let Some(con_id) = session.meta.con_id {
         if i3::focus(con_id) {
@@ -65,20 +62,15 @@ pub(crate) fn focus_window(child_pid: u64) -> Result<(), String> {
         }
     }
 
-    let name = match session.meta.tag.as_str() {
-        "" => format!("session {child_pid}"),
-        tag => format!("{tag} (pid {child_pid})"),
-    };
     Err(format!(
-        "{name}: window not identified (focus was elsewhere at launch, \
-         or the window is gone); type into the agent once and retry"
+        "{}: window not identified (focus was elsewhere at launch, or the window is gone)",
+        session.meta.tag
     ))
 }
 
-/// Persist the agent's window identity into its meta — called at launch, from
-/// the input pump whenever the user types (focused terminal = agent's window),
-/// and from the X-id focus path to heal a post-restart con_id. Skips the write
-/// when nothing changed, so the once-a-minute input capture is usually free.
+/// Persist the agent's window identity into its meta — called at launch, and
+/// from the X-id focus path to heal a post-restart con_id. Skips the write
+/// when nothing changed.
 pub(crate) fn record_window(files: &Files, con_id: u64, xid: Option<u64>) {
     crate::registry::update_meta(files, |meta| {
         meta.con_id = Some(con_id);
@@ -92,8 +84,8 @@ pub(crate) fn record_window(files: &Files, con_id: u64, xid: Option<u64>) {
 /// `return_to` (the HUD) so the user keeps navigating. `i3-msg focus` switches
 /// the target output to the agent's workspace; refocusing the HUD leaves that
 /// output showing the agent while input stays on the HUD.
-pub(crate) fn preview_window(child_pid: u64, return_to: Option<u64>) -> Result<(), String> {
-    focus_window(child_pid)?;
+pub(crate) fn preview_window(key: &str, return_to: Option<u64>) -> Result<(), String> {
+    focus_window(key)?;
     if let Some(id) = return_to {
         i3::focus(id);
     }
@@ -133,6 +125,16 @@ pub(crate) fn focused_terminal_ids() -> Option<(u64, Option<u64>)> {
 /// it is running in. `WINDOWID` is the old xterm convention, still set by a
 /// number of terminals; alacritty sets its own.
 const WINDOW_ID_VARS: [&str; 2] = ["ALACRITTY_WINDOW_ID", "WINDOWID"];
+
+/// Every variable through which a terminal names the window its child runs
+/// in — the ones [`window_ids_from_env`] reads, and Terminator's own. A
+/// process that outlives or leaves that window must not carry them on: a
+/// herdr server would hand them to every pane, and a terminal seagents opens
+/// that sets none of its own (Terminator sets no window id) would hand the
+/// caller's to its `run`, which would record the caller's window as its own.
+/// Removed from the environment of the process started, never `unset` inside
+/// a new terminal (where they are already that terminal's own).
+pub(crate) const WINDOW_ENV: [&str; 3] = ["ALACRITTY_WINDOW_ID", "WINDOWID", "TERMINATOR_UUID"];
 
 /// The (con_id, X window id) of our window, straight from the environment the
 /// terminal handed us.
@@ -226,8 +228,7 @@ pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
 /// shell inside it can start before the window is mapped), so this polls
 /// briefly rather than answering "not there" on the first look. Returns None if
 /// the handle never appears, or if two windows carry it — an ambiguous handle
-/// is worse than none, and the input-driven re-capture will heal it on the
-/// first keystroke.
+/// is worse than none.
 pub(crate) fn window_ids_for_handle(value: &str) -> Option<(u64, Option<u64>)> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
