@@ -18,12 +18,22 @@ Conventions:
   the two side by side: no parallel implementation, no `_v2`/`_new` name, no
   compatibility shim, no flag that keeps the old behaviour reachable, no dead
   helper "in case". Move the shared thing to where it now belongs, update every
-  call site, remove the duplicate, and carry the tests and `HANDOFF.md` over in
-  the same commit — one source of truth per concern, at every commit.
+  call site, remove the duplicate, and carry `HANDOFF.md` over in the same
+  commit — one source of truth per concern, at every commit.
+- **No unit tests.** Don't write `#[cfg(test)]` tests, and the existing ones are
+  being removed. Verify behaviour by running it. The end-to-end scripts in
+  `tools/` (`test-orchestration.sh`, `test-restore.sh`, …) are not unit tests
+  and stay.
   This is a private single-author project with no external consumers, so nothing
   here is owed a deprecation cycle: a half-finished cutover costs more than the
-  full one. If a cutover turns out to be genuinely too large for the change in
-  hand, say so and stop, rather than shipping the fork and leaving it.
+  full one.
+- **Refactors, cutovers and deleting code are pre-approved.** Size is not a
+  reason to hold back: rewriting a subsystem, cutting a whole command over to a
+  new design, or deleting modules, commands and their tests (including recent,
+  working code) needs no permission. Don't keep code because effort went into
+  it, and don't propose a smaller, staged or flag-gated version to avoid a big
+  change. When unsure whether to keep or delete something superseded, delete
+  it. Name the notable deletions in the summary so they are visible.
 - **Commits: do NOT add a Claude/AI co-author or "Generated with" trailer.** The
   user authors commits solely. Conventional-commit style (`fix(...)`, `feat(...)`).
 - Default branch `main`; remote `git@github.com:AnakTeka/seagents.git` (private).
