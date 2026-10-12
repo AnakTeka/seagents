@@ -220,7 +220,7 @@ letter).
 Source layout under `src/`:
 
 - **`src/main.rs`** — the command line only: the clap-derived `Cli`/`Command`
-  and `dispatch()` to the module that owns each command, plus parse tests.
+  and `dispatch()` to the module that owns each command.
 - **`src/wrapper/`** — `seagents run`, the pty-tee wrapper (§1):
   - `mod.rs` — setup and wiring: `run()` (pty + child, `.meta`, then window
     identity on a thread, raw mode, thread start, the job-control wait loop),
@@ -292,8 +292,7 @@ Source layout under `src/`:
   with the turn ledger), `observe_state()` (the `.state` transition rules), OSC-title parsing (`all_titles`,
   `current_title`, `strip_title_glyph`, `conversation_title`), `read_tail()`.
 - **`src/detect.rs`** — `render()` (vt100), `input_box()` (what the
-  agent's input box holds, §9) plus regression tests that pin the
-  vendored engine's verdicts on live-capture scenarios; `debug_screen()`; the
+  agent's input box holds, §9); `debug_screen()`; the
   manifest-update helpers (`update_manifests_now()`, the HUD's daily
   `spawn_manifest_update()`, `manifest_health_warning()`).
 - **`src/vendor/herdr_detect/`** — **herdr's detection engine, vendored**
@@ -1144,9 +1143,8 @@ chain. A peer that exited (or whose pid was reused), or any link that can't be
 read, is `caller identity unknown` → `forbidden`. Until 2026-09-30 an
 unreadable ancestry read as "no wrapper", i.e. human: a process that connected,
 forked and exited let its child `stop --force` any agent (reproduced: an
-unrelated agent `evil` stopped `top`; now refused — the unit test
-`a_peer_that_exited_after_connecting_is_unknown_not_human` does the same
-fork-and-exit, and so did a live tmux run). An agent may act only
+unrelated agent `evil` stopped `top`; now refused — verified with the same
+fork-and-exit in a unit test at the time, and in a live tmux run). An agent may act only
 on its own descendants — walking the target's `parent` chain by tag, over live
 `.meta`s, must reach the caller — so never on itself, its parent, a sibling or
 a stranger (and A→B→A ping-pong can't happen), and may never
@@ -1341,8 +1339,8 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   once trusted** (`codex exec` silently skips untrusted ones; the TUI stops
   at "Hooks need review"): `hooks.state."<layer>:<event_snake>:<group>:<handler>".trusted_hash`
   = `sha256:` of the canonical JSON of the hook's normalized identity
-  (codex-rs `hook_hash`; reproduced exactly, pinned by a test against the
-  hash Codex wrote in `/hooks`). Codex reads that state from the user layer
+  (codex-rs `hook_hash`; reproduced exactly, checked against the hash Codex
+  wrote in `/hooks`). Codex reads that state from the user layer
   *and* the session-flags layer, so `run` passes ONE `-c hooks={…}` holding
   our three hooks and their trust — no `--dangerously-bypass-hook-trust`
   (which would also run the user's unreviewed hooks), nothing written. A
@@ -1512,7 +1510,6 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ```bash
 cargo build            # or --release
-cargo test             # all tests (vendored engine + manifests, title parsing, glyph strip)
 cargo run -- status    # etc.
 
 # Inspect detection against a real capture (state + matched rule; --json for

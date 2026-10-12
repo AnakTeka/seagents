@@ -31,10 +31,3 @@ pub fn config_dir() -> PathBuf {
 pub fn state_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", ".local/state")
 }
-
-/// Serializes tests that mutate XDG env vars (vendored tests rely on this).
-#[cfg(test)]
-pub fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}

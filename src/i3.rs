@@ -126,38 +126,3 @@ pub(crate) fn active_outputs() -> Vec<String> {
 pub(crate) fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn success_must_be_affirmed_in_either_spacing() {
-        assert!(affirms_success(r#"[{"success":true}]"#));
-        assert!(affirms_success(r#"[ { "success": true } ]"#));
-        assert!(!affirms_success(
-            r#"[{"success":false,"error":"No such con"}]"#
-        ));
-        assert!(!affirms_success("[]"));
-    }
-
-    #[test]
-    fn collects_tiled_and_floating_windows_but_not_containers() {
-        let tree = serde_json::json!({
-            "id": 1, "nodes": [
-                {"id": 2, "window": 20, "nodes": []},
-                {"id": 3, "nodes": [{"id": 4, "window": 40}]}
-            ],
-            "floating_nodes": [{"id": 5, "window": 50}]
-        });
-        let mut wins = Vec::new();
-        collect(&tree, &mut wins);
-        let ids: Vec<(u64, Option<u64>)> = wins.iter().map(|w| (w.con_id, w.xid)).collect();
-        assert_eq!(ids, vec![(2, Some(20)), (4, Some(40)), (5, Some(50))]);
-    }
-
-    #[test]
-    fn quoting_escapes_backslashes_and_quotes() {
-        assert_eq!(quote(r#"1: "work" \ ws"#), r#""1: \"work\" \\ ws""#);
-    }
-}

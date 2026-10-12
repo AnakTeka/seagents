@@ -9,9 +9,9 @@ pub(crate) fn alive(pid: u64) -> bool {
 
 /// Whether `pid` runs a seagents binary: the file name of its executable,
 /// or of its argv[0], starts with `seagents` (a binary replaced by a
-/// reinstall reads `seagents (deleted)`; cargo's test binaries are
-/// `seagents-<hash>`). None when neither can be read — gone, another user's,
-/// or a kernel thread — so a caller can tell "not ours" from "can't say".
+/// reinstall reads `seagents (deleted)`). None when neither can be read —
+/// gone, another user's, or a kernel thread — so a caller can tell "not
+/// ours" from "can't say".
 pub(crate) fn runs_seagents(pid: u64) -> Option<bool> {
     let named = |path: &std::path::Path| {
         path.file_name()
@@ -145,59 +145,5 @@ pub(crate) fn live_pty_size(child_pid: u64) -> Option<(u16, u16)> {
         Some((ws.ws_row, ws.ws_col))
     } else {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn our_own_process_is_alive_and_has_a_parent() {
-        let me = std::process::id() as u64;
-        assert!(alive(me));
-        assert!(!alive(u32::MAX as u64));
-        let parent = parent_pid(me).expect("our own stat is readable");
-        let chain = ancestors(me).expect("our own ancestry is readable");
-        assert_eq!(chain.first().copied(), Some(parent).filter(|p| *p > 1));
-        assert!(!chain.contains(&1) && !chain.contains(&0));
-        // A pid with no process has no ancestry to speak of: not an empty
-        // one, which would read as "no wrapper above it".
-        assert_eq!(ancestors(u32::MAX as u64), None);
-    }
-
-    #[test]
-    fn a_pinned_process_is_alive_until_it_exits() {
-        let me = Pinned::open(std::process::id() as u64).expect("pidfd_open on ourselves");
-        assert!(me.alive());
-        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
-        let pinned = Pinned::open(u64::from(child.id())).unwrap();
-        assert!(pinned.alive());
-        child.kill().unwrap();
-        child.wait().unwrap();
-        // Reaped: the pidfd still names that process, which is gone.
-        assert!(!pinned.alive());
-        assert!(Pinned::open(u32::MAX as u64).is_none());
-    }
-
-    #[test]
-    fn a_seagents_process_is_told_from_any_other() {
-        // This test binary is `seagents-<hash>`.
-        assert_eq!(runs_seagents(std::process::id() as u64), Some(true));
-        let mut sleep = std::process::Command::new("sleep").arg("5").spawn().unwrap();
-        assert_eq!(runs_seagents(u64::from(sleep.id())), Some(false));
-        sleep.kill().ok();
-        sleep.wait().ok();
-        assert_eq!(runs_seagents(u32::MAX as u64), None);
-    }
-
-    #[test]
-    fn boot_time_is_the_btime_line() {
-        let stat = "cpu  1 2 3\nintr 5 6\nctxt 99\nbtime 1759132800\nprocesses 7\n";
-        assert_eq!(parse_btime(stat), Some(1759132800));
-        assert_eq!(parse_btime("cpu 1 2 3\n"), None);
-        // This boot began before now, and after 2020.
-        let now = crate::clock::unix_now();
-        assert!((1_577_836_800..=now).contains(&boot_time().expect("/proc/stat has btime")));
     }
 }

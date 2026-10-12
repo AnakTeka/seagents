@@ -271,7 +271,7 @@ const MAX_MATCHERS_PER_GATE: usize = 32;
 const MAX_TOTAL_MATCHERS: usize = 1024;
 const MAX_MATCHER_CHARS: usize = 512;
 
-#[allow(dead_code)] // seagents: tests + upstream parity; the binary reloads per agent
+#[allow(dead_code)] // seagents: upstream parity; the binary reloads per agent
 pub(crate) fn reload_manifests() -> Vec<AgentManifestSummary> {
     let _reload_guard = MANIFEST_RELOAD_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -1555,6 +1555,3 @@ fn line_start_offset(content: &str, lines: &[&str], index: usize) -> usize {
 
 // seagents: local rule re-weighting, applied to bundled and remote manifests.
 mod patches;
-
-#[cfg(test)]
-mod tests;

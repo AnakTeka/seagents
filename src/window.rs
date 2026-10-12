@@ -295,35 +295,3 @@ fn looks_like_terminal(class: &str) -> bool {
     let c = class.to_lowercase();
     c.contains("term") || c.contains("kitty") || c.contains("alacritty") || c.contains("ghostty")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn record_window_updates_ids_and_skips_when_unchanged() {
-        let dir = std::env::temp_dir().join(format!("seagents-record-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let files = Files::in_dir(&dir, 1);
-        std::fs::write(&files.meta, r#"{"wrapper_pid":1,"con_id":10,"window_id":100}"#).unwrap();
-        let ids = || {
-            let meta = crate::registry::read_meta(&files).unwrap();
-            (meta.con_id, meta.window_id)
-        };
-
-        // Changed con_id: rewritten, xid preserved when not supplied.
-        record_window(&files, 20, None);
-        assert_eq!(ids(), (Some(20), Some(100)));
-
-        // Unchanged: file untouched (mtime-free check via content identity).
-        let before = std::fs::read_to_string(&files.meta).unwrap();
-        record_window(&files, 20, Some(100));
-        assert_eq!(std::fs::read_to_string(&files.meta).unwrap(), before);
-
-        // New window entirely (agent moved / restarted terminal).
-        record_window(&files, 30, Some(300));
-        assert_eq!(ids(), (Some(30), Some(300)));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}

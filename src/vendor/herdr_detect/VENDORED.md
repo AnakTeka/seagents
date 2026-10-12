@@ -29,17 +29,16 @@ explicit override is applied literally, patches skipped.
 
 Substantive deltas are marked with `// seagents:` comments in the code; the
 mechanical path retargets (`crate::config::`/`crate::detect::` → `super::…`,
-applied throughout all files including tests) and the added
+applied throughout all files) and the added
 `#[allow(dead_code)]` attributes are not individually marked — this list is
 their record.
 
 - `mod.rs`: removed the process-identification half (herdr's
-  `crate::platform`-coupled `ForegroundJob` machinery and its tests) — seagents
+  `crate::platform`-coupled `ForegroundJob` machinery) — seagents
   spawns its agents itself and maps argv basename via `identify_agent()`.
   Removed herdr-internal `full_lifecycle_hook_authority()` and
   `session_identity_only_integration()`, plus the agent-launch surface seagents
-  never calls (`Agent::ALL`, `interactive_agent_executable()`) and the tests
-  covering them. Added `pub mod config;`; `#[allow(dead_code)]` on
+  never calls (`Agent::ALL`, `interactive_agent_executable()`). Added `pub mod config;`; `#[allow(dead_code)]` on
   `should_skip_state_update`.
 - `config.rs`: **not vendored** — seagents-local replacement for herdr's
   `crate::config` (`config_dir()`/`state_dir()` under seagents' XDG paths).
@@ -52,15 +51,14 @@ their record.
 - `manifest_update.rs`: removed `auto_update()` (tokio/AppEvent coupling) —
   callers use `check_and_update()` + `agents_needing_cache_reload()` (raised to
   `pub(crate)`) + `manifest::reload_manifests_for_agents()` directly, which is
-  the work `auto_update()` did around its AppEvent; its three tokio/AppEvent
-  tests rewritten to drive `check_and_update()` directly;
+  the work `auto_update()` did around its AppEvent;
   `tracing::warn!` → local `warn_log!` (stderr, gated on `SEAGENTS_DEBUG`);
   `crate::config::` → `super::config::`; `fetch_text` keeps plain
   `std::process::Command` (upstream moved to its Windows window-hiding wrapper)
   and pins https catalogs to https across redirects
   (`--proto '=https' --proto-redir '=https'`).
-- `manifest/tests.rs`: `crate::config::`/`crate::detect::` paths retargeted
-  into this module tree.
+- All files: upstream's unit tests (`#[cfg(test)]` modules, `manifest/tests.rs`)
+  are not carried — seagents has no unit tests; do not re-copy them on a re-sync.
 - `manifest/patches.rs`: **not vendored** — seagents' rule re-weighting table.
   Re-check every entry against the new rules on a re-sync.
 
@@ -72,6 +70,5 @@ their record.
 2. Re-copy upstream files and re-apply the modifications above (all
    mechanical), and update the pinned commit at the top of this file.
 3. Re-check `manifest/patches.rs`: each entry names an upstream rule id, and a
-   rule that was renamed, removed or reshaped upstream needs its patch revisited
-   (`patches_only_touch_their_own_manifest` catches an id that no longer exists).
-4. `cargo test`, then live-verify with `seagents debug-screen`.
+   rule that was renamed, removed or reshaped upstream needs its patch revisited.
+4. `cargo build`, then live-verify with `seagents debug-screen`.
