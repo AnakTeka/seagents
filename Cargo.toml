@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "run coding agents in herdr, each in its own i3 window"
 license = "Apache-2.0"
+keywords = ["i3", "herdr", "claude-code", "codex", "agents"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "seagents"

@@ -1,4 +1,4 @@
-# seagents
+# seagents: coding agents as i3 windows
 
 **See your coding agents.** seagents runs Claude Code and Codex in
 [herdr](https://github.com/ogulcancelik/herdr) and shows each one in its own
