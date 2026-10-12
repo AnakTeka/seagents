@@ -1363,9 +1363,8 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   shared PID and colliding idle titles.
 - **self-reaping cache** — a fully-exited agent isn't interesting; "idle" already
   means finished-and-waiting-at-prompt (still alive).
-- **License**: seagents was AGPL-3.0-or-later because it vendored herdr's
-  detection code. That code is gone; the license is the user's choice again
-  (left as it is for now, decision D7).
+- **License**: Apache-2.0 (decision D7). It was AGPL-3.0-or-later only while
+  it vendored herdr's then-AGPL detection code, which is gone.
 
 ---
 
@@ -1472,7 +1471,6 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
   profile) — HERDR-BACKEND-SPEC § Later.
 - A bug report to herdr for Codex's trust question reading idle (the user's
   call; herdr's contributor rules allow a reproducible bug report, not a PR).
-- Decide the **license** now that nothing of herdr's is vendored (D7).
 - Decide the **mouse_warping** question for the HUD preview.
 - **README.md** for the repo landing page (not written yet).
 - Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once

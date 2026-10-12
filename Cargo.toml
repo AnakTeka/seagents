@@ -2,8 +2,8 @@
 name = "seagents"
 version = "0.1.0"
 edition = "2021"
-description = "observe coding agents running in your own terminal windows"
-license = "AGPL-3.0-or-later"
+description = "run coding agents in herdr, each in its own i3 window"
+license = "Apache-2.0"
 
 [[bin]]
 name = "seagents"

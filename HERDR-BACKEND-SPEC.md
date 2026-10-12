@@ -209,8 +209,9 @@ So the alias keeps working and the window looks as it does today.
   history). Codex's `-c hooks=…` stays inline.
 - **D6 — start, then attach**: `run` prints `starting <tag>…` and attaches
   once `agent start` has returned, so a start failure shows in the window.
-- **D7 — the license** stays as it is for now; with the vendored detector
-  gone it is the user's to choose.
+- **D7 — the license**: Apache-2.0 (was AGPL-3.0-or-later only because it
+  vendored herdr's then-AGPL detector; that code is gone, and herdr itself is
+  Apache-2.0 since 2026-07-22).
 
 Found while building, and resolved the way most consistent with the above:
 

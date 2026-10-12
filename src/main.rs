@@ -29,8 +29,9 @@ mod turn;
 mod wait;
 mod window;
 
-/// See which of your coding agents is blocked, done or working, and jump to
-/// its i3 window.
+/// Run coding agents in herdr, each in its own i3 window: see which is
+/// blocked, done or working, jump to it, and restore the layout after a
+/// reboot.
 #[derive(Parser, Debug)]
 #[command(name = "seagents", version)]
 struct Cli {
