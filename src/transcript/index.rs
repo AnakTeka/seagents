@@ -101,10 +101,16 @@ impl Index {
     /// The index of `transcript`, from `cache` when that still describes
     /// the file, extended past what it covered, and written back when
     /// changed.
-    pub(crate) fn load(transcript: &Path, cache: Option<&Path>, head: HeadFn) -> std::io::Result<Index> {
+    pub(crate) fn load(
+        transcript: &Path,
+        cache: Option<&Path>,
+        head: HeadFn,
+    ) -> std::io::Result<Index> {
         let mut file = File::open(transcript)?;
         let len = file.metadata()?.len();
-        let cached = cache.and_then(|c| fs::read(c).ok()).and_then(|bytes| decode(&bytes));
+        let cached = cache
+            .and_then(|c| fs::read(c).ok())
+            .and_then(|bytes| decode(&bytes));
         let mut index = match cached {
             Some((index, prefix_len, hash))
                 if index.indexed_len <= len && prefix_hash(&mut file, prefix_len)? == hash =>
@@ -121,9 +127,11 @@ impl Index {
                 let hash = prefix_hash(&mut file, prefix_len)?;
                 // Canonical, so the sweep (run from any cwd) finds the file
                 // a relative `read --transcript` named.
-                let path = fs::canonicalize(transcript).unwrap_or_else(|_| transcript.to_path_buf());
+                let path =
+                    fs::canonicalize(transcript).unwrap_or_else(|_| transcript.to_path_buf());
                 // Failure is ignored: the cache only saves time.
-                let _ = crate::fsutil::write_atomic(cache, &encode(&index, prefix_len, hash, &path));
+                let _ =
+                    crate::fsutil::write_atomic(cache, &encode(&index, prefix_len, hash, &path));
             } else {
                 // Read, not rewritten: mark it used for the sweep.
                 let _ = File::options()
@@ -244,11 +252,17 @@ fn transcript_of(idx: &Path) -> Option<PathBuf> {
 /// one (`<uuid>.jsonl`); otherwise (a subagent's `agent-<id>.jsonl`, which
 /// is only unique within its session) a hash of the whole path.
 fn cache_name(transcript: &Path) -> String {
-    let stem = transcript.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let stem = transcript
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if parse_uuid(stem).is_some() {
         format!("{stem}.idx")
     } else {
-        format!("{:016x}.idx", fnv1a(transcript.as_os_str().as_encoded_bytes()))
+        format!(
+            "{:016x}.idx",
+            fnv1a(transcript.as_os_str().as_encoded_bytes())
+        )
     }
 }
 
@@ -256,11 +270,17 @@ fn prefix_hash(file: &mut File, len: u64) -> std::io::Result<u64> {
     let mut buf = Vec::with_capacity(len as usize);
     file.seek(SeekFrom::Start(0))?;
     file.take(len).read_to_end(&mut buf)?;
-    Ok(if buf.len() as u64 == len { fnv1a(&buf) } else { !fnv1a(&buf) })
+    Ok(if buf.len() as u64 == len {
+        fnv1a(&buf)
+    } else {
+        !fnv1a(&buf)
+    })
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn encode(index: &Index, prefix_len: u64, hash: u64, transcript: &Path) -> Vec<u8> {
@@ -290,7 +310,10 @@ fn decode(bytes: &[u8]) -> Option<(Index, u64, u64)> {
     }
     let path_len = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
     let entries = HEADER + path_len;
-    if path_len > PATH_MAX || bytes.len() < entries || (bytes.len() - entries) % ENTRY != 0 {
+    if path_len > PATH_MAX
+        || bytes.len() < entries
+        || !(bytes.len() - entries).is_multiple_of(ENTRY)
+    {
         return None;
     }
     let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
@@ -306,7 +329,10 @@ fn decode(bytes: &[u8]) -> Option<(Index, u64, u64)> {
             parent: u128_at(e, 37),
         })
         .collect();
-    let index = Index { nodes, indexed_len: u64_at(bytes, 8) };
+    let index = Index {
+        nodes,
+        indexed_len: u64_at(bytes, 8),
+    };
     Some((index, u64_at(bytes, 16), u64_at(bytes, 24)))
 }
 
@@ -326,5 +352,12 @@ pub(crate) fn parse_uuid(s: &str) -> Option<u128> {
 /// The canonical lowercase spelling of a uuid.
 pub(crate) fn format_uuid(u: u128) -> String {
     let h = format!("{u:032x}");
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }

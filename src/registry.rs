@@ -206,7 +206,10 @@ impl Meta {
 }
 
 fn basename(p: &str) -> &str {
-    Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p)
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p)
 }
 
 /// What the `.state` sidecar records: the last observed state word, when it
@@ -358,7 +361,10 @@ fn all_in(dir: &Path) -> Vec<Session> {
             // The file must be the key's own: a `.meta` named otherwise is
             // not a session here.
             (!meta.key.is_empty() && e.file_name().to_str() == Some(&format!("{}.meta", meta.key)))
-                .then(|| Session { files: Files::in_dir(dir, &meta.key), meta })
+                .then(|| Session {
+                    files: Files::in_dir(dir, &meta.key),
+                    meta,
+                })
         })
         .collect();
     out.sort_by(|a, b| (a.meta.started, &a.meta.key).cmp(&(b.meta.started, &b.meta.key)));
@@ -389,7 +395,11 @@ fn list_in(dir: &Path) -> Vec<Session> {
 pub(crate) fn reap() {
     let dir = cache_dir();
     let all = all_in(&dir);
-    let live_tags: HashSet<&str> = all.iter().filter(|s| s.alive()).map(|s| s.meta.tag.as_str()).collect();
+    let live_tags: HashSet<&str> = all
+        .iter()
+        .filter(|s| s.alive())
+        .map(|s| s.meta.tag.as_str())
+        .collect();
     for s in all.iter().filter(|s| !procfs::alive(s.meta.run_pid)) {
         if s.meta.pid.is_some_and(procfs::alive) {
             if let Ok(Some(pane)) = crate::herdr::pane_of(&s.meta.key) {
@@ -408,7 +418,9 @@ pub(crate) fn reap() {
 /// for a session whose `run` could not.
 pub(crate) fn finish(s: &Session) {
     let dir = cache_dir();
-    let superseded = list_in(&dir).iter().any(|o| o.meta.tag == s.meta.tag && o.meta.key != s.meta.key);
+    let superseded = list_in(&dir)
+        .iter()
+        .any(|o| o.meta.tag == s.meta.tag && o.meta.key != s.meta.key);
     finish_in(&dir, s, !superseded);
 }
 
@@ -470,7 +482,10 @@ pub(crate) fn by_pane(pane_id: &str, socket: &str) -> Option<Session> {
     all_in(&cache_dir())
         .into_iter()
         .filter(|s| procfs::alive(s.meta.run_pid))
-        .find(|s| s.meta.pane_id == pane_id && (socket.is_empty() || s.meta.socket.is_empty() || s.meta.socket == socket))
+        .find(|s| {
+            s.meta.pane_id == pane_id
+                && (socket.is_empty() || s.meta.socket.is_empty() || s.meta.socket == socket)
+        })
 }
 
 /// The live session named by `target`, as every command that addresses an
@@ -483,7 +498,9 @@ pub(crate) fn resolve_target(target: &str) -> Result<Session, String> {
 
 fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
     if !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
-        let pid: u64 = target.parse().map_err(|_| format!("{target} is not a pid"))?;
+        let pid: u64 = target
+            .parse()
+            .map_err(|_| format!("{target} is not a pid"))?;
         return all_in(dir)
             .into_iter()
             .find(|s| s.meta.pid == Some(pid))
@@ -491,7 +508,9 @@ fn resolve_target_in(dir: &Path, target: &str) -> Result<Session, String> {
     }
     let tag = target.strip_prefix('@').unwrap_or(target);
     if !valid_tag(tag) {
-        return Err(format!("{target:?} is neither a tag ({TAG_RULE}) nor a pid"));
+        return Err(format!(
+            "{target:?} is neither a tag ({TAG_RULE}) nor a pid"
+        ));
     }
     list_in(dir)
         .into_iter()
@@ -599,6 +618,7 @@ fn prune_tombstones(dir: &Path, now: u64) {
 /// and not yet reaped — its files still say how it ended), or the tombstone
 /// of one that has been cleaned up.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // a one-off lookup result, never stored in bulk
 pub(crate) enum Found {
     Session(Session),
     Exited(Tombstone),
@@ -617,7 +637,10 @@ pub(crate) fn resolve_exited(target: &str) -> Result<Found, String> {
     if !valid_tag(tag) {
         return Err(err);
     }
-    let dead = all_in(&dir).into_iter().filter(|s| s.meta.tag == tag).max_by_key(|s| s.meta.started);
+    let dead = all_in(&dir)
+        .into_iter()
+        .filter(|s| s.meta.tag == tag)
+        .max_by_key(|s| s.meta.started);
     if let Some(s) = dead {
         return Ok(Found::Session(s));
     }
@@ -655,7 +678,8 @@ pub(crate) fn valid_tag(tag: &str) -> bool {
     !b.is_empty()
         && b.len() <= TAG_MAX
         && b[0].is_ascii_lowercase()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
 /// The name part of a minted tag: the cwd's basename folded into the tag
@@ -663,7 +687,10 @@ pub(crate) fn valid_tag(tag: &str) -> bool {
 /// would not start with a letter, short enough to leave room for the `-xxxx`
 /// suffix. Never empty.
 fn tag_base(cwd: &Path) -> String {
-    let name = cwd.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
     let mut base = String::new();
     for c in name.chars() {
         if c.is_ascii_lowercase() || c.is_ascii_digit() {
@@ -724,8 +751,17 @@ pub(crate) fn minted_from(tag: &str, cwd: &Path) -> bool {
 /// herdr already has (an agent somebody started in herdr directly), and
 /// `reserved` (the snapshot's — a pending restore will want those back).
 fn taken_tags(dir: &Path, reserved: &HashSet<String>) -> HashSet<String> {
-    let herdr = crate::herdr::agents().unwrap_or_default().into_iter().map(|a| a.name).filter(|n| !n.is_empty());
-    list_in(dir).into_iter().map(|s| s.meta.tag).chain(herdr).chain(reserved.iter().cloned()).collect()
+    let herdr = crate::herdr::agents()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name)
+        .filter(|n| !n.is_empty());
+    list_in(dir)
+        .into_iter()
+        .map(|s| s.meta.tag)
+        .chain(herdr)
+        .chain(reserved.iter().cloned())
+        .collect()
 }
 
 /// The name a new session will be created under, with the cache-wide tags lock
@@ -764,7 +800,11 @@ impl TagClaim {
 /// precisely how `restore` relaunches an agent under its old name. Minting
 /// avoids them, so a new agent never takes a placeholder a pending restore
 /// will want back.
-pub(crate) fn claim_tag(requested: Option<&str>, cwd: &Path, reserved: &HashSet<String>) -> Result<TagClaim, String> {
+pub(crate) fn claim_tag(
+    requested: Option<&str>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+) -> Result<TagClaim, String> {
     let dir = cache_dir();
     check_requested(requested)?;
     // Without this lock two runs can both pass the check. Failing to take it
@@ -779,7 +819,11 @@ pub(crate) fn claim_tag(requested: Option<&str>, cwd: &Path, reserved: &HashSet<
         }
         None => mint_tag(cwd, &taken_tags(&dir, reserved)),
     };
-    Ok(TagClaim { exited: tombstone_path(&dir, &tag), tag, _lock: lock })
+    Ok(TagClaim {
+        exited: tombstone_path(&dir, &tag),
+        tag,
+        _lock: lock,
+    })
 }
 
 /// A tag for an agent `spawn` is about to open a window for: `requested`,
@@ -788,7 +832,11 @@ pub(crate) fn claim_tag(requested: Option<&str>, cwd: &Path, reserved: &HashSet<
 /// restore will swallow, which `run --tag` alone allows) — or one minted
 /// avoiding all three. Nothing is held: the window's `run` claims it
 /// ([`claim_tag`]), and refuses it there if another took it meanwhile.
-pub(crate) fn pick_tag(requested: Option<&str>, cwd: &Path, reserved: &HashSet<String>) -> Result<String, String> {
+pub(crate) fn pick_tag(
+    requested: Option<&str>,
+    cwd: &Path,
+    reserved: &HashSet<String>,
+) -> Result<String, String> {
     check_requested(requested)?;
     let dir = cache_dir();
     let _lock = Lock::acquire(&dir.join("tags.lock")).ok_or("could not lock the tag registry")?;
@@ -881,7 +929,12 @@ fn write_prompt(key: &str, cwd: &str, stops: u64, body: &str) -> Result<PathBuf,
     // is random; retry the rare collision rather than overwrite.
     for _ in 0..16 {
         let path = dir.join(format!("{key}-{stops}-{}.md", tag_suffix()));
-        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
             Ok(mut f) => {
                 return f
                     .write_all(body.as_bytes())
@@ -901,7 +954,9 @@ fn write_prompt(key: &str, cwd: &str, stops: u64, body: &str) -> Result<PathBuf,
 /// can tell instructions it was sent from text it merely found.
 fn reference_line(file: &Path, cwd: &str) -> String {
     let at = match file.strip_prefix(cwd) {
-        Ok(rel) if !cwd.is_empty() => format!("{} (relative to your working directory)", rel.display()),
+        Ok(rel) if !cwd.is_empty() => {
+            format!("{} (relative to your working directory)", rel.display())
+        }
         _ => file.display().to_string(),
     };
     format!("Read the file {at} and carry out the instructions in it. They were sent to you through seagents.")
@@ -914,9 +969,14 @@ fn reference_line(file: &Path, cwd: &str) -> String {
 pub(crate) fn referenced_file(text: &str) -> Option<&str> {
     let at = text
         .strip_prefix("Read the file ")?
-        .split_once(" and carry out the instructions in it. They were sent to you through seagents")?
+        .split_once(
+            " and carry out the instructions in it. They were sent to you through seagents",
+        )?
         .0;
-    Some(at.strip_suffix(" (relative to your working directory)").unwrap_or(at))
+    Some(
+        at.strip_suffix(" (relative to your working directory)")
+            .unwrap_or(at),
+    )
 }
 
 /// Delete session `key`'s prompt files in `cwd` — those named
@@ -943,7 +1003,10 @@ pub(crate) fn remove_prompts(key: &str, cwd: &str) {
 
 /// Whether `name` is one of session `key`'s prompt files.
 fn is_prompt_of(name: &str, key: &str) -> bool {
-    let Some(rest) = name.strip_prefix(&format!("{key}-")).and_then(|r| r.strip_suffix(".md")) else {
+    let Some(rest) = name
+        .strip_prefix(&format!("{key}-"))
+        .and_then(|r| r.strip_suffix(".md"))
+    else {
         return false;
     };
     let Some((stops, hex)) = rest.split_once('-') else {
@@ -952,7 +1015,9 @@ fn is_prompt_of(name: &str, key: &str) -> bool {
     !stops.is_empty()
         && stops.bytes().all(|b| b.is_ascii_digit())
         && hex.len() == 4
-        && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Keep `.seagents/` (worktrees, prompt files) out of the git work tree
@@ -984,8 +1049,13 @@ fn add_exclude_line(exclude: &Path) -> Result<(), String> {
     if let Some(dir) = exclude.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-    fs::write(exclude, format!("{text}{sep}{LINE}\n")).map_err(|e| format!("{}: {e}", exclude.display()))
+    let sep = if text.is_empty() || text.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    fs::write(exclude, format!("{text}{sep}{LINE}\n"))
+        .map_err(|e| format!("{}: {e}", exclude.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,8 +1168,14 @@ pub(crate) fn debug_log(log: &str, message: &str) {
     if std::env::var_os("SEAGENTS_DEBUG").is_none() {
         return;
     }
-    if let Ok(mut f) = crate::fsutil::create_private(&cache_dir().join(format!("{log}.log")), true) {
-        let _ = writeln!(f, "{} pid {}: {message}", crate::clock::unix_now(), std::process::id());
+    if let Ok(mut f) = crate::fsutil::create_private(&cache_dir().join(format!("{log}.log")), true)
+    {
+        let _ = writeln!(
+            f,
+            "{} pid {}: {message}",
+            crate::clock::unix_now(),
+            std::process::id()
+        );
     }
 }
 
@@ -1143,6 +1219,12 @@ impl Lock {
 
     fn open(path: &Path) -> Option<File> {
         use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).ok()
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
     }
 }

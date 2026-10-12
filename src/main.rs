@@ -290,7 +290,12 @@ enum Command {
     /// the session of the herdr pane it runs in. Always exits 0 and prints nothing: a nonzero `Stop`
     /// hook changes what the agent does. Any arguments are ignored, so no
     /// command line can make it a usage error.
-    #[command(name = "__hook", hide = true, disable_help_flag = true, disable_version_flag = true)]
+    #[command(
+        name = "__hook",
+        hide = true,
+        disable_help_flag = true,
+        disable_version_flag = true
+    )]
     Hook {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         _ignored: Vec<String>,
@@ -347,7 +352,11 @@ fn main() {
 fn dispatch(command: Command) -> i32 {
     match command {
         Command::Hud => hud::run(),
-        Command::Run { tag, seed_file, cmd } => run::run(cmd, tag, seed_file),
+        Command::Run {
+            tag,
+            seed_file,
+            cmd,
+        } => run::run(cmd, tag, seed_file),
         Command::Spawn {
             cwd,
             tag,

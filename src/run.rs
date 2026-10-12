@@ -61,7 +61,9 @@ pub(crate) fn run(cmd: Vec<String>, tag: Option<String>, seed_file: Option<PathB
     };
     if in_herdr_pane() {
         if seed.is_some() {
-            eprintln!("seagents: inside a herdr pane the agent runs as it is; its seed prompt is dropped");
+            eprintln!(
+                "seagents: inside a herdr pane the agent runs as it is; its seed prompt is dropped"
+            );
         }
         let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
         eprintln!("seagents: {}: {err}", cmd[0]);
@@ -99,7 +101,12 @@ fn take_seed(path: &Path) -> Result<String, String> {
 }
 
 /// Everything after the checks: start the agent, show it, end with it.
-fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>) -> Result<i32, (i32, String)> {
+fn launch(
+    cmd: &[String],
+    kind: &str,
+    tag: Option<String>,
+    seed: Option<String>,
+) -> Result<i32, (i32, String)> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("seagents"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session_env = crate::adapter::own_session_env();
@@ -107,7 +114,9 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
     let adapter = match crate::adapter::for_command(&cmd[0]) {
         Ok(a) => Some(a),
         // A seed has nowhere to go without the adapter.
-        Err(e) if seed.is_some() => return Err((2, format!("agent adapter: {e}; cannot seed the prompt"))),
+        Err(e) if seed.is_some() => {
+            return Err((2, format!("agent adapter: {e}; cannot seed the prompt")))
+        }
         Err(e) => {
             // The agent still starts — a broken override must not take every
             // `claude` launch down with it — just without our hooks.
@@ -132,9 +141,11 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
     let handle = tag.as_deref().map(handle_for);
     // Held from here until the `.meta` exists, so no other `run` can take
     // the same tag in between.
-    let claim = registry::claim_tag(tag.as_deref(), &cwd, &crate::snapshot::captured_tags()).map_err(|e| (2, e))?;
+    let claim = registry::claim_tag(tag.as_deref(), &cwd, &crate::snapshot::captured_tags())
+        .map_err(|e| (2, e))?;
     let env = pane_env(adapter.as_ref().map_or(&[][..], |a| &a.launch.pass_env));
-    let pane = place(&cwd, &claim.tag, &env).map_err(|e| (1, format!("making the agent's herdr tab: {e}")))?;
+    let pane = place(&cwd, &claim.tag, &env)
+        .map_err(|e| (1, format!("making the agent's herdr tab: {e}")))?;
     let key = pane.terminal_id.clone();
     let meta = registry::Meta {
         key: key.clone(),
@@ -169,8 +180,8 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
 
     let args = match &adapter {
         Some(a) => {
-            let settings =
-                registry::hooks_file(&key).map_err(|e| fail(format!("no runtime dir for the hook settings: {e}")))?;
+            let settings = registry::hooks_file(&key)
+                .map_err(|e| fail(format!("no runtime dir for the hook settings: {e}")))?;
             let (argv, warning) = crate::hook::inject(cmd, a, &exe, &cwd, &settings);
             if let Some(w) = warning {
                 eprintln!("seagents: {w}");
@@ -213,7 +224,13 @@ fn launch(cmd: &[String], kind: &str, tag: Option<String>, seed: Option<String>)
     record_pid(&files, &pane.pane_id);
 
     let gone = Arc::new(AtomicBool::new(false));
-    monitor(files.clone(), key.clone(), tag.clone(), cmd[0].clone(), Arc::clone(&gone));
+    monitor(
+        files.clone(),
+        key.clone(),
+        tag.clone(),
+        cmd[0].clone(),
+        Arc::clone(&gone),
+    );
     if let Some(seed) = seed {
         deliver_seed(key.clone(), seed);
     }
@@ -244,10 +261,13 @@ fn place(cwd: &Path, tag: &str, env: &[(String, String)]) -> Result<herdr::Pane,
     let mut workspaces: Vec<&str> = here.iter().map(|p| p.workspace_id.as_str()).collect();
     workspaces.dedup();
     for ws in &workspaces {
-        for tab in herdr::tabs(ws)?.into_iter().filter(|t| t.label == tag && t.pane_count == 1) {
-            let free = here
-                .iter()
-                .find(|p| p.tab_id == tab.tab_id && !agents.iter().any(|a| a.terminal_id == p.terminal_id));
+        for tab in herdr::tabs(ws)?
+            .into_iter()
+            .filter(|t| t.label == tag && t.pane_count == 1)
+        {
+            let free = here.iter().find(|p| {
+                p.tab_id == tab.tab_id && !agents.iter().any(|a| a.terminal_id == p.terminal_id)
+            });
             if let Some(p) = free {
                 return Ok((*p).clone());
             }
@@ -256,8 +276,11 @@ fn place(cwd: &Path, tag: &str, env: &[(String, String)]) -> Result<herdr::Pane,
     match workspaces.first() {
         Some(ws) => herdr::create_tab(ws, cwd, tag, env),
         None => {
-            let label = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "/".to_string());
-                let pane = herdr::create_workspace(cwd, &label, env)?;
+            let label = cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let pane = herdr::create_workspace(cwd, &label, env)?;
             if let Err(e) = herdr::rename_tab(&pane.tab_id, tag) {
                 let _ = herdr::close_pane(&pane.pane_id);
                 return Err(e);
@@ -292,7 +315,12 @@ fn clean_shell(pane: &str) {
     let names: Vec<String> = std::fs::read(format!("/proc/{}/environ", procs.shell_pid))
         .map(|env| {
             env.split(|b| *b == 0)
-                .filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('=').map(|(k, _)| k.to_string()))
+                .filter_map(|kv| {
+                    std::str::from_utf8(kv)
+                        .ok()?
+                        .split_once('=')
+                        .map(|(k, _)| k.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -310,7 +338,13 @@ const SHELL_READY: Duration = Duration::from_secs(15);
 
 /// `herdr agent start`, once the pane's shell is in the foreground — and
 /// again while herdr still finds the pane busy, within [`SHELL_READY`].
-fn start(tag: &str, kind: &str, pane: &str, args: &[String], cancelled: &dyn Fn() -> bool) -> Result<(), herdr::Error> {
+fn start(
+    tag: &str,
+    kind: &str,
+    pane: &str,
+    args: &[String],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), herdr::Error> {
     let deadline = Instant::now() + SHELL_READY;
     loop {
         // The pane's foreground process group is its shell's own.
@@ -391,7 +425,11 @@ fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> End
         if gone.load(Ordering::Relaxed) {
             return Ended::Agent;
         }
-        let child = herdr::attach(key).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::piped()).spawn();
+        let child = herdr::attach(key)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn();
         let mut child = match child {
             Ok(c) => c,
             Err(e) => return Ended::Failed(format!("running herdr: {e}")),
@@ -440,7 +478,10 @@ fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> End
         failures.retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
         failures.push(now);
         if failures.len() >= MAX_FAILURES {
-            return Ended::Failed(format!("could not show {tag} in this window: {}", said.trim()));
+            return Ended::Failed(format!(
+                "could not show {tag} in this window: {}",
+                said.trim()
+            ));
         }
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -463,7 +504,11 @@ fn wait_out(end: &AtomicBool, gone: &AtomicBool) -> Ended {
 /// hang-up. Beside SIGHUP, which the shell between us and the terminal may
 /// not pass on.
 fn hung_up() -> bool {
-    let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: 0, revents: 0 };
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: 0,
+        revents: 0,
+    };
     let n = unsafe { libc::poll(&mut fd, 1, 0) };
     n > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
@@ -482,7 +527,11 @@ fn agent_alive(key: &str) -> bool {
 /// watching. When the agent exits it closes its pane — the attach ends, and
 /// with it the window — and says so through `gone`.
 fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<AtomicBool>) {
-    let cmd0 = Path::new(&cmd).file_name().and_then(|s| s.to_str()).unwrap_or(&cmd).to_string();
+    let cmd0 = Path::new(&cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd)
+        .to_string();
     std::thread::spawn(move || {
         // In-memory previous state for transition notifications — kept apart
         // from `.state` on purpose: another observer (an open HUD) may stamp
@@ -497,7 +546,10 @@ fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<Atomic
             let meta = registry::read_meta(&files).unwrap_or_default();
             let pid = match meta.pid {
                 Some(pid) => Some(pid),
-                None => herdr::pane_of(&key).ok().flatten().and_then(|p| record_pid(&files, &p.pane_id)),
+                None => herdr::pane_of(&key)
+                    .ok()
+                    .flatten()
+                    .and_then(|p| record_pid(&files, &p.pane_id)),
             };
             if pid.is_some_and(|p| !crate::procfs::alive(p)) {
                 if let Ok(Some(p)) = herdr::pane_of(&key) {
@@ -524,7 +576,11 @@ fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<Atomic
             prev = Some(state);
             // Unacknowledged completion + the agent's window is focused → the
             // user is looking at it: done → idle.
-            if state == status::State::Idle && !seen && meta.con_id.is_some() && window::focused_con_id() == meta.con_id {
+            if state == status::State::Idle
+                && !seen
+                && meta.con_id.is_some()
+                && window::focused_con_id() == meta.con_id
+            {
                 status::ack_session_files(&files);
             }
             // The dropped-turn clock: while the agent sits idle in a turn,
@@ -588,8 +644,13 @@ fn deliver_seed(key: String, seed: String) {
             return;
         };
         let agent = herdr::agent_on(&key).ok().flatten();
-        let idle = status::agent_status(agent.as_ref(), session.meta.agent()).is_some_and(|(s, _)| s.idle());
-        idle_since = if idle { idle_since.or(Some(Instant::now())) } else { None };
+        let idle = status::agent_status(agent.as_ref(), session.meta.agent())
+            .is_some_and(|(s, _)| s.idle());
+        idle_since = if idle {
+            idle_since.or(Some(Instant::now()))
+        } else {
+            None
+        };
         if idle_since.is_some_and(|t| t.elapsed() >= SEED_SETTLE) {
             if line.is_none() {
                 match registry::by_reference(&key, &session.meta.cwd, 0, &seed) {
@@ -597,19 +658,29 @@ fn deliver_seed(key: String, seed: String) {
                     Err(e) => {
                         // Not printed: this window's terminal is the agent's
                         // screen now.
-                        registry::debug_log("run", &format!("{key}: writing the seed prompt's file: {e}"));
+                        registry::debug_log(
+                            "run",
+                            &format!("{key}: writing the seed prompt's file: {e}"),
+                        );
                         return;
                     }
                 }
             }
             let body = crate::send::Body::Prompt(line.clone().unwrap_or_default());
-            let opts = crate::send::Opts { now: false, answer: false, timeout: Duration::from_secs(10) };
+            let opts = crate::send::Opts {
+                now: false,
+                answer: false,
+                timeout: Duration::from_secs(10),
+            };
             match crate::send::submit(&session, body, &opts) {
                 Ok(_) => return,
                 Err(r) if r.reason == Some(crate::send::Refusal::Exit) => return,
                 // Anything else — busy, blocked, someone's draft in the box —
                 // is waited out: the seed is not dropped.
-                Err(r) => registry::debug_log("run", &format!("{key}: seed held: {}", r.error.unwrap_or_default())),
+                Err(r) => registry::debug_log(
+                    "run",
+                    &format!("{key}: seed held: {}", r.error.unwrap_or_default()),
+                ),
             }
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -620,16 +691,28 @@ fn deliver_seed(key: String, seed: String) {
 /// for: the agent finished (working → idle) or is waiting on input
 /// (→ blocked). Suppressed while the agent's own window is focused — the
 /// user is already looking at it. SEAGENTS_NO_NOTIFY=1 disables.
-fn notify_transition(prev: status::State, state: status::State, dir: &str, cmd: &str, con_id: Option<u64>) {
+fn notify_transition(
+    prev: status::State,
+    state: status::State,
+    dir: &str,
+    cmd: &str,
+    con_id: Option<u64>,
+) {
     use status::State;
     if std::env::var_os("SEAGENTS_NO_NOTIFY").is_some() {
         return;
     }
     let (summary, body, urgency) = match (prev, state) {
-        (State::Working, State::Idle) => (format!("{cmd} · {dir}: done"), "finished and waiting at the prompt".to_string(), "normal"),
-        (p, State::Blocked) if p != State::Blocked && p != State::Unknown => {
-            (format!("{cmd} · {dir}: needs you"), "waiting for your input".to_string(), "critical")
-        }
+        (State::Working, State::Idle) => (
+            format!("{cmd} · {dir}: done"),
+            "finished and waiting at the prompt".to_string(),
+            "normal",
+        ),
+        (p, State::Blocked) if p != State::Blocked && p != State::Unknown => (
+            format!("{cmd} · {dir}: needs you"),
+            "waiting for your input".to_string(),
+            "critical",
+        ),
         _ => return,
     };
     if con_id.is_some() && window::focused_con_id() == con_id {
@@ -638,7 +721,9 @@ fn notify_transition(prev: status::State, state: status::State, dir: &str, cmd: 
     // Reap in a detached thread: a dropped Child is never wait()ed, so each
     // finished notify-send would otherwise linger as a zombie.
     if let Ok(mut child) = std::process::Command::new("notify-send")
-        .args(["-a", "seagents", "-u", urgency, "-t", "8000", &summary, &body])
+        .args([
+            "-a", "seagents", "-u", urgency, "-t", "8000", &summary, &body,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

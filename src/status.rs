@@ -157,13 +157,24 @@ pub(crate) fn collect(sort: Sort) -> Vec<Session> {
         // Within a rank, longest-in-state first: the blocked agent you've
         // kept waiting longest tops the list.
         Sort::Urgency => sessions.sort_by(|a, b| {
-            (a.state.rank(), std::cmp::Reverse(a.state_secs), &a.dir, &a.id)
-                .cmp(&(b.state.rank(), std::cmp::Reverse(b.state_secs), &b.dir, &b.id))
+            (
+                a.state.rank(),
+                std::cmp::Reverse(a.state_secs),
+                &a.dir,
+                &a.id,
+            )
+                .cmp(&(
+                    b.state.rank(),
+                    std::cmp::Reverse(b.state_secs),
+                    &b.dir,
+                    &b.id,
+                ))
         }),
-        Sort::Dir => sessions.sort_by(|a, b| (&a.dir, a.state.rank(), &a.id).cmp(&(&b.dir, b.state.rank(), &b.id))),
-        Sort::Recent => {
-            sessions.sort_by(|a, b| (a.state_secs, a.state.rank(), &a.id).cmp(&(b.state_secs, b.state.rank(), &b.id)))
-        }
+        Sort::Dir => sessions
+            .sort_by(|a, b| (&a.dir, a.state.rank(), &a.id).cmp(&(&b.dir, b.state.rank(), &b.id))),
+        Sort::Recent => sessions.sort_by(|a, b| {
+            (a.state_secs, a.state.rank(), &a.id).cmp(&(b.state_secs, b.state.rank(), &b.id))
+        }),
     }
     sessions
 }
@@ -177,9 +188,24 @@ pub fn print(sort: Sort) -> i32 {
     if sessions.is_empty() {
         println!("no agents tracked");
     }
-    let tag_w = sessions.iter().map(|s| s.tag.len()).max().unwrap_or(3).max(3);
-    let dir_w = sessions.iter().map(|s| s.dir.len()).max().unwrap_or(3).max(3);
-    let cmd_w = sessions.iter().map(|s| s.cmd.len()).max().unwrap_or(3).max(3);
+    let tag_w = sessions
+        .iter()
+        .map(|s| s.tag.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let dir_w = sessions
+        .iter()
+        .map(|s| s.dir.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let cmd_w = sessions
+        .iter()
+        .map(|s| s.cmd.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
     for s in &sessions {
         println!(
             "{:<11}  {:<tw$}  {:<dw$}  {:<cw$}  {:>6}",
@@ -229,21 +255,32 @@ pub fn print_json(sort: Sort) -> i32 {
             })
         })
         .collect();
-    println!("{}", serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into()));
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::Value::Array(arr)).unwrap_or_else(|_| "[]".into())
+    );
     0
 }
 
 /// Build a Session from one live session's `.meta` and what herdr reports
 /// of its agent (None: herdr does not see it — not started yet, or
 /// suspended).
-fn read_session(live: &crate::registry::Session, herdr_agent: Option<&herdr::Agent>, now: u64) -> Session {
+fn read_session(
+    live: &crate::registry::Session,
+    herdr_agent: Option<&herdr::Agent>,
+    now: u64,
+) -> Session {
     let meta = &live.meta;
     let cmd = or_unknown(meta.agent());
     let screen = screen_of(herdr_agent, &cmd);
     let herdr_state = herdr_agent.map(|a| State::of(a.status).word());
     let (state, record, agent, in_turn) = settle(&live.files, &cmd, screen, now);
     // Present unacknowledged completions as their own state.
-    let state = if state == State::Idle && !record.seen { State::Done } else { state };
+    let state = if state == State::Idle && !record.seen {
+        State::Done
+    } else {
+        state
+    };
     Session {
         id: meta.key.clone(),
         state,
@@ -254,7 +291,9 @@ fn read_session(live: &crate::registry::Session, herdr_agent: Option<&herdr::Age
         pane_id: herdr_agent.map_or_else(|| meta.pane_id.clone(), |a| a.pane_id.clone()),
         herdr_state,
         state_secs: now.saturating_sub(record.since),
-        title: herdr_agent.map(|a| conversation_title(&a.title, meta.agent())).unwrap_or_default(),
+        title: herdr_agent
+            .map(|a| conversation_title(&a.title, meta.agent()))
+            .unwrap_or_default(),
         tag: meta.tag.clone(),
         hooks_ok: crate::hook::health(meta, &agent, now),
         agent,
@@ -274,8 +313,14 @@ pub(crate) struct Screen {
 /// with the dialogs herdr misses ([`agent_status`]).
 pub(crate) fn screen_of(agent: Option<&herdr::Agent>, cmd: &str) -> Screen {
     match agent_status(agent, cmd) {
-        Some((status, rule)) => Screen { state: State::of(status), rule },
-        None => Screen { state: State::Unknown, rule: None },
+        Some((status, rule)) => Screen {
+            state: State::of(status),
+            rule,
+        },
+        None => Screen {
+            state: State::Unknown,
+            rule: None,
+        },
     }
 }
 
@@ -292,13 +337,22 @@ pub(crate) const DIALOG_RULE: &str = "seagents_dialog";
 /// whether an agent waits at a dialog. None: herdr does not see the agent.
 /// Costs a herdr call more for a blocked agent (its rule), and one for an
 /// agent whose adapter lists dialogs (its screen).
-pub(crate) fn agent_status(agent: Option<&herdr::Agent>, cmd: &str) -> Option<(herdr::Status, Option<String>)> {
+pub(crate) fn agent_status(
+    agent: Option<&herdr::Agent>,
+    cmd: &str,
+) -> Option<(herdr::Status, Option<String>)> {
     let a = agent?;
     if a.status == herdr::Status::Blocked {
         return Some((a.status, herdr::blocked_rule(&a.pane_id)));
     }
-    let dialogs = crate::adapter::for_command(cmd).map(|ad| ad.screen.dialogs).unwrap_or_default();
-    if !dialogs.is_empty() && herdr::read(&a.pane_id, false).ok().is_none_or(|s| crate::screen::shows_any(&s, &dialogs)) {
+    let dialogs = crate::adapter::for_command(cmd)
+        .map(|ad| ad.screen.dialogs)
+        .unwrap_or_default();
+    if !dialogs.is_empty()
+        && herdr::read(&a.pane_id, false)
+            .ok()
+            .is_none_or(|s| crate::screen::shows_any(&s, &dialogs))
+    {
         return Some((herdr::Status::Blocked, Some(DIALOG_RULE.to_string())));
     }
     Some((a.status, None))
@@ -337,15 +391,28 @@ pub(crate) fn settle(
         let in_turn = ledger.in_turn(&agent, Some(&raw));
         let seen = screen.state;
         let shown = if in_turn && screen.state != State::Blocked {
-            Screen { state: State::Working, rule: None }
+            Screen {
+                state: State::Working,
+                rule: None,
+            }
         } else {
             screen
         };
         let state = shown.state;
-        (state, observe_state(files, shown, seen, now), agent, in_turn)
+        (
+            state,
+            observe_state(files, shown, seen, now),
+            agent,
+            in_turn,
+        )
     } else {
         let state = screen.state;
-        (state, observe_state(files, screen, state, now), agent, false)
+        (
+            state,
+            observe_state(files, screen, state, now),
+            agent,
+            false,
+        )
     }
 }
 
@@ -394,7 +461,8 @@ fn observe_state(files: &Files, shown: Screen, seen: State, now: u64) -> StateRe
                 return p.clone();
             }
         }
-        let finished_unwatched = state == State::Idle && current.as_ref().is_some_and(|p| p.state == "working");
+        let finished_unwatched =
+            state == State::Idle && current.as_ref().is_some_and(|p| p.state == "working");
         let record = StateRecord {
             state: state.word().to_string(),
             since: now,
@@ -431,7 +499,8 @@ pub(crate) fn ack_session(id: &str) {
 /// no HUD or status invocation is watching. Returns the fused state, whether
 /// the completion has been seen, and whether the agent is in a turn.
 pub(crate) fn track(files: &Files, cmd: &str, agent: Option<&herdr::Agent>) -> (State, bool, bool) {
-    let (state, record, _, in_turn) = settle(files, cmd, screen_of(agent, cmd), crate::clock::unix_now());
+    let (state, record, _, in_turn) =
+        settle(files, cmd, screen_of(agent, cmd), crate::clock::unix_now());
     (state, record.seen, in_turn)
 }
 

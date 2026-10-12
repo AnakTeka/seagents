@@ -49,7 +49,11 @@ pub(crate) fn run(args: Args) -> i32 {
 
 fn spawn(args: Args) -> Result<serde_json::Value, String> {
     if crate::herdr::kind_for(&args.agent).is_none() {
-        return Err(format!("{} is not an agent herdr can start; one of: {}", args.agent, crate::herdr::executables()));
+        return Err(format!(
+            "{} is not an agent herdr can start; one of: {}",
+            args.agent,
+            crate::herdr::executables()
+        ));
     }
     let adapter = crate::adapter::for_command(&args.agent)?;
     let prompt = match (&args.prompt_file, args.prompt) {
@@ -82,15 +86,28 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
     let permission = permission_args(&adapter.launch, args.permission_mode.as_deref())?;
     let tag = registry::pick_tag(args.tag.as_deref(), &cwd, &crate::snapshot::captured_tags())?;
 
-    let cwd = if args.worktree { add_worktree(&cwd, &tag)? } else { cwd };
+    let cwd = if args.worktree {
+        add_worktree(&cwd, &tag)?
+    } else {
+        cwd
+    };
     let mut argv = vec![args.agent.clone()];
     argv.extend(permission);
     argv.extend(args.args);
 
     let seed = write_seed(&tag, &prompt)?;
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let run = launch::Run { tag: &tag, seed_file: Some(&seed), argv: &argv, keep_shell: false };
-    if let Err(e) = launch::spawn_terminal(&run, &cwd_str, &crate::window::terminal_class(caller_window())) {
+    let run = launch::Run {
+        tag: &tag,
+        seed_file: Some(&seed),
+        argv: &argv,
+        keep_shell: false,
+    };
+    if let Err(e) = launch::spawn_terminal(
+        &run,
+        &cwd_str,
+        &crate::window::terminal_class(caller_window()),
+    ) {
         let _ = std::fs::remove_file(&seed);
         return Err(e);
     }
@@ -113,7 +130,9 @@ fn spawn(args: Args) -> Result<serde_json::Value, String> {
             }
             Some(_) => registered = true,
             None if registered => {
-                return Err(format!("{tag} registered but did not start; its window says why (if it is still open)"));
+                return Err(format!(
+                    "{tag} registered but did not start; its window says why (if it is still open)"
+                ));
             }
             None => {}
         }
@@ -147,7 +166,10 @@ fn caller_window() -> Option<u64> {
 /// The argv that starts the agent in permission mode `requested`, per the
 /// adapter's `permission_argv`; none asked for, none passed — the tool's own
 /// configured default, the same as typing the command in a terminal.
-fn permission_args(launch: &crate::adapter::Launch, requested: Option<&str>) -> Result<Vec<String>, String> {
+fn permission_args(
+    launch: &crate::adapter::Launch,
+    requested: Option<&str>,
+) -> Result<Vec<String>, String> {
     let Some(mode) = requested else {
         return Ok(Vec::new());
     };
@@ -157,7 +179,10 @@ fn permission_args(launch: &crate::adapter::Launch, requested: Option<&str>) -> 
     }
     modes.get(mode).cloned().ok_or_else(|| {
         let known: Vec<&str> = modes.keys().map(String::as_str).collect();
-        format!("unknown permission mode {mode:?}; one of: {}", known.join(", "))
+        format!(
+            "unknown permission mode {mode:?}; one of: {}",
+            known.join(", ")
+        )
     })
 }
 
@@ -208,21 +233,36 @@ fn add_worktree(cwd: &Path, tag: &str) -> Result<PathBuf, String> {
             .output()
             .map_err(|e| format!("running git: {e}"))?;
         if !out.status.success() {
-            return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let root = PathBuf::from(git(&["rev-parse", "--show-toplevel"]).map_err(|e| format!("--worktree: {e}"))?);
+    let root = PathBuf::from(
+        git(&["rev-parse", "--show-toplevel"]).map_err(|e| format!("--worktree: {e}"))?,
+    );
     let path = root.join(".seagents/worktrees").join(tag);
     let branch = format!("seagents/{tag}");
     if path.exists() {
         return Err(format!("--worktree: {} already exists", path.display()));
     }
-    if git(&["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok() {
+    if git(&[
+        "show-ref",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ])
+    .is_ok()
+    {
         return Err(format!("--worktree: branch {branch} already exists"));
     }
     registry::exclude_seagents(&root)?;
     git(&["worktree", "add", &path.to_string_lossy(), "-b", &branch])?;
     let within = cwd.strip_prefix(&root).unwrap_or(Path::new(""));
-    Ok(Some(path.join(within)).filter(|p| p.is_dir()).unwrap_or(path))
+    Ok(Some(path.join(within))
+        .filter(|p| p.is_dir())
+        .unwrap_or(path))
 }

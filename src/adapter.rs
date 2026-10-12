@@ -182,7 +182,8 @@ impl Send {
     /// counted as the paste carries them, so a trailing newline is one more.
     pub(crate) fn by_reference(&self, body: &str) -> bool {
         self.long_prompt == LongPrompt::File
-            && (body.chars().count() > self.inline_max_chars || body.split('\n').count() > self.inline_max_lines)
+            && (body.chars().count() > self.inline_max_chars
+                || body.split('\n').count() > self.inline_max_lines)
     }
 }
 
@@ -218,32 +219,65 @@ const BUNDLED: &[(&str, &str)] = &[
 fn parse(text: &str) -> Result<Adapter, String> {
     let adapter: Adapter = toml::from_str(text).map_err(|e| e.to_string())?;
     let launch = &adapter.launch;
-    if let Some((mode, _)) = launch.permission_argv.iter().find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-'))) {
-        return Err(format!("launch.permission_argv.{mode} does not start with a flag"));
+    if let Some((mode, _)) = launch
+        .permission_argv
+        .iter()
+        .find(|(_, a)| !a.first().is_some_and(|f| f.starts_with('-')))
+    {
+        return Err(format!(
+            "launch.permission_argv.{mode} does not start with a flag"
+        ));
     }
-    if let Some(bad) = adapter.launch.session_env.iter().find(|n| !valid_env_pattern(n)) {
-        return Err(format!("launch.session_env: {bad:?} is not a variable name (or a prefix and *)"));
+    if let Some(bad) = adapter
+        .launch
+        .session_env
+        .iter()
+        .find(|n| !valid_env_pattern(n))
+    {
+        return Err(format!(
+            "launch.session_env: {bad:?} is not a variable name (or a prefix and *)"
+        ));
     }
-    if let Some(bad) = adapter.launch.pass_env.iter().find(|n| n.ends_with('*') || !valid_env_pattern(n)) {
+    if let Some(bad) = adapter
+        .launch
+        .pass_env
+        .iter()
+        .find(|n| n.ends_with('*') || !valid_env_pattern(n))
+    {
         return Err(format!("launch.pass_env: {bad:?} is not a variable name"));
     }
     let hooks = &adapter.hooks;
     if hooks.enabled() && (hooks.flags.is_empty() || hooks.events.is_empty()) {
         return Err("hooks.inject needs flags and events".to_string());
     }
-    if let Some(bad) = hooks.flags.iter().find(|f| !f.starts_with('-') || f.contains('=')) {
+    if let Some(bad) = hooks
+        .flags
+        .iter()
+        .find(|f| !f.starts_with('-') || f.contains('='))
+    {
         return Err(format!("hooks.flags: {bad:?} is not a flag"));
     }
-    if let Some(bad) = hooks.events.iter().find(|e| !crate::hook::KNOWN_EVENTS.contains(&e.as_str())) {
-        return Err(format!("hooks.events: seagents records {}, not {bad:?}", crate::hook::KNOWN_EVENTS.join(", ")));
+    if let Some(bad) = hooks
+        .events
+        .iter()
+        .find(|e| !crate::hook::KNOWN_EVENTS.contains(&e.as_str()))
+    {
+        return Err(format!(
+            "hooks.events: seagents records {}, not {bad:?}",
+            crate::hook::KNOWN_EVENTS.join(", ")
+        ));
     }
     let resume = &adapter.restore.resume;
     if !resume.is_empty() && !resume.iter().any(|a| a.contains("{session}")) {
         return Err("restore.resume has no {session}".to_string());
     }
     let send = &adapter.send;
-    if send.long_prompt == LongPrompt::File && (send.inline_max_chars == 0 || send.inline_max_lines == 0) {
-        return Err("send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string());
+    if send.long_prompt == LongPrompt::File
+        && (send.inline_max_chars == 0 || send.inline_max_lines == 0)
+    {
+        return Err(
+            "send.long_prompt = \"file\" needs inline_max_chars and inline_max_lines".to_string(),
+        );
     }
     if !send.input_glyph.is_empty() && send.input_clear.is_empty() {
         return Err("send.input_glyph needs input_clear".to_string());
@@ -256,7 +290,9 @@ fn parse(text: &str) -> Result<Adapter, String> {
 fn valid_env_pattern(p: &str) -> bool {
     let name = p.strip_suffix('*').unwrap_or(p);
     let b = name.as_bytes();
-    !b.is_empty() && !b[0].is_ascii_digit() && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    !b.is_empty()
+        && !b[0].is_ascii_digit()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Of the variables `env` holds, those every bundled adapter's
@@ -269,7 +305,12 @@ fn valid_env_pattern(p: &str) -> bool {
 pub(crate) fn session_env<'a>(env: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let patterns: Vec<String> = BUNDLED
         .iter()
-        .flat_map(|(_, text)| parse(text).expect("bundled adapters parse").launch.session_env)
+        .flat_map(|(_, text)| {
+            parse(text)
+                .expect("bundled adapters parse")
+                .launch
+                .session_env
+        })
         .collect();
     let mut names: Vec<String> = env
         .into_iter()
@@ -288,13 +329,17 @@ pub(crate) fn session_env<'a>(env: impl IntoIterator<Item = &'a str>) -> Vec<Str
 
 /// [`session_env`] of this process's own environment.
 pub(crate) fn own_session_env() -> Vec<String> {
-    let vars: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
+    let vars: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
     session_env(vars.iter().map(String::as_str))
 }
 
 /// `~/.config/seagents/agents/<agent>.toml`.
 fn override_path(agent: &str) -> PathBuf {
-    crate::fsutil::config_dir().join("agents").join(format!("{agent}.toml"))
+    crate::fsutil::config_dir()
+        .join("agents")
+        .join(format!("{agent}.toml"))
 }
 
 /// The adapter for the command whose first word is `argv0` (a path or a bare

@@ -19,21 +19,41 @@
 pub(crate) fn input_box(ansi: &str, glyph: &str) -> Option<String> {
     let rows: Vec<Vec<(char, bool)>> = ansi.split('\n').map(styled_row).collect();
     let plain = |r: &[(char, bool)]| r.iter().map(|(c, _)| *c).collect::<String>();
-    let top = rows.iter().rposition(|r| plain(r).trim_start().starts_with(glyph))?;
+    let top = rows
+        .iter()
+        .rposition(|r| plain(r).trim_start().starts_with(glyph))?;
     let rule = |r: &[(char, bool)]| plain(r).trim_start().starts_with('─');
     let end = rows[top + 1..]
         .iter()
         .position(|r| plain(r).trim().is_empty() || rule(r))
         .map_or(rows.len(), |n| top + 1 + n);
     // Typed text: the cells that are not dim, the glyph itself left out.
-    let typed = |r: &[(char, bool)]| r.iter().filter(|(_, dim)| !dim).map(|(c, _)| *c).collect::<String>();
+    let typed = |r: &[(char, bool)]| {
+        r.iter()
+            .filter(|(_, dim)| !dim)
+            .map(|(c, _)| *c)
+            .collect::<String>()
+    };
     let first = typed(&rows[top]);
-    let first = first.trim_start().strip_prefix(glyph).unwrap_or(&first).trim().to_string();
+    let first = first
+        .trim_start()
+        .strip_prefix(glyph)
+        .unwrap_or(&first)
+        .trim()
+        .to_string();
     let lines: Vec<String> = std::iter::once(first)
-        .chain(rows[top + 1..end].iter().map(|r| typed(r).trim().to_string()))
+        .chain(
+            rows[top + 1..end]
+                .iter()
+                .map(|r| typed(r).trim().to_string()),
+        )
         .collect();
     let text = lines.join("\n");
-    Some(if text.trim().is_empty() { String::new() } else { text.trim().to_string() })
+    Some(if text.trim().is_empty() {
+        String::new()
+    } else {
+        text.trim().to_string()
+    })
 }
 
 /// Whether the plain screen shows any of `needles` — compared with
@@ -42,14 +62,25 @@ pub(crate) fn input_box(ansi: &str, glyph: &str) -> Option<String> {
 /// matches its question.
 pub(crate) fn shows_any(screen: &str, needles: &[String]) -> bool {
     let screen = normalized(screen);
-    needles.iter().map(|n| normalized(n)).any(|n| !n.is_empty() && screen.contains(&n))
+    needles
+        .iter()
+        .map(|n| normalized(n))
+        .any(|n| !n.is_empty() && screen.contains(&n))
 }
 
 /// `text` with box-drawing characters (U+2500–U+257F) and `|` gone and every
 /// run of whitespace one space.
 fn normalized(text: &str) -> String {
-    let kept: String =
-        text.chars().map(|c| if ('\u{2500}'..='\u{257f}').contains(&c) || c == '|' { ' ' } else { c }).collect();
+    let kept: String = text
+        .chars()
+        .map(|c| {
+            if ('\u{2500}'..='\u{257f}').contains(&c) || c == '|' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -102,7 +133,10 @@ fn styled_row(line: &str) -> Vec<(char, bool)> {
 /// Colour parameters carry numbers of their own (`38;2;r;g;b`, `38;5;n`),
 /// which are skipped, not read as attributes.
 fn sgr_dim(params: &str, mut dim: bool) -> bool {
-    let p: Vec<u32> = params.split([';', ':']).map(|x| x.parse().unwrap_or(0)).collect();
+    let p: Vec<u32> = params
+        .split([';', ':'])
+        .map(|x| x.parse().unwrap_or(0))
+        .collect();
     let mut i = 0;
     while i < p.len() {
         match p[i] {

@@ -110,11 +110,19 @@ const CONTEXT_TAGS: &[&str] = &[
 /// Whether a `user` message is the user's own words — a turn — rather
 /// than context Codex injected under the user role.
 fn user_turn(p: &Payload) -> bool {
-    if let Some(kinds) = p.internal_chat_message_metadata_passthrough.as_ref().and_then(|m| m.content_item_kinds.as_ref()) {
+    if let Some(kinds) = p
+        .internal_chat_message_metadata_passthrough
+        .as_ref()
+        .and_then(|m| m.content_item_kinds.as_ref())
+    {
         return kinds.iter().any(|k| k.starts_with("user."));
     }
     let contextual = p.content.iter().flatten().any(|c| {
-        c.text.as_deref().is_some_and(|t| CONTEXT_TAGS.iter().any(|tag| t.trim_start().starts_with(tag)))
+        c.text.as_deref().is_some_and(|t| {
+            CONTEXT_TAGS
+                .iter()
+                .any(|tag| t.trim_start().starts_with(tag))
+        })
     });
     !contextual
 }
@@ -141,7 +149,14 @@ pub(super) fn head(line: &[u8], at: u64, prior: &[Node]) -> Option<Node> {
         let turns = p.and_then(|p| p.num_turns).unwrap_or(0);
         parent = before_turns(prior, turns);
     }
-    Some(Node { offset: 0, len: 0, kind, ts, uuid: u128::from(at) + 1, parent })
+    Some(Node {
+        offset: 0,
+        len: 0,
+        kind,
+        ts,
+        uuid: u128::from(at) + 1,
+        parent,
+    })
 }
 
 /// The node the conversation stood on before its last `turns` user turns:
@@ -157,7 +172,10 @@ fn before_turns(prior: &[Node], turns: u64) -> u128 {
     let by_uuid = |u: u128| {
         // uuid = offset + 1, and nodes are in offset order.
         let offset = u64::try_from(u.checked_sub(1)?).ok()?;
-        prior.binary_search_by_key(&offset, |n| n.offset).ok().map(|i| &prior[i])
+        prior
+            .binary_search_by_key(&offset, |n| n.offset)
+            .ok()
+            .map(|i| &prior[i])
     };
     let mut seen = 0;
     let mut at = Some(last);
@@ -192,8 +210,12 @@ pub(super) fn records(line: &[u8], node: &Node) -> Vec<Record> {
     let text = |s: &str| s.to_string();
     let kind = match p["type"].as_str().unwrap_or("") {
         "message" => match p["role"].as_str() {
-            Some("user") if node.kind == NodeKind::User => Kind::User { text: flatten(&p["content"]) },
-            Some("assistant") => Kind::Assistant { text: flatten(&p["content"]) },
+            Some("user") if node.kind == NodeKind::User => Kind::User {
+                text: flatten(&p["content"]),
+            },
+            Some("assistant") => Kind::Assistant {
+                text: flatten(&p["content"]),
+            },
             _ => return Vec::new(),
         },
         "reasoning" => {
@@ -205,21 +227,32 @@ pub(super) fn records(line: &[u8], node: &Node) -> Vec<Record> {
             if parts.is_empty() {
                 return Vec::new(); // encrypted only
             }
-            Kind::Thinking { text: parts.join("\n\n") }
+            Kind::Thinking {
+                text: parts.join("\n\n"),
+            }
         }
         "function_call" | "custom_tool_call" => {
-            let raw = p["arguments"].as_str().or(p["input"].as_str()).unwrap_or("");
+            let raw = p["arguments"]
+                .as_str()
+                .or(p["input"].as_str())
+                .unwrap_or("");
             Kind::ToolUse {
                 id: p["call_id"].as_str().map_or_else(String::new, text),
                 name: p["name"].as_str().map_or_else(String::new, text),
                 // `arguments` is JSON in a string; a custom tool's `input`
                 // is free text (0.152's `exec` takes a script).
-                input: serde_json::from_str::<Value>(raw).ok().filter(Value::is_object).unwrap_or_else(|| Value::String(raw.to_string())),
+                input: serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| Value::String(raw.to_string())),
                 subagent: None,
             }
         }
         "local_shell_call" => Kind::ToolUse {
-            id: p["call_id"].as_str().or(p["id"].as_str()).map_or_else(String::new, text),
+            id: p["call_id"]
+                .as_str()
+                .or(p["id"].as_str())
+                .map_or_else(String::new, text),
             name: "shell".to_string(),
             input: p["action"].clone(),
             subagent: None,
@@ -233,7 +266,9 @@ pub(super) fn records(line: &[u8], node: &Node) -> Vec<Record> {
         "function_call_output" | "custom_tool_call_output" => {
             let text = flatten(&p["output"]);
             Kind::ToolResult {
-                tool_use_id: p["call_id"].as_str().map_or_else(String::new, |s| s.to_string()),
+                tool_use_id: p["call_id"]
+                    .as_str()
+                    .map_or_else(String::new, |s| s.to_string()),
                 bytes: text.len(),
                 text,
                 is_error: false,
@@ -257,7 +292,11 @@ fn flatten(content: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        Value::Object(o) => o.get("content").or(o.get("output")).map(flatten).unwrap_or_default(),
+        Value::Object(o) => o
+            .get("content")
+            .or(o.get("output"))
+            .map(flatten)
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -287,7 +326,9 @@ fn scan(tail: &[u8], since_ms: u64) -> bool {
         if ts < since_ms {
             return false;
         }
-        if h.kind.as_deref() == Some("event_msg") && h.payload.as_ref().and_then(|p| p.kind.as_deref()) == Some("turn_aborted") {
+        if h.kind.as_deref() == Some("event_msg")
+            && h.payload.as_ref().and_then(|p| p.kind.as_deref()) == Some("turn_aborted")
+        {
             return true;
         }
     }

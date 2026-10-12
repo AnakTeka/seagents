@@ -117,8 +117,19 @@ pub(super) fn head(line: &[u8], _at: u64, _prior: &[Node]) -> Option<Node> {
         Some("assistant") => NodeKind::Assistant,
         _ => NodeKind::Other,
     };
-    let ts = h.timestamp.as_deref().and_then(super::parse_utc_ms).unwrap_or(0);
-    Some(Node { offset: 0, len: 0, kind, ts, uuid, parent })
+    let ts = h
+        .timestamp
+        .as_deref()
+        .and_then(super::parse_utc_ms)
+        .unwrap_or(0);
+    Some(Node {
+        offset: 0,
+        len: 0,
+        kind,
+        ts,
+        uuid,
+        parent,
+    })
 }
 
 /// The records of one line, in block order; none for a line that is not
@@ -146,9 +157,13 @@ pub(super) fn records(line: &[u8], _node: &Node) -> Vec<Record> {
     let content = &v["message"]["content"];
     if let Some(text) = content.as_str() {
         return vec![record(if role == "user" {
-            Kind::User { text: text.to_string() }
+            Kind::User {
+                text: text.to_string(),
+            }
         } else {
-            Kind::Assistant { text: text.to_string() }
+            Kind::Assistant {
+                text: text.to_string(),
+            }
         })];
     }
     let Some(blocks) = content.as_array() else {
@@ -160,7 +175,9 @@ pub(super) fn records(line: &[u8], _node: &Node) -> Vec<Record> {
     let mut said: Vec<String> = Vec::new();
     let flush = |said: &mut Vec<String>, out: &mut Vec<Record>| {
         if !said.is_empty() {
-            out.push(record(Kind::User { text: said.join("\n") }));
+            out.push(record(Kind::User {
+                text: said.join("\n"),
+            }));
             said.clear();
         }
     };
@@ -179,12 +196,12 @@ pub(super) fn records(line: &[u8], _node: &Node) -> Vec<Record> {
             }
             ("user", "text") => said.push(b["text"].as_str().unwrap_or("").to_string()),
             ("user", other) => said.push(format!("[{other}]")),
-            ("assistant", "text") => {
-                out.push(record(Kind::Assistant { text: b["text"].as_str().unwrap_or("").to_string() }))
-            }
-            ("assistant", "thinking") => {
-                out.push(record(Kind::Thinking { text: b["thinking"].as_str().unwrap_or("").to_string() }))
-            }
+            ("assistant", "text") => out.push(record(Kind::Assistant {
+                text: b["text"].as_str().unwrap_or("").to_string(),
+            })),
+            ("assistant", "thinking") => out.push(record(Kind::Thinking {
+                text: b["thinking"].as_str().unwrap_or("").to_string(),
+            })),
             ("assistant", "tool_use" | "server_tool_use") => {
                 let name = b["name"].as_str().unwrap_or("").to_string();
                 let input = b["input"].clone();
@@ -230,7 +247,10 @@ fn subagent_call(name: &str, input: &Value) -> Option<Subagent> {
     }
     Some(Subagent {
         // Claude Code's own default when the call names no type.
-        agent_type: input["subagent_type"].as_str().unwrap_or("general-purpose").to_string(),
+        agent_type: input["subagent_type"]
+            .as_str()
+            .unwrap_or("general-purpose")
+            .to_string(),
         description: input["description"].as_str().unwrap_or("").to_string(),
         transcript: None,
     })
@@ -258,7 +278,10 @@ pub(super) fn subagents(transcript: &Path) -> HashMap<String, Subagent> {
         if is_helper(stem) {
             continue;
         }
-        let Some(meta) = std::fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        let Some(meta) = std::fs::read(e.path())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
             continue;
         };
         let Some(id) = meta["toolUseId"].as_str() else {
@@ -268,7 +291,10 @@ pub(super) fn subagents(transcript: &Path) -> HashMap<String, Subagent> {
         out.insert(
             id.to_string(),
             Subagent {
-                agent_type: meta["agentType"].as_str().unwrap_or("general-purpose").to_string(),
+                agent_type: meta["agentType"]
+                    .as_str()
+                    .unwrap_or("general-purpose")
+                    .to_string(),
                 description: meta["description"].as_str().unwrap_or("").to_string(),
                 transcript: jsonl.exists().then(|| jsonl.display().to_string()),
             },
@@ -280,5 +306,6 @@ pub(super) fn subagents(transcript: &Path) -> HashMap<String, Subagent> {
 /// `agent-a<word>-…`: a helper. A real subagent is `agent-a<hex>`, no
 /// hyphen after the prefix.
 fn is_helper(stem: &str) -> bool {
-    stem.strip_prefix("agent-").is_none_or(|rest| rest.contains('-'))
+    stem.strip_prefix("agent-")
+        .is_none_or(|rest| rest.contains('-'))
 }

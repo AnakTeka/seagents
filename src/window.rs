@@ -42,7 +42,8 @@ pub fn focus(target: &str) -> i32 {
 /// again. There is deliberately no fuzzy fallback: window identity is captured
 /// at launch, by exact means wherever the terminal allows.
 pub(crate) fn focus_window(key: &str) -> Result<(), String> {
-    let session = crate::registry::by_key(key).ok_or_else(|| format!("no tracked session {key}"))?;
+    let session =
+        crate::registry::by_key(key).ok_or_else(|| format!("no tracked session {key}"))?;
 
     if let Some(con_id) = session.meta.con_id {
         if i3::focus(con_id) {
@@ -52,8 +53,7 @@ pub(crate) fn focus_window(key: &str) -> Result<(), String> {
     }
 
     if let Some(xid) = session.meta.window_id {
-        let windows =
-            i3::windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
+        let windows = i3::windows().ok_or("could not read the i3 tree (is i3-msg on PATH?)")?;
         if let Some(win) = windows.iter().find(|w| w.xid == Some(xid)) {
             if i3::focus(win.con_id) {
                 record_window(&session.files, win.con_id, Some(xid));
@@ -179,8 +179,7 @@ pub(crate) fn window_ids_from_env() -> Option<(u64, Option<u64>)> {
 /// terminal costs one extra lookup rather than a wrong answer.
 pub(crate) fn window_ids_by_pid() -> Option<(u64, Option<u64>)> {
     let windows = i3::windows()?;
-    let known: std::collections::HashSet<u64> =
-        windows.iter().filter_map(|w| w.xid).collect();
+    let known: std::collections::HashSet<u64> = windows.iter().filter_map(|w| w.xid).collect();
 
     for pid in crate::procfs::ancestors(std::process::id() as u64).unwrap_or_default() {
         let Ok(out) = Command::new("xdotool")
@@ -277,7 +276,9 @@ pub(crate) fn terminal_class(con_id: Option<u64>) -> String {
     };
     fn find(node: &serde_json::Value, pred: &dyn Fn(&serde_json::Value) -> bool) -> Option<String> {
         if pred(node) {
-            return node["window_properties"]["class"].as_str().map(str::to_string);
+            return node["window_properties"]["class"]
+                .as_str()
+                .map(str::to_string);
         }
         ["nodes", "floating_nodes"]
             .iter()

@@ -36,7 +36,12 @@ pub fn run() -> i32 {
     // Bracketed paste so a prompt pasted into the send line arrives as one
     // event: unbracketed, its first newline would be an Enter and submit the
     // first line alone.
-    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste);
+    let _ = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = match Terminal::new(backend) {
         Ok(t) => t,
@@ -130,7 +135,11 @@ fn label_of(s: &Session, labels: Label) -> String {
 /// land in whichever row slid under the cursor meanwhile.
 enum Input {
     /// Typing a prompt for `target` (`name` is how the footer shows it).
-    Prompt { target: String, name: String, text: String },
+    Prompt {
+        target: String,
+        name: String,
+        text: String,
+    },
     /// Asking before stopping `target`.
     ConfirmStop { target: String, name: String },
 }
@@ -384,7 +393,11 @@ fn input_key(app: &mut App, k: KeyEvent) {
         return;
     };
     match input {
-        Input::Prompt { target, name, mut text } => match k.code {
+        Input::Prompt {
+            target,
+            name,
+            mut text,
+        } => match k.code {
             KeyCode::Enter if text.trim().is_empty() => app.message = "nothing to send".into(),
             KeyCode::Enter => {
                 app.message = format!("sending to {name} · waits until it is idle");
@@ -397,7 +410,11 @@ fn input_key(app: &mut App, k: KeyEvent) {
             }
             // Ctrl+U clears the line, as in a shell.
             KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.input = Some(Input::Prompt { target, name, text: String::new() });
+                app.input = Some(Input::Prompt {
+                    target,
+                    name,
+                    text: String::new(),
+                });
             }
             KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 text.push(c);
@@ -671,14 +688,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         // Width a row actually gets: the block's borders take two columns, and
         // `highlight_symbol` reserves its own width on *every* row, not just
         // the selected one.
-        let row_width = body
-            .width
-            .saturating_sub(2)
-            .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16)
-            as usize;
+        let row_width =
+            body.width
+                .saturating_sub(2)
+                .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16) as usize;
         let cols = Cols::measure(&app.rows);
-        let items: Vec<ListItem> =
-            app.rows.iter().map(|s| ListItem::new(session_line(s, row_width, &cols, app.labels))).collect();
+        let items: Vec<ListItem> = app
+            .rows
+            .iter()
+            .map(|s| ListItem::new(session_line(s, row_width, &cols, app.labels)))
+            .collect();
         let list = List::new(items)
             .block(agent_block(app.sort, app.labels, above, below))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -717,7 +736,10 @@ fn input_line(input: &Input, width: usize) -> (Line<'static>, Option<usize>) {
     match input {
         Input::Prompt { name, text, .. } => {
             let head = format!("send {name} › ");
-            let shown: String = text.chars().map(|c| if c == '\n' { '↵' } else { c }).collect();
+            let shown: String = text
+                .chars()
+                .map(|c| if c == '\n' { '↵' } else { c })
+                .collect();
             // One column is kept for the cursor after the last character.
             let room = width.saturating_sub(head.chars().count() + 1);
             let n = shown.chars().count();
@@ -739,19 +761,16 @@ fn input_line(input: &Input, width: usize) -> (Line<'static>, Option<usize>) {
         Input::ConfirmStop { name, .. } => (
             Line::from(Span::styled(
                 format!("stop {name}? y/n"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )),
             None,
         ),
     }
 }
 
-fn agent_block(
-    sort: status::Sort,
-    labels: Label,
-    above: usize,
-    below: usize,
-) -> Block<'static> {
+fn agent_block(sort: status::Sort, labels: Label, above: usize, below: usize) -> Block<'static> {
     use ratatui::widgets::block::{Position, Title};
     let dim = |text: String| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let mut block = Block::default()
@@ -807,8 +826,17 @@ impl Cols {
 
     fn measure(rows: &[Session]) -> Cols {
         Cols {
-            time_w: rows.iter().map(|s| crate::status::humanize_secs(s.state_secs).chars().count()).max().unwrap_or(3),
-            dir_w: rows.iter().map(|s| name_of(s).chars().count()).max().unwrap_or(4).min(Cols::DIR_CAP),
+            time_w: rows
+                .iter()
+                .map(|s| crate::status::humanize_secs(s.state_secs).chars().count())
+                .max()
+                .unwrap_or(3),
+            dir_w: rows
+                .iter()
+                .map(|s| name_of(s).chars().count())
+                .max()
+                .unwrap_or(4)
+                .min(Cols::DIR_CAP),
             any_title: rows.iter().any(|s| !s.title.is_empty()),
         }
     }
@@ -883,7 +911,11 @@ fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'
     // column flexes.
     let need = |state: bool, cmd: bool, title: bool| {
         DOT + if state { state_w + GAP } else { 0 }
-            + if title { dir_w + GAP + TITLE_MIN } else { solo_min }
+            + if title {
+                dir_w + GAP + TITLE_MIN
+            } else {
+                solo_min
+            }
             + if cmd { 1 + CMD } else { 0 }
             + GAP
             + time_w
@@ -891,9 +923,17 @@ fn session_line(s: &Session, width: usize, cols: &Cols, labels: Label) -> Line<'
 
     let mut ladder: Vec<(bool, bool, bool)> = Vec::new();
     if labels == Label::Both && cols.any_title {
-        ladder.extend([(true, true, true), (true, false, true), (false, false, true)]);
+        ladder.extend([
+            (true, true, true),
+            (true, false, true),
+            (false, false, true),
+        ]);
     }
-    ladder.extend([(true, true, false), (true, false, false), (false, false, false)]);
+    ladder.extend([
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+    ]);
     let (show_state, show_cmd, show_title) = ladder
         .into_iter()
         .find(|&(state, cmd, title)| width >= need(state, cmd, title))

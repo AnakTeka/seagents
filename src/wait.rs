@@ -140,7 +140,12 @@ fn decide(what: For, after: Option<u64>, seen: &Seen) -> Option<Reason> {
 /// ledger decides working-or-not (as `status` fuses it): a dialog still shows
 /// as `blocked`, a turn as `working`, and a stale `working` outside a turn as
 /// `idle`, which the screen will say too within a tick.
-fn state_word(hooks: bool, state: Option<&StateRecord>, blocked: bool, in_turn: bool) -> Option<&str> {
+fn state_word(
+    hooks: bool,
+    state: Option<&StateRecord>,
+    blocked: bool,
+    in_turn: bool,
+) -> Option<&str> {
     if blocked {
         return Some("blocked");
     }
@@ -202,7 +207,8 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
     let mut herdr_gate = |s: &registry::Session| -> (bool, Option<String>) {
         if gate.0.is_none_or(|t| t.elapsed() >= HERDR_POLL) {
             let agent = crate::herdr::agent_on(&s.meta.key).ok().flatten();
-            let (blocked, rule) = match crate::status::agent_status(agent.as_ref(), s.meta.agent()) {
+            let (blocked, rule) = match crate::status::agent_status(agent.as_ref(), s.meta.agent())
+            {
                 Some((crate::herdr::Status::Blocked, rule)) => (true, rule),
                 _ => (false, None),
             };
@@ -220,9 +226,18 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
             // Read again: `run` and `send` record when the agent was first
             // prompted.
             let meta = registry::read_meta(&s.files).unwrap_or_else(|| s.meta.clone());
-            let hooks_ok = crate::hook::health(&meta, &agent, crate::clock::unix_now()) != Some(false);
+            let hooks_ok =
+                crate::hook::health(&meta, &agent, crate::clock::unix_now()) != Some(false);
             let (blocked, rule) = herdr_gate(s);
-            Look { agent, state, blocked, rule, alive: true, in_turn, hooks_ok }
+            Look {
+                agent,
+                state,
+                blocked,
+                rule,
+                alive: true,
+                in_turn,
+                hooks_ok,
+            }
         }
         Found::Session(s) => Look::gone(registry::final_agent(s)),
         Found::Exited(t) => Look::gone(t.ledger()),
@@ -252,7 +267,8 @@ pub(crate) fn run(target: &str, after: Option<u64>, what: For, timeout: Duration
             in_turn: seen.in_turn,
             hooks_ok: seen.hooks_ok,
         };
-        let reason = decide(what, after, &now).or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
+        let reason = decide(what, after, &now)
+            .or_else(|| (Instant::now() >= deadline).then_some(Reason::Timeout));
         if let Some(reason) = reason {
             let message = match (&found, reason) {
                 (Found::Session(s), Reason::NoHooks) => Some(crate::hook::silence(&s.meta)),
@@ -279,7 +295,15 @@ struct Look {
 impl Look {
     /// An agent that is gone: only its ledger is left.
     fn gone(agent: AgentRecord) -> Look {
-        Look { agent, state: None, blocked: false, rule: None, alive: false, in_turn: false, hooks_ok: true }
+        Look {
+            agent,
+            state: None,
+            blocked: false,
+            rule: None,
+            alive: false,
+            in_turn: false,
+            hooks_ok: true,
+        }
     }
 }
 

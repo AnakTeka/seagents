@@ -83,7 +83,10 @@ impl Ledger {
         let path = Path::new(path);
         // What the transcript says since the prompt — nothing, when this
         // adapter names no format to parse it with.
-        let ask = |f: fn(Format, &Path, u64) -> bool| self.transcript.is_some_and(|format| f(format, path, prompted));
+        let ask = |f: fn(Format, &Path, u64) -> bool| {
+            self.transcript
+                .is_some_and(|format| f(format, path, prompted))
+        };
         if ask(crate::transcript::interrupted_since) {
             return false;
         }

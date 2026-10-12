@@ -74,7 +74,9 @@ impl<'a> Tree<'a> {
             }
         }
         let tips: Vec<usize> = (0..n)
-            .filter(|&i| self.nodes[i].kind.conversation() && self.canonical(i) && !above_conversation[i])
+            .filter(|&i| {
+                self.nodes[i].kind.conversation() && self.canonical(i) && !above_conversation[i]
+            })
             .collect();
         let newest = |bound: u64, visited: &[bool]| {
             tips.iter()
@@ -114,7 +116,11 @@ impl<'a> Tree<'a> {
     /// Where to continue after a read whose tip was `leaf`, over the current
     /// main line `main`.
     pub(crate) fn resume(&self, main: &[usize], leaf: u128) -> Resume {
-        let pos: HashMap<u128, usize> = main.iter().enumerate().map(|(p, &i)| (self.nodes[i].uuid, p)).collect();
+        let pos: HashMap<u128, usize> = main
+            .iter()
+            .enumerate()
+            .map(|(p, &i)| (self.nodes[i].uuid, p))
+            .collect();
         if let Some(p) = pos.get(&leaf) {
             return Resume::After(p + 1);
         }
@@ -123,10 +129,16 @@ impl<'a> Tree<'a> {
         while let Some(i) = at.filter(|&i| !seen[i]) {
             seen[i] = true;
             if let Some(p) = pos.get(&self.nodes[i].uuid) {
-                return Resume::Rewound { fork: Some(self.nodes[i].uuid), from: p + 1 };
+                return Resume::Rewound {
+                    fork: Some(self.nodes[i].uuid),
+                    from: p + 1,
+                };
             }
             at = self.parent(i);
         }
-        Resume::Rewound { fork: None, from: 0 }
+        Resume::Rewound {
+            fork: None,
+            from: 0,
+        }
     }
 }

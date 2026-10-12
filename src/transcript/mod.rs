@@ -54,7 +54,9 @@ impl Format {
     pub(crate) fn detect(path: &Path) -> std::io::Result<Format> {
         let mut head = Vec::new();
         File::open(path)?.take(64 * 1024).read_to_end(&mut head)?;
-        let lines = head.split(|b| *b == b'\n').filter(|l| l.first() == Some(&b'{'));
+        let lines = head
+            .split(|b| *b == b'\n')
+            .filter(|l| l.first() == Some(&b'{'));
         for line in lines {
             if codex::sniff(line) {
                 return Ok(Format::Codex);
@@ -125,7 +127,11 @@ impl Transcript {
     }
 
     /// Open `path` with its index cached at `cache` (None: in memory only).
-    pub(crate) fn open_cached(path: &Path, format: Format, cache: Option<&Path>) -> std::io::Result<Transcript> {
+    pub(crate) fn open_cached(
+        path: &Path,
+        format: Format,
+        cache: Option<&Path>,
+    ) -> std::io::Result<Transcript> {
         let head = match format {
             Format::Claude => claude::head,
             Format::Codex => codex::head,
@@ -153,7 +159,12 @@ impl Transcript {
             Format::Codex => codex::records(&buf, node),
         };
         for r in &mut records {
-            if let Kind::ToolUse { id, subagent: Some(sub), .. } = &mut r.kind {
+            if let Kind::ToolUse {
+                id,
+                subagent: Some(sub),
+                ..
+            } = &mut r.kind
+            {
                 let known = self.subagents.get_or_init(|| match self.format {
                     Format::Claude => claude::subagents(&self.path),
                     // Codex's subagents are threads of their own, not

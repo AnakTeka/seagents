@@ -65,14 +65,22 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     let _ = fs::DirBuilder::new().mode(0o700).create(dir);
     let meta = fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if !meta.file_type().is_dir() {
-        return Err(format!("{} is not a directory (a symlink?); refusing it", dir.display()));
+        return Err(format!(
+            "{} is not a directory (a symlink?); refusing it",
+            dir.display()
+        ));
     }
     let uid = unsafe { libc::getuid() };
     if meta.uid() != uid {
-        return Err(format!("{} belongs to uid {}, not us; refusing it", dir.display(), meta.uid()));
+        return Err(format!(
+            "{} belongs to uid {}, not us; refusing it",
+            dir.display(),
+            meta.uid()
+        ));
     }
     if meta.mode() & 0o077 != 0 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{}: {e}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     Ok(())
 }

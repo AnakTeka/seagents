@@ -35,13 +35,25 @@ pub(crate) fn render(records: &[Record], raw: bool) -> Vec<String> {
         }
         after_user = is_user;
         match &r.kind {
-            Kind::User { text } => {
-                out.extend(text.lines().map(|l| if l.is_empty() { "│".to_string() } else { format!("│ {l}") }))
-            }
+            Kind::User { text } => out.extend(text.lines().map(|l| {
+                if l.is_empty() {
+                    "│".to_string()
+                } else {
+                    format!("│ {l}")
+                }
+            })),
             Kind::Assistant { text } => out.extend(text.lines().map(str::to_string)),
             Kind::Thinking { text } if raw => out.extend(text.lines().map(|l| format!("⋯ {l}"))),
-            Kind::Thinking { text } => out.push(format!("⋯ thinking ({} words)", text.split_whitespace().count())),
-            Kind::ToolUse { name, input, subagent, .. } => {
+            Kind::Thinking { text } => out.push(format!(
+                "⋯ thinking ({} words)",
+                text.split_whitespace().count()
+            )),
+            Kind::ToolUse {
+                name,
+                input,
+                subagent,
+                ..
+            } => {
                 out.push(match subagent {
                     Some(s) => format!("▸ subagent: {} — {}", s.agent_type, s.description),
                     None => format!("● {name}({})", short_arg(input)),
@@ -51,7 +63,12 @@ pub(crate) fn render(records: &[Record], raw: bool) -> Vec<String> {
                     out.extend(pretty.lines().map(|l| format!("    {l}")));
                 }
             }
-            Kind::ToolResult { text, bytes, is_error, .. } => {
+            Kind::ToolResult {
+                text,
+                bytes,
+                is_error,
+                ..
+            } => {
                 let mark = if *is_error { "✗ " } else { "" };
                 if raw {
                     let mut lines = text.lines();
@@ -59,7 +76,11 @@ pub(crate) fn render(records: &[Record], raw: bool) -> Vec<String> {
                     out.extend(lines.map(|l| format!("    {l}")));
                 } else {
                     let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                    let first = if first.is_empty() { "(no output)".to_string() } else { truncate(first.trim(), SHORT) };
+                    let first = if first.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        truncate(first.trim(), SHORT)
+                    };
                     out.push(format!("  ⎿ {mark}{first} ({bytes} bytes)"));
                 }
             }
@@ -75,12 +96,26 @@ pub(crate) fn render(records: &[Record], raw: bool) -> Vec<String> {
 /// The field names are the common vocabulary of coding agents' tools, not
 /// one agent's.
 fn short_arg(input: &Value) -> String {
-    const TELLING: &[&str] = &["command", "cmd", "file_path", "path", "notebook_path", "pattern", "url", "query", "description", "skill"];
+    const TELLING: &[&str] = &[
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "notebook_path",
+        "pattern",
+        "url",
+        "query",
+        "description",
+        "skill",
+    ];
     let text = |v: &Value| match v {
         Value::String(s) => Some(s.clone()),
-        Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_string) => {
-            Some(a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-        }
+        Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_string) => Some(
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
         _ => None,
     };
     let value = match input {

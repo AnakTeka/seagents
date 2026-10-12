@@ -30,9 +30,15 @@ pub(crate) enum Kind {
     /// The user's words (or what stands in for them: a slash command, the
     /// summary a compaction continues from). Attachments inline as
     /// `[image]`, `[document]`.
-    User { text: String },
-    Assistant { text: String },
-    Thinking { text: String },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
     ToolUse {
         /// The call's id, which its result names.
         id: String,

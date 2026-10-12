@@ -121,7 +121,12 @@ impl Refusal {
 
 impl Reply {
     pub(crate) fn refused(reason: Refusal, error: impl Into<String>) -> Reply {
-        Reply { ok: false, reason: Some(reason), error: Some(error.into()), ..Reply::default() }
+        Reply {
+            ok: false,
+            reason: Some(reason),
+            error: Some(error.into()),
+            ..Reply::default()
+        }
     }
 
     /// The exit code the reply stands for.
@@ -193,13 +198,23 @@ pub(crate) fn send(args: SendArgs) -> i32 {
     } else {
         Body::Prompt(text)
     };
-    let opts = Opts { now: args.now, answer: args.answer_permission, timeout: args.timeout };
-    print_reply("send", registry::resolve_target(&args.target).map(|s| submit(&s, body, &opts)))
+    let opts = Opts {
+        now: args.now,
+        answer: args.answer_permission,
+        timeout: args.timeout,
+    };
+    print_reply(
+        "send",
+        registry::resolve_target(&args.target).map(|s| submit(&s, body, &opts)),
+    )
 }
 
 /// `seagents stop <target> [--force]`: 0 once the agent is gone, 1 otherwise.
 pub(crate) fn stop(target: &str, force: bool) -> i32 {
-    print_reply("stop", registry::resolve_target(target).map(|s| stop_session(&s, force)))
+    print_reply(
+        "stop",
+        registry::resolve_target(target).map(|s| stop_session(&s, force)),
+    )
 }
 
 /// Print a reply (or why there is none), return its exit code.
@@ -223,7 +238,11 @@ fn print_reply(cmd: &str, outcome: Result<Result<Reply, Reply>, String>) -> i32 
 /// idle.
 pub(crate) fn prompt_target(target: &str, text: String) -> Result<Reply, String> {
     let session = registry::resolve_target(target)?;
-    let opts = Opts { now: false, answer: false, timeout: DEFAULT_TIMEOUT };
+    let opts = Opts {
+        now: false,
+        answer: false,
+        timeout: DEFAULT_TIMEOUT,
+    };
     Ok(submit(&session, Body::Prompt(text), &opts).unwrap_or_else(|r| r))
 }
 
@@ -237,7 +256,10 @@ pub(crate) fn stop_target(target: &str) -> Result<Reply, String> {
 fn pane(session: &Session) -> Result<String, Reply> {
     match herdr::pane_of(&session.meta.key) {
         Ok(Some(p)) => Ok(p.pane_id),
-        Ok(None) => Err(Reply::refused(Refusal::Exit, format!("{}'s herdr pane is gone", session.meta.tag))),
+        Ok(None) => Err(Reply::refused(
+            Refusal::Exit,
+            format!("{}'s herdr pane is gone", session.meta.tag),
+        )),
         Err(e) => Err(Reply::refused(Refusal::Failed, e.to_string())),
     }
 }
@@ -255,9 +277,19 @@ enum Gate {
 /// Otherwise `--now` goes at once. The default waits for the agent to be out
 /// of a turn, with no submission of ours still landing, and herdr reading it
 /// idle.
-fn gate(status: Option<herdr::Status>, in_turn: bool, landing: bool, now: bool, answer: bool) -> Gate {
+fn gate(
+    status: Option<herdr::Status>,
+    in_turn: bool,
+    landing: bool,
+    now: bool,
+    answer: bool,
+) -> Gate {
     if status == Some(herdr::Status::Blocked) {
-        return if answer { Gate::Go { paired: false } } else { Gate::Blocked };
+        return if answer {
+            Gate::Go { paired: false }
+        } else {
+            Gate::Blocked
+        };
     }
     if now {
         return Gate::Go { paired: false };
@@ -274,7 +306,12 @@ fn gate(status: Option<herdr::Status>, in_turn: bool, landing: bool, now: bool, 
 pub(crate) fn submit(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Reply> {
     let reply = submit_locked(session, body, opts);
     let tag = Some(session.meta.tag.clone());
-    reply.map(|r| Reply { tag: tag.clone(), ..r }).map_err(|r| Reply { tag, ..r })
+    reply
+        .map(|r| Reply {
+            tag: tag.clone(),
+            ..r
+        })
+        .map_err(|r| Reply { tag, ..r })
 }
 
 fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Reply> {
@@ -283,12 +320,16 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
     let adapter = adapter::for_command(session.meta.agent())
         .map_err(|e| Reply::refused(Refusal::Failed, format!("agent adapter: {e}")))?;
     if let Body::Prompt(t) | Body::Text(t) = &body {
-        if t.len() > MAX_TEXT && !(matches!(body, Body::Prompt(_)) && adapter.send.by_reference(t)) {
-            return Err(Reply::refused(Refusal::BadRequest, format!("the text is over {MAX_TEXT} bytes")));
+        if t.len() > MAX_TEXT && !(matches!(body, Body::Prompt(_)) && adapter.send.by_reference(t))
+        {
+            return Err(Reply::refused(
+                Refusal::BadRequest,
+                format!("the text is over {MAX_TEXT} bytes"),
+            ));
         }
     }
-    let _serial =
-        registry::send_lock(files, None).ok_or_else(|| Reply::refused(Refusal::Exit, format!("{me} exited")))?;
+    let _serial = registry::send_lock(files, None)
+        .ok_or_else(|| Reply::refused(Refusal::Exit, format!("{me} exited")))?;
     let ledger = Ledger::for_command(session.meta.agent());
     let deadline = Instant::now() + opts.timeout;
     let answer = opts.answer && matches!(body, Body::Keys(_));
@@ -300,8 +341,10 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
             return Err(Reply::refused(Refusal::Exit, format!("{me} exited")));
         }
         let pane = pane(session)?;
-        let agent = herdr::agent_on(&session.meta.key).map_err(|e| Reply::refused(Refusal::Failed, e.to_string()))?;
-        let (status, rule) = match crate::status::agent_status(agent.as_ref(), session.meta.agent()) {
+        let agent = herdr::agent_on(&session.meta.key)
+            .map_err(|e| Reply::refused(Refusal::Failed, e.to_string()))?;
+        let (status, rule) = match crate::status::agent_status(agent.as_ref(), session.meta.agent())
+        {
             Some((s, rule)) => (Some(s), rule),
             None => (None, None),
         };
@@ -310,11 +353,16 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
         let meta = registry::read_meta(files).unwrap_or_else(|| session.meta.clone());
         let landing = landing(&meta, ledger.hooks, agent.prompted_at);
         match gate(status, in_turn, landing, opts.now, answer) {
-            Gate::Go { paired } => return deliver(session, &adapter, &pane, body, paired, status, agent.stops),
+            Gate::Go { paired } => {
+                return deliver(session, &adapter, &pane, body, paired, status, agent.stops)
+            }
             Gate::Blocked => {
                 let mut r = Reply::refused(
                     Refusal::Blocked,
-                    format!("{me} is blocked at a dialog ({}); a human answers this", rule.as_deref().unwrap_or("unknown rule")),
+                    format!(
+                        "{me} is blocked at a dialog ({}); a human answers this",
+                        rule.as_deref().unwrap_or("unknown rule")
+                    ),
                 );
                 r.rule = rule;
                 return Err(r);
@@ -322,7 +370,10 @@ fn submit_locked(session: &Session, body: Body, opts: &Opts) -> Result<Reply, Re
             Gate::Wait if Instant::now() >= deadline => {
                 return Err(Reply::refused(
                     Refusal::BusyTimeout,
-                    format!("{me} was still busy after {} s; nothing was sent", opts.timeout.as_secs()),
+                    format!(
+                        "{me} was still busy after {} s; nothing was sent",
+                        opts.timeout.as_secs()
+                    ),
                 ))
             }
             Gate::Wait => std::thread::sleep(POLL),
@@ -352,10 +403,18 @@ fn deliver(
 ) -> Result<Reply, Reply> {
     let files = &session.files;
     let failed = |e: herdr::Error| match e.code.as_str() {
-        "agent_blocked" => Reply::refused(Refusal::Blocked, format!("{} is blocked at a dialog", session.meta.tag)),
+        "agent_blocked" => Reply::refused(
+            Refusal::Blocked,
+            format!("{} is blocked at a dialog", session.meta.tag),
+        ),
         _ => Reply::refused(Refusal::Failed, e.to_string()),
     };
-    let ok = Reply { ok: true, stops: Some(stops), paired: Some(paired), ..Reply::default() };
+    let ok = Reply {
+        ok: true,
+        stops: Some(stops),
+        paired: Some(paired),
+        ..Reply::default()
+    };
     match body {
         Body::Keys(keys) => {
             herdr::send_keys(pane, &keys).map_err(failed)?;
@@ -366,18 +425,25 @@ fn deliver(
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
-            Ok(Reply { paired: Some(false), ..ok })
+            Ok(Reply {
+                paired: Some(false),
+                ..ok
+            })
         }
         Body::Text(text) => {
             make_room(session, adapter, pane)?;
             herdr::send_text(pane, &text).map_err(failed)?;
-            Ok(Reply { paired: Some(false), ..ok })
+            Ok(Reply {
+                paired: Some(false),
+                ..ok
+            })
         }
         Body::Prompt(text) => {
             make_room(session, adapter, pane)?;
             let text = if adapter.send.by_reference(&text) {
-                registry::by_reference(&session.meta.key, &session.meta.cwd, stops, &text)
-                    .map_err(|e| Reply::refused(Refusal::Failed, format!("writing the prompt file: {e}")))?
+                registry::by_reference(&session.meta.key, &session.meta.cwd, stops, &text).map_err(
+                    |e| Reply::refused(Refusal::Failed, format!("writing the prompt file: {e}")),
+                )?
             } else {
                 text
             };
@@ -401,7 +467,8 @@ fn deliver(
                     // folder-trust dialog closed reads idle yet drops it
                     // (seen live, Claude 2.1.28x). Pressed once more.
                     let glyph = &adapter.send.input_glyph;
-                    let unsent = !glyph.is_empty() && input_box(pane, glyph).is_some_and(|t| same_text(&t, &text));
+                    let unsent = !glyph.is_empty()
+                        && input_box(pane, glyph).is_some_and(|t| same_text(&t, &text));
                     if unsent && herdr::send_keys(pane, &["enter".to_string()]).is_ok() {
                         announced(session, ms);
                     }
@@ -417,7 +484,10 @@ fn deliver(
 fn announced(session: &Session, ms: u64) -> bool {
     let landed = Instant::now() + LANDING_GRACE;
     loop {
-        if registry::read_agent(&session.files).prompted_at.is_some_and(|p| p >= ms) {
+        if registry::read_agent(&session.files)
+            .prompted_at
+            .is_some_and(|p| p >= ms)
+        {
             return true;
         }
         if Instant::now() >= landed || !session.alive_now() {
@@ -432,7 +502,9 @@ const REPAINT: Duration = Duration::from_millis(150);
 
 /// The same words, however the box wrapped and indented them.
 fn same_text(a: &str, b: &str) -> bool {
-    a.chars().filter(|c| !c.is_whitespace()).eq(b.chars().filter(|c| !c.is_whitespace()))
+    a.chars()
+        .filter(|c| !c.is_whitespace())
+        .eq(b.chars().filter(|c| !c.is_whitespace()))
 }
 
 /// What the agent's input box holds now (`screen::input_box`); None: nothing
@@ -475,7 +547,8 @@ fn make_room(session: &Session, adapter: &adapter::Adapter, pane: &str) -> Resul
     let mut left = text;
     let mut stalled = 0;
     for _ in 0..2 * left.lines().count() + 4 {
-        herdr::send_keys(pane, &send.input_clear).map_err(|e| Reply::refused(Refusal::Failed, e.to_string()))?;
+        herdr::send_keys(pane, &send.input_clear)
+            .map_err(|e| Reply::refused(Refusal::Failed, e.to_string()))?;
         std::thread::sleep(REPAINT);
         match input_box(pane, &send.input_glyph) {
             Some(t) if t.is_empty() => return Ok(()),
@@ -498,7 +571,8 @@ fn make_room(session: &Session, adapter: &adapter::Adapter, pane: &str) -> Resul
 /// not read as one).
 fn blocked(session: &Session) -> bool {
     let agent = herdr::agent_on(&session.meta.key).ok().flatten();
-    crate::status::agent_status(agent.as_ref(), session.meta.agent()).is_some_and(|(s, _)| s == herdr::Status::Blocked)
+    crate::status::agent_status(agent.as_ref(), session.meta.agent())
+        .is_some_and(|(s, _)| s == herdr::Status::Blocked)
 }
 
 /// Make the agent exit: its adapter's exit sequence as a prompt, given
@@ -514,14 +588,27 @@ fn blocked(session: &Session) -> bool {
 /// closes the window too.
 pub(crate) fn stop_session(session: &Session, force: bool) -> Result<Reply, Reply> {
     let tag = Some(session.meta.tag.clone());
-    let gone = Ok(Reply { ok: true, tag: tag.clone(), ..Reply::default() });
-    let Some(pid) = session.meta.pid.or_else(|| registry::read_meta(&session.files).and_then(|m| m.pid)) else {
-        return Err(Reply { tag, ..Reply::refused(Refusal::Failed, "the agent has not started yet") });
+    let gone = Ok(Reply {
+        ok: true,
+        tag: tag.clone(),
+        ..Reply::default()
+    });
+    let Some(pid) = session
+        .meta
+        .pid
+        .or_else(|| registry::read_meta(&session.files).and_then(|m| m.pid))
+    else {
+        return Err(Reply {
+            tag,
+            ..Reply::refused(Refusal::Failed, "the agent has not started yet")
+        });
     };
     if !crate::procfs::alive(pid) {
         return gone;
     }
-    let serial = (!force).then(|| registry::send_lock(&session.files, Some(STOP_LOCK_WAIT))).flatten();
+    let serial = (!force)
+        .then(|| registry::send_lock(&session.files, Some(STOP_LOCK_WAIT)))
+        .flatten();
     let adapter = adapter::for_command(session.meta.agent()).unwrap_or_default();
     let pane = pane(session).ok();
     if let (Some(_), Some(pane)) = (&serial, pane.as_deref()) {
@@ -547,7 +634,10 @@ pub(crate) fn stop_session(session: &Session, force: bool) -> Result<Reply, Repl
     if exited(pid, STOP_GRACE) {
         return gone;
     }
-    Err(Reply { tag, ..Reply::refused(Refusal::Failed, "the agent is still running after SIGKILL") })
+    Err(Reply {
+        tag,
+        ..Reply::refused(Refusal::Failed, "the agent is still running after SIGKILL")
+    })
 }
 
 /// Wait up to `within` for `pid` to be gone; whether it is.

@@ -141,7 +141,8 @@ fn write_layout(dir: &Path, snapshot: &Value, boot: u64) -> Result<(), String> {
         }
     }
     let text = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
-    crate::fsutil::write_atomic(&path, text.as_bytes()).map_err(|e| format!("writing {}: {e}", path.display()))
+    crate::fsutil::write_atomic(&path, text.as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// The layout `restore` works from: a previous boot's that no restore has used
@@ -378,7 +379,10 @@ fn prune_layout(nodes: &[Value], keep: &HashSet<String>) -> Vec<Value> {
             }
             continue;
         }
-        let children = node["nodes"].as_array().map(|v| v.as_slice()).unwrap_or(&[]);
+        let children = node["nodes"]
+            .as_array()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mut kids = prune_layout(children, keep);
         if kids.is_empty() {
             continue;
@@ -412,10 +416,7 @@ fn to_i3_nodes(nodes: &[Value], matchers: &HashMap<String, WindowMatch>) -> Vec<
         .map(|node| {
             let mut out = node.clone();
             if let Some(tag) = leaf_tag(node) {
-                let matcher = matchers
-                    .get(&tag)
-                    .copied()
-                    .unwrap_or(WindowMatch::Instance);
+                let matcher = matchers.get(&tag).copied().unwrap_or(WindowMatch::Instance);
                 out.as_object_mut().map(|o| o.remove("tag"));
                 out["swallows"] = json!([{
                     matcher.key(): format!("^{}$", launch::handle_for(&tag))
@@ -527,7 +528,12 @@ fn capture() -> Result<Value, String> {
     // without `--resume`.
     let session_ids: HashMap<&str, Option<String>> = sessions
         .iter()
-        .map(|s| (s.meta.key.as_str(), crate::registry::read_agent(&s.files).session_id))
+        .map(|s| {
+            (
+                s.meta.key.as_str(),
+                crate::registry::read_agent(&s.files).session_id,
+            )
+        })
         .collect();
 
     // con_id → tag, for the agents we can actually locate on screen.
@@ -728,7 +734,11 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
     // Codex resume, or its Claude integration) — holds the name, and `run
     // --tag` would be refused after its window had opened. Left to herdr,
     // and said so.
-    let in_herdr: HashSet<String> = crate::herdr::agents().unwrap_or_default().into_iter().map(|a| a.name).collect();
+    let in_herdr: HashSet<String> = crate::herdr::agents()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
 
     let empty = Vec::new();
     let mut skipped = 0usize;
@@ -785,7 +795,11 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
         );
         for a in todo {
             let cmd = resume_argv(a);
-            println!("  {:<24}  {}", a["dir"].as_str().unwrap_or("?"), cmd.join(" "));
+            println!(
+                "  {:<24}  {}",
+                a["dir"].as_str().unwrap_or("?"),
+                cmd.join(" ")
+            );
         }
         if dry_run {
             launched += todo.len();
@@ -808,7 +822,12 @@ fn restore_in(dir: &Path, dry_run: bool, stagger: u64, only: Option<String>) -> 
             let tag = a["tag"].as_str().unwrap_or_default();
             let cwd = a["cwd"].as_str().unwrap_or_default();
             let argv = resume_argv(a);
-            let run = launch::Run { tag, seed_file: None, argv: &argv, keep_shell: true };
+            let run = launch::Run {
+                tag,
+                seed_file: None,
+                argv: &argv,
+                keep_shell: true,
+            };
             if let Err(e) =
                 launch::spawn_terminal(&run, cwd, a["terminal_class"].as_str().unwrap_or_default())
             {
@@ -888,7 +907,10 @@ fn resume_argv(agent: &Value) -> Vec<String> {
     };
     let restore = crate::adapter::for_command(cmd).unwrap_or_default().restore;
     let mut out = argv_without_resume(&argv, &restore.drop);
-    if let Some(id) = agent["session_id"].as_str().filter(|_| !restore.resume.is_empty()) {
+    if let Some(id) = agent["session_id"]
+        .as_str()
+        .filter(|_| !restore.resume.is_empty())
+    {
         let resume = restore.resume.iter().map(|a| a.replace("{session}", id));
         out.splice(1..1, resume);
     }

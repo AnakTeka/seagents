@@ -223,7 +223,12 @@ pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), St
     // PATH its rc files give it, and the one it finds need not be us.
     let exe = std::env::current_exe().map_err(|e| format!("locating seagents: {e}"))?;
     let mut strip = crate::adapter::own_session_env();
-    strip.extend(crate::herdr::PANE_ENV.iter().filter(|v| std::env::var_os(v).is_some()).map(|v| v.to_string()));
+    strip.extend(
+        crate::herdr::PANE_ENV
+            .iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .map(|v| v.to_string()),
+    );
     let inner = inner_command(&exe, run, &strip);
     let term = terminal(&handle, cwd, &inner, class)?;
     let Some((program, rest)) = term.argv.split_first() else {
@@ -231,7 +236,11 @@ pub(crate) fn spawn_terminal(run: &Run, cwd: &str, class: &str) -> Result<(), St
     };
 
     let mut cmd = Command::new(program);
-    for name in strip.iter().map(String::as_str).chain(crate::window::WINDOW_ENV) {
+    for name in strip
+        .iter()
+        .map(String::as_str)
+        .chain(crate::window::WINDOW_ENV)
+    {
         cmd.env_remove(name);
     }
     cmd.args(rest)
@@ -260,9 +269,17 @@ fn inner_command(exe: &Path, run: &Run, strip: &[String]) -> String {
         shell_quote(run.tag)
     );
     if let Some(seed) = run.seed_file {
-        inner.push_str(&format!(" --seed-file {}", shell_quote(&seed.to_string_lossy())));
+        inner.push_str(&format!(
+            " --seed-file {}",
+            shell_quote(&seed.to_string_lossy())
+        ));
     }
-    let argv = run.argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let argv = run
+        .argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     if run.keep_shell {
         format!("{unset}{inner} -- {argv}; exec \"$SHELL\"")
     } else {

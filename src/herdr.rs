@@ -24,7 +24,12 @@ use serde_json::Value;
 /// neither must a server seagents starts. `HERDR_SOCKET_PATH` and
 /// `HERDR_SESSION` are not among them: they name the server, which the new
 /// window should keep using.
-pub(crate) const PANE_ENV: [&str; 4] = ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"];
+pub(crate) const PANE_ENV: [&str; 4] = [
+    "HERDR_ENV",
+    "HERDR_PANE_ID",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+];
 
 /// Every agent kind herdr 0.9.0 can start (`agent start --kind`), as
 /// (label, executable): the label is the kind herdr reports and seagents keys
@@ -58,7 +63,10 @@ const KINDS: &[(&str, &str)] = &[
 /// The herdr kind of the command whose first word is `argv0` (a path or a
 /// bare name), by its executable or its label. None: herdr cannot start it.
 pub(crate) fn kind_for(argv0: &str) -> Option<&'static str> {
-    let name = Path::new(argv0).file_name().and_then(|n| n.to_str()).unwrap_or(argv0);
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(argv0);
     KINDS
         .iter()
         .find(|(label, exe)| name == *exe || name == *label)
@@ -67,7 +75,11 @@ pub(crate) fn kind_for(argv0: &str) -> Option<&'static str> {
 
 /// The executables `run` accepts, for its refusal message.
 pub(crate) fn executables() -> String {
-    KINDS.iter().map(|(_, exe)| *exe).collect::<Vec<_>>().join(", ")
+    KINDS
+        .iter()
+        .map(|(_, exe)| *exe)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Why a herdr call failed: herdr's own error code and message when it gave
@@ -80,7 +92,10 @@ pub(crate) struct Error {
 
 impl Error {
     fn new(code: &str, message: impl Into<String>) -> Error {
-        Error { code: code.to_string(), message: message.into() }
+        Error {
+            code: code.to_string(),
+            message: message.into(),
+        }
     }
 }
 
@@ -189,19 +204,26 @@ pub(crate) struct Procs {
 /// where herdr installs itself, and which a window i3 opens through `sh -c`
 /// may not have on its `PATH`.
 fn bin() -> PathBuf {
-    if let Some(p) = std::env::var_os("HERDR_BIN_PATH").filter(|p| !p.is_empty()).map(PathBuf::from) {
+    if let Some(p) = std::env::var_os("HERDR_BIN_PATH")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+    {
         if p.is_file() {
             return p;
         }
     }
     let on_path = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path).map(|d| d.join("herdr")).find(|p| p.is_file())
+        std::env::split_paths(&path)
+            .map(|d| d.join("herdr"))
+            .find(|p| p.is_file())
     });
     if let Some(p) = on_path {
         return p;
     }
     let local = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/herdr"));
-    local.filter(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("herdr"))
+    local
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("herdr"))
 }
 
 fn command(args: &[&str]) -> Command {
@@ -217,18 +239,38 @@ fn outcome(out: Output) -> Result<String, Error> {
         return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if let Some(e) = stderr.lines().find_map(|l| serde_json::from_str::<Value>(l).ok()) {
+    if let Some(e) = stderr
+        .lines()
+        .find_map(|l| serde_json::from_str::<Value>(l).ok())
+    {
         if let Some(code) = e["error"]["code"].as_str() {
-            return Err(Error::new(code, e["error"]["message"].as_str().unwrap_or(code)));
+            return Err(Error::new(
+                code,
+                e["error"]["message"].as_str().unwrap_or(code),
+            ));
         }
     }
-    let code = if out.status.code() == Some(2) { "usage" } else { "failed" };
+    let code = if out.status.code() == Some(2) {
+        "usage"
+    } else {
+        "failed"
+    };
     let message = stderr.trim();
-    Err(Error::new(code, if message.is_empty() { "the command failed" } else { message }))
+    Err(Error::new(
+        code,
+        if message.is_empty() {
+            "the command failed"
+        } else {
+            message
+        },
+    ))
 }
 
 fn spawn_error(e: std::io::Error) -> Error {
-    Error::new("no_herdr", format!("running {}: {e} (is herdr installed?)", bin().display()))
+    Error::new(
+        "no_herdr",
+        format!("running {}: {e} (is herdr installed?)", bin().display()),
+    )
 }
 
 /// Run `herdr <args>` and return its stdout.
@@ -244,8 +286,12 @@ fn call(args: &[&str]) -> Result<Value, Error> {
     if out.trim().is_empty() {
         return Ok(Value::Null);
     }
-    let v: Value = serde_json::from_str(out.trim())
-        .map_err(|e| Error::new("bad_reply", format!("herdr {}: unreadable reply: {e}", args.join(" "))))?;
+    let v: Value = serde_json::from_str(out.trim()).map_err(|e| {
+        Error::new(
+            "bad_reply",
+            format!("herdr {}: unreadable reply: {e}", args.join(" ")),
+        )
+    })?;
     Ok(v["result"].clone())
 }
 
@@ -253,7 +299,8 @@ fn call(args: &[&str]) -> Result<Value, Error> {
 /// hooks see as `HERDR_SOCKET_PATH`. None when no server is running.
 pub(crate) fn server_socket() -> Option<String> {
     let v: Value = serde_json::from_str(&text(&["status", "--json"]).ok()?).ok()?;
-    (v["server"]["running"].as_bool() == Some(true)).then(|| v["server"]["socket"].as_str().map(str::to_string))?
+    (v["server"]["running"].as_bool() == Some(true))
+        .then(|| v["server"]["socket"].as_str().map(str::to_string))?
 }
 
 /// Whether a herdr server is up for this environment.
@@ -273,8 +320,16 @@ pub(crate) fn ensure_server(strip: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let mut cmd = Command::new(bin());
-    cmd.arg("server").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    for name in strip.iter().map(String::as_str).chain(PANE_ENV).chain(crate::window::WINDOW_ENV) {
+    cmd.arg("server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for name in strip
+        .iter()
+        .map(String::as_str)
+        .chain(PANE_ENV)
+        .chain(crate::window::WINDOW_ENV)
+    {
         cmd.env_remove(name);
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -302,7 +357,10 @@ pub(crate) fn ensure_server(strip: &[String]) -> Result<(), String> {
 /// Every agent herdr knows.
 pub(crate) fn agents() -> Result<Vec<Agent>, Error> {
     let v = call(&["agent", "list"])?;
-    Ok(v["agents"].as_array().map(|a| a.iter().map(Agent::from).collect()).unwrap_or_default())
+    Ok(v["agents"]
+        .as_array()
+        .map(|a| a.iter().map(Agent::from).collect())
+        .unwrap_or_default())
 }
 
 /// The agent hosted by terminal `terminal_id`, if herdr sees one there now
@@ -316,7 +374,10 @@ pub(crate) fn agent_on(terminal_id: &str) -> Result<Option<Agent>, Error> {
 /// Every pane.
 pub(crate) fn panes() -> Result<Vec<Pane>, Error> {
     let v = call(&["pane", "list"])?;
-    Ok(v["panes"].as_array().map(|a| a.iter().map(Pane::from).collect()).unwrap_or_default())
+    Ok(v["panes"]
+        .as_array()
+        .map(|a| a.iter().map(Pane::from).collect())
+        .unwrap_or_default())
 }
 
 /// The pane terminal `terminal_id` is in now; None once it is closed.
@@ -343,10 +404,22 @@ pub(crate) fn tabs(workspace: &str) -> Result<Vec<Tab>, Error> {
 
 /// A new workspace at `cwd`, without moving anyone's focus, its shell given
 /// `env` besides the server's: its first tab's pane.
-pub(crate) fn create_workspace(cwd: &Path, label: &str, env: &[(String, String)]) -> Result<Pane, Error> {
+pub(crate) fn create_workspace(
+    cwd: &Path,
+    label: &str,
+    env: &[(String, String)],
+) -> Result<Pane, Error> {
     let cwd = cwd.to_string_lossy();
     let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args = vec!["workspace", "create", "--cwd", &cwd, "--label", label, "--no-focus"];
+    let mut args = vec![
+        "workspace",
+        "create",
+        "--cwd",
+        &cwd,
+        "--label",
+        label,
+        "--no-focus",
+    ];
     args.extend(env.iter().flat_map(|e| ["--env", e.as_str()]));
     let v = call(&args)?;
     Ok(Pane::from(&v["root_pane"]))
@@ -354,10 +427,25 @@ pub(crate) fn create_workspace(cwd: &Path, label: &str, env: &[(String, String)]
 
 /// A new tab in `workspace` at `cwd`, without moving anyone's focus, its
 /// shell given `env` besides the server's: its pane.
-pub(crate) fn create_tab(workspace: &str, cwd: &Path, label: &str, env: &[(String, String)]) -> Result<Pane, Error> {
+pub(crate) fn create_tab(
+    workspace: &str,
+    cwd: &Path,
+    label: &str,
+    env: &[(String, String)],
+) -> Result<Pane, Error> {
     let cwd = cwd.to_string_lossy();
     let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args = vec!["tab", "create", "--workspace", workspace, "--cwd", &cwd, "--label", label, "--no-focus"];
+    let mut args = vec![
+        "tab",
+        "create",
+        "--workspace",
+        workspace,
+        "--cwd",
+        &cwd,
+        "--label",
+        label,
+        "--no-focus",
+    ];
     args.extend(env.iter().flat_map(|e| ["--env", e.as_str()]));
     let v = call(&args)?;
     Ok(Pane::from(&v["root_pane"]))
@@ -381,7 +469,18 @@ pub(crate) fn start_agent(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), Error> {
     let timeout_ms = timeout.as_millis().to_string();
-    let mut argv = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms, "--"];
+    let mut argv = vec![
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane,
+        "--timeout",
+        &timeout_ms,
+        "--",
+    ];
     argv.extend(args.iter().map(String::as_str));
     let mut child = command(&argv)
         .stdout(Stdio::piped())
@@ -452,7 +551,9 @@ pub(crate) fn send_keys(pane: &str, keys: &[String]) -> Result<(), Error> {
 /// placeholder is told from typed text, `crate::screen`).
 pub(crate) fn read(pane: &str, ansi: bool) -> Result<String, Error> {
     let format = if ansi { "ansi" } else { "text" };
-    text(&["pane", "read", pane, "--source", "visible", "--format", format])
+    text(&[
+        "pane", "read", pane, "--source", "visible", "--format", format,
+    ])
 }
 
 /// For an agent herdr reads as blocked: the id of the detection rule that

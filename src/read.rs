@@ -57,20 +57,28 @@ impl Cursor {
     fn parse(s: &str) -> Result<Cursor, String> {
         let s = s.trim();
         let s = s.strip_prefix(TEXT_PREFIX).unwrap_or(s);
-        let bad = || format!("{s:?} is not a cursor (`<offset>:<leaf>:<path>`, or the JSON cursor record)");
+        let bad = || {
+            format!("{s:?} is not a cursor (`<offset>:<leaf>:<path>`, or the JSON cursor record)")
+        };
         if s.starts_with('{') {
             let v: serde_json::Value = serde_json::from_str(s).map_err(|_| bad())?;
-            return serde_json::from_value(v.get("cursor").unwrap_or(&v).clone()).map_err(|_| bad());
+            return serde_json::from_value(v.get("cursor").unwrap_or(&v).clone())
+                .map_err(|_| bad());
         }
         let mut parts = s.splitn(3, ':');
-        let (Some(offset), Some(leaf), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(offset), Some(leaf), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
             return Err(bad());
         };
         let offset = offset.parse().map_err(|_| bad())?;
         if path.is_empty() || !(leaf.is_empty() || parse_uuid(leaf).is_some()) {
             return Err(bad());
         }
-        Ok(Cursor { transcript_path: path.to_string(), offset, leaf: leaf.to_string() })
+        Ok(Cursor {
+            transcript_path: path.to_string(),
+            offset,
+            leaf: leaf.to_string(),
+        })
     }
 }
 
@@ -94,7 +102,12 @@ pub(crate) fn run(args: Args) -> i32 {
 
 fn read(args: &Args) -> Result<(), String> {
     let from = args.from.as_deref().map(Cursor::parse).transpose()?;
-    let Source { path, format, cwd, ended_at } = source(args)?;
+    let Source {
+        path,
+        format,
+        cwd,
+        ended_at,
+    } = source(args)?;
     let t = open_settled(&path, format, ended_at)?;
     let tree = Tree::new(&t.index.nodes);
     let main = tree.main_line();
@@ -102,13 +115,19 @@ fn read(args: &Args) -> Result<(), String> {
 
     let wanted = &main[start.min(main.len())..];
     let mut records = match args.tail {
-        None => wanted.iter().flat_map(|&i| t.records(&t.index.nodes[i])).collect(),
+        None => wanted
+            .iter()
+            .flat_map(|&i| t.records(&t.index.nodes[i]))
+            .collect(),
         Some(n) => tail(&t, wanted, n),
     };
     let cursor = Cursor {
         transcript_path: path.display().to_string(),
         offset: t.index.indexed_len,
-        leaf: main.last().map(|&i| format_uuid(t.index.nodes[i].uuid)).unwrap_or_default(),
+        leaf: main
+            .last()
+            .map(|&i| format_uuid(t.index.nodes[i].uuid))
+            .unwrap_or_default(),
     };
 
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -137,7 +156,12 @@ fn source(args: &Args) -> Result<Source, String> {
     if let Some(p) = &args.transcript {
         // No agent to ask which tool wrote it: the content says.
         let format = Format::detect(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        return Ok(Source { path: p.clone(), format, cwd: None, ended_at: None });
+        return Ok(Source {
+            path: p.clone(),
+            format,
+            cwd: None,
+            ended_at: None,
+        });
     }
     let target = args.target.as_deref().unwrap_or_default();
     // An exited agent's conversation is still on disk: its files say where
@@ -145,8 +169,18 @@ fn source(args: &Args) -> Result<Source, String> {
     let (tag, command, cwd, agent, ended) = match registry::resolve_exited(target)? {
         registry::Found::Session(s) => {
             let alive = s.alive();
-            let agent = if alive { registry::read_agent(&s.files) } else { registry::final_agent(&s) };
-            (s.meta.tag.clone(), s.meta.agent().to_string(), s.meta.cwd.clone(), agent, !alive)
+            let agent = if alive {
+                registry::read_agent(&s.files)
+            } else {
+                registry::final_agent(&s)
+            };
+            (
+                s.meta.tag.clone(),
+                s.meta.agent().to_string(),
+                s.meta.cwd.clone(),
+                agent,
+                !alive,
+            )
         }
         registry::Found::Exited(t) => {
             let agent = t.ledger();
@@ -158,12 +192,10 @@ fn source(args: &Args) -> Result<Source, String> {
         .read
         .transcript
         .ok_or_else(|| format!("{tag} runs {command:?}, whose transcript seagents cannot read"))?;
-    let path = agent
-        .transcript_path
-        .ok_or_else(|| match ended {
-            true => format!("{tag} exited without reporting a transcript (no hook fired)"),
-            false => format!("{tag} has not reported its transcript yet (no hook has fired)"),
-        })?;
+    let path = agent.transcript_path.ok_or_else(|| match ended {
+        true => format!("{tag} exited without reporting a transcript (no hook fired)"),
+        false => format!("{tag} has not reported its transcript yet (no hook has fired)"),
+    })?;
     // Nothing more will be written by an agent that has exited.
     let ended_at = agent
         .stopped_at
@@ -191,7 +223,10 @@ fn open_settled(path: &Path, format: Format, ended_at: Option<u64>) -> Result<Tr
     loop {
         let t = Transcript::open(path, format).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {
-                format!("{}: not written yet (the agent writes it at its first prompt)", path.display())
+                format!(
+                    "{}: not written yet (the agent writes it at its first prompt)",
+                    path.display()
+                )
             }
             _ => format!("{}: {e}", path.display()),
         })?;
@@ -204,7 +239,13 @@ fn open_settled(path: &Path, format: Format, ended_at: Option<u64>) -> Result<Tr
 }
 
 /// The main-line position to start at, and what to say first.
-fn start_at(tree: &Tree, main: &[usize], path: &Path, indexed: u64, from: Option<&Cursor>) -> (usize, Option<Notice>) {
+fn start_at(
+    tree: &Tree,
+    main: &[usize],
+    path: &Path,
+    indexed: u64,
+    from: Option<&Cursor>,
+) -> (usize, Option<Notice>) {
     let Some(c) = from else {
         return (0, None);
     };
@@ -264,10 +305,23 @@ fn inline_references(records: &mut [Record], cwd: Option<&Path>) {
     }
 }
 
-fn write_json(out: &mut impl Write, notice: Option<&Notice>, records: &[Record], c: &Cursor) -> std::io::Result<()> {
+fn write_json(
+    out: &mut impl Write,
+    notice: Option<&Notice>,
+    records: &[Record],
+    c: &Cursor,
+) -> std::io::Result<()> {
     match notice {
-        Some(Notice::Reset) => writeln!(out, "{}", json!({"reset": {"transcript_path": c.transcript_path}}))?,
-        Some(Notice::Rewound(fork)) => writeln!(out, "{}", json!({"rewound": {"fork": fork.map(format_uuid)}}))?,
+        Some(Notice::Reset) => writeln!(
+            out,
+            "{}",
+            json!({"reset": {"transcript_path": c.transcript_path}})
+        )?,
+        Some(Notice::Rewound(fork)) => writeln!(
+            out,
+            "{}",
+            json!({"rewound": {"fork": fork.map(format_uuid)}})
+        )?,
         None => {}
     }
     for r in records {
@@ -288,11 +342,20 @@ fn write_text(
     raw: bool,
 ) -> std::io::Result<()> {
     match notice {
-        Some(Notice::Reset) => writeln!(out, "-- reset: a new transcript, {}, read from its start", c.transcript_path)?,
-        Some(Notice::Rewound(Some(fork))) => {
-            writeln!(out, "-- rewound: the conversation went back to {}; continuing from there", format_uuid(*fork))?
-        }
-        Some(Notice::Rewound(None)) => writeln!(out, "-- rewound: the cursor's place is not in this transcript; from its start")?,
+        Some(Notice::Reset) => writeln!(
+            out,
+            "-- reset: a new transcript, {}, read from its start",
+            c.transcript_path
+        )?,
+        Some(Notice::Rewound(Some(fork))) => writeln!(
+            out,
+            "-- rewound: the conversation went back to {}; continuing from there",
+            format_uuid(*fork)
+        )?,
+        Some(Notice::Rewound(None)) => writeln!(
+            out,
+            "-- rewound: the cursor's place is not in this transcript; from its start"
+        )?,
         None => {}
     }
     for line in render::render(records, raw) {

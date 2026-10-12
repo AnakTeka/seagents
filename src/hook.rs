@@ -62,7 +62,8 @@ pub(crate) fn health(meta: &registry::Meta, agent: &AgentRecord, now: u64) -> Op
     if !meta.hooks {
         return None;
     }
-    let silent = agent.session_id.is_none() && meta.engaged_at.is_some_and(|t| now >= t + HOOK_GRACE);
+    let silent =
+        agent.session_id.is_none() && meta.engaged_at.is_some_and(|t| now >= t + HOOK_GRACE);
     Some(!silent)
 }
 
@@ -104,7 +105,9 @@ pub(crate) fn run() -> i32 {
 /// `run` writes the `.meta` before it starts the agent, so it is there by
 /// the first hook.
 fn find_session() -> Option<registry::Session> {
-    let pane = std::env::var("HERDR_PANE_ID").ok().filter(|p| !p.is_empty())?;
+    let pane = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty())?;
     let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
     registry::by_pane(&pane, &socket)
 }
@@ -145,7 +148,6 @@ fn record(files: &Files, payload: &Value, now: u64) -> Result<(), String> {
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // Injection
 // ---------------------------------------------------------------------------
@@ -183,23 +185,38 @@ pub(crate) fn inject(
 ) -> (Vec<String>, Option<String>) {
     let hooks = &adapter.hooks;
     let flags_end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    if !hooks.enabled() || argv.is_empty() || argv[1..flags_end].iter().any(|a| hooks.hookless_flags.contains(a)) {
+    if !hooks.enabled()
+        || argv.is_empty()
+        || argv[1..flags_end]
+            .iter()
+            .any(|a| hooks.hookless_flags.contains(a))
+    {
         return (argv.to_vec(), None);
     }
-    let command = format!("{} __hook", crate::launch::shell_quote(&exe.to_string_lossy()));
+    let command = format!(
+        "{} __hook",
+        crate::launch::shell_quote(&exe.to_string_lossy())
+    );
 
     let mine: Vec<Occurrence> = occurrences(&argv[..flags_end], &hooks.flags)
         .into_iter()
-        .filter(|o| hooks.inject != Inject::Config || o.value.as_deref().is_none_or(is_hooks_override))
+        .filter(|o| {
+            hooks.inject != Inject::Config || o.value.as_deref().is_none_or(is_hooks_override)
+        })
         .collect();
     let merged = match hooks.inject {
         // The last one wins in the agent too, so it is the one merged into.
-        Inject::Settings => settings_value(mine.last().map(|o| o.value.as_deref()), cwd, &hooks.events, &command)
-            .and_then(|json| {
-                crate::fsutil::write_atomic(settings_file, json.as_bytes())
-                    .map(|()| settings_file.to_string_lossy().into_owned())
-                    .map_err(|e| format!("writing {}: {e}", settings_file.display()))
-            }),
+        Inject::Settings => settings_value(
+            mine.last().map(|o| o.value.as_deref()),
+            cwd,
+            &hooks.events,
+            &command,
+        )
+        .and_then(|json| {
+            crate::fsutil::write_atomic(settings_file, json.as_bytes())
+                .map(|()| settings_file.to_string_lossy().into_owned())
+                .map_err(|e| format!("writing {}: {e}", settings_file.display()))
+        }),
         Inject::Config => config_value(&mine, &hooks.events, &command),
         Inject::None => unreachable!("not wanted"),
     };
@@ -252,10 +269,18 @@ fn occurrences(words: &[String], spellings: &[String]) -> Vec<Occurrence> {
             }
         });
         if spellings.contains(a) {
-            out.push(Occurrence { at: i, width: 2, value: words.get(i + 1).cloned() });
+            out.push(Occurrence {
+                at: i,
+                width: 2,
+                value: words.get(i + 1).cloned(),
+            });
             i += 2;
         } else if let Some(v) = joined {
-            out.push(Occurrence { at: i, width: 1, value: Some(v.to_string()) });
+            out.push(Occurrence {
+                at: i,
+                width: 1,
+                value: Some(v.to_string()),
+            });
             i += 1;
         } else {
             i += 1;
@@ -277,7 +302,12 @@ fn is_hooks_override(value: &str) -> bool {
 /// [`Inject::Settings`]: the user's settings (`user`: their last
 /// `--settings`, if any — Some(None) when it had no value) with our hooks
 /// added, as one JSON object.
-fn settings_value(user: Option<Option<&str>>, cwd: &Path, events: &[String], command: &str) -> Result<String, String> {
+fn settings_value(
+    user: Option<Option<&str>>,
+    cwd: &Path,
+    events: &[String],
+    command: &str,
+) -> Result<String, String> {
     let mut settings = match user {
         None => Map::new(),
         Some(None) => return Err("it has no value".to_string()),
@@ -318,7 +348,9 @@ fn config_value(user: &[Occurrence], events: &[String], command: &str) -> Result
     let mut root = toml::Table::new();
     for o in user {
         let v = o.value.as_deref().ok_or("it has no value")?;
-        let (key, raw) = v.split_once('=').ok_or_else(|| format!("{v:?} has no '='"))?;
+        let (key, raw) = v
+            .split_once('=')
+            .ok_or_else(|| format!("{v:?} has no '='"))?;
         let value = toml::from_str::<toml::Table>(&format!("v = {}", raw.trim()))
             .ok()
             .and_then(|mut t| t.remove("v"))
@@ -369,7 +401,11 @@ fn set_path(root: &mut toml::Table, key: &str, value: toml::Value) -> Result<(),
 /// escapes JSON and TOML share, plus DEL, which TOML wants escaped and JSON
 /// does not.
 fn toml_inline(v: &Value) -> Result<String, String> {
-    let string = |s: &str| serde_json::to_string(s).unwrap_or_default().replace('\u{7f}', "\\u007F");
+    let string = |s: &str| {
+        serde_json::to_string(s)
+            .unwrap_or_default()
+            .replace('\u{7f}', "\\u007F")
+    };
     Ok(match v {
         Value::Null => return Err("a null has no TOML form".to_string()),
         Value::Bool(b) => b.to_string(),
@@ -380,8 +416,10 @@ fn toml_inline(v: &Value) -> Result<String, String> {
             format!("[{}]", items?.join(","))
         }
         Value::Object(map) => {
-            let fields: Result<Vec<String>, String> =
-                map.iter().map(|(k, v)| Ok(format!("{}={}", string(k), toml_inline(v)?))).collect();
+            let fields: Result<Vec<String>, String> = map
+                .iter()
+                .map(|(k, v)| Ok(format!("{}={}", string(k), toml_inline(v)?)))
+                .collect();
             format!("{{{}}}", fields?.join(","))
         }
     })
@@ -410,15 +448,25 @@ fn codex_trust(event: &str, group: usize, command: &str) -> (String, String) {
         q(&snake),
         q(command)
     );
-    let hex: String = Sha256::digest(identity.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-    (format!("{CODEX_SESSION_FLAGS}:{snake}:{group}:0"), format!("sha256:{hex}"))
+    let hex: String = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    (
+        format!("{CODEX_SESSION_FLAGS}:{snake}:{group}:0"),
+        format!("sha256:{hex}"),
+    )
 }
 
 /// Append one matcher group running `command` to each event's array,
 /// creating what's missing; returns each event with the index its group
 /// landed at. A `hooks` event that isn't an array is a configuration we
 /// don't understand: refuse rather than replace it.
-fn add_hooks(hooks: &mut Map<String, Value>, events: &[String], command: &str) -> Result<Vec<(String, usize)>, String> {
+fn add_hooks(
+    hooks: &mut Map<String, Value>,
+    events: &[String],
+    command: &str,
+) -> Result<Vec<(String, usize)>, String> {
     let mut placed = Vec::new();
     for event in events {
         let groups = hooks
