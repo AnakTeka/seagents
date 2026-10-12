@@ -250,7 +250,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>) -> i32 {
         if event::poll(timeout).unwrap_or(false) {
             let ev = event::read();
             // Never log what is typed into the send line: prompt text stays
-            // out of every log (HANDOFF §9).
+            // out of every log (docs/HANDOFF.md §9).
             match (&ev, app.input.is_some()) {
                 (Ok(Event::Key(_) | Event::Paste(_)), true) => hud_log!("input-line event"),
                 _ => hud_log!("{ev:?}"),

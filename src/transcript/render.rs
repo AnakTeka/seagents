@@ -1,4 +1,4 @@
-//! Records → text lines, by the collapse rules (SESSIONS-SPEC "Collapse
+//! Records → text lines, by the collapse rules (docs/HANDOFF.md §10, "Collapse
 //! rules"): what makes a thousand-turn session skimmable. The user's words
 //! and the assistant's text in full; the rest one line each.
 //!

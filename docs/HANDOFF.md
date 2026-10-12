@@ -25,15 +25,15 @@ through herdr.
 
 Until 2026-10-12 seagents ran each agent itself, on a pty of its own inside
 the window (a "pty-tee" wrapper), which made the window the only way in:
-nothing could reach an agent from another machine. HERDR-BACKEND-SPEC.md is
-the design of the move to herdr, with every decision and why.
+nothing could reach an agent from another machine.
+[`HERDR-BACKEND-SPEC.md`](./HERDR-BACKEND-SPEC.md) is the design of the move
+to herdr, with every decision and why.
 
 ---
 
 ## Current status
 
-Built on the branch `feat/herdr-backend` (from `main` after `refactor/phase0`
-was fast-forwarded into it), not yet merged, not yet installed:
+The herdr backend is merged into `main` (2026-10-12):
 
 | capability | command | state |
 |---|---|---|
@@ -54,20 +54,18 @@ hand against an isolated herdr session (§ Dev workflow). There is no lineage:
 any agent may drive any agent (decided 2026-10-12, HERDR-BACKEND-SPEC). The
 agent-facing workflow is the skill, `skills/seagents-orchestrate/SKILL.md`.
 
-**Installing it.** Agents started by the pre-herdr binary are not seen by
-this one: restart them after installing, then delete what they left in
-`~/.cache/seagents/` (files named `<pid>.*`), which this binary ignores.
+**Upgrading from a pre-herdr build.** Agents started by the pre-herdr binary
+are not seen by this one: restart them after installing, then delete what they
+left in `~/.cache/seagents/` (files named `<pid>.*`), which this binary ignores.
 
 ---
 
 ## Getting set up on a new machine
 
 `target/` and the `herdr` reference clone are gitignored, so after cloning you
-build fresh:
+build fresh, from the checkout:
 
 ```bash
-git clone git@github.com:AnakTeka/seagents.git
-cd seagents
 cargo build --release
 install -Dm755 target/release/seagents ~/.local/bin/seagents   # ensure ~/.local/bin is on PATH
 ```
@@ -95,7 +93,7 @@ seagents started (workspace = directory, tab = agent) and drives them; the i3
 windows here keep showing them.
 
 Add the HUD keybind + float rule to your i3 config (`~/.config/i3/config`).
-`$mod` is Super on the dev machine; `$mod+o` was free there — pick any free key:
+`$mod+o` is only an example — pick any free key:
 
 ```conf
 # seagents — floating agent HUD
@@ -139,7 +137,7 @@ windows.
 **The orchestration skill.** `skills/seagents-orchestrate/SKILL.md` teaches an
 agent the spawn → wait → send → read → stop loop (§7–§10) from the CLI as
 built. Claude Code loads skills from `~/.claude/skills/<name>/SKILL.md` (or
-`$CLAUDE_CONFIG_DIR/skills/` when that is set, as on the dev machine), so link
+`$CLAUDE_CONFIG_DIR/skills/` when that is set), so link
 the directory rather than copying it, and the skill follows the repo:
 
 ```bash
@@ -532,12 +530,12 @@ across herdr servers.
     "socket": "/home/me/.config/herdr/herdr.sock", // the server (its hooks' HERDR_SOCKET_PATH)
     "run_pid": 305301,             // the `run` holding the window
     "pid": 305358,                 // the agent (its pane's foreground group); null while starting
-    "cwd": "/home/me/.../homelab", // launch cwd = grouping key
+    "cwd": "/home/me/projects/myapp", // launch cwd = grouping key
     "argv": ["claude", "--model", "haiku"],
     "started": 1783468316,
     "con_id": 103471613296720,     // i3 window recorded at launch (focus handle)
     "window_id": 30728026,         // X11 id (survives an i3 restart)
-    "tag": "homelab-3f9a",         // the agent's name, and its herdr agent name
+    "tag": "myapp-3f9a",           // the agent's name, and its herdr agent name
     "hooks": true,                 // run handed the agent our hooks (absent: false)
     "engaged_at": 1783468320,      // first prompt given (a seed, or a send)
     "last_prompt": "…",            // the last prompt seagents submitted (§9)
@@ -570,7 +568,7 @@ across herdr servers.
   hooks:
   ```json
   {
-    "transcript_path": "/home/me/.claude-work/projects/…/1f81….jsonl",
+    "transcript_path": "/home/me/.claude/projects/…/1f81….jsonl",
     "session_id": "1f81…",          // the conversation, for restore's --resume
     "stops": 7,                     // +1 at every Stop; never resets
     "prompted_at": 1783468390120,   // last UserPromptSubmit (Unix ms)
@@ -898,7 +896,7 @@ and nothing is touched. An adapter with no `resume` restores fresh). Because `/c
 again with the new conversation, the id is always the one the window is
 writing *now* — the stale-after-`/clear` problem the old resolvers had is gone,
 and so is their `~/.claude/projects` hardcoding, which pointed at the wrong
-directory under `CLAUDE_CONFIG_DIR=~/.claude-work` (the hook reports the real
+directory under a custom `CLAUDE_CONFIG_DIR` (the hook reports the real
 path).
 
 Details that matter:
@@ -1225,7 +1223,7 @@ A compaction's boundary takes its `logicalParentUuid` as parent; when that
 line was never written (5 of 15 here) the walk bridges to the newest tip
 before the boundary, so the line still starts at the real beginning.
 
-**Collapse rules** (`render.rs`, SESSIONS-SPEC's): user text in full behind
+**Collapse rules** (`render.rs`): user text in full behind
 `│`, assistant text in full, `⋯ thinking (N words)`, `● Tool(short arg)`,
 `  ⎿ first line (N bytes)`; `--raw` shows all. A real subagent (an `Agent` /
 `Task` call) is one line at its call, `▸ subagent: <type> — <description>`,
@@ -1249,7 +1247,7 @@ the answer, ~60 ms late), so a target read after a finished turn waits (≤ 1
 s) until a line stamped at or after the `Stop` is there — the turn's
 `stop_hook_summary`, written once the hooks have run.
 
-**The offset index** (`index.rs`, SESSIONS-SPEC's `.idx`): one 53-byte entry
+**The offset index** (`index.rs`, the `.idx` files): one 53-byte entry
 per tree node (offset, length, kind, timestamp, uuid, parent), so the main
 line is found without parsing content and `--tail N` reads only the lines it
 prints. Cached in `~/.cache/seagents/sessions/`, extended from the last
@@ -1463,16 +1461,16 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ## Open items / backlog / next steps
 
-- **Merge** `feat/herdr-backend` into `main` once the hand checks
-  (HERDR-BACKEND-SPEC § Verification) pass on the real desktop; install;
-  restart running agents.
+- **Hand checks on the real desktop** still open (HERDR-BACKEND-SPEC
+  § Verification): `claude` in a fresh Terminator window with no herdr server
+  running, the HUD's preview and jump, `focus` on Terminator, `herdr --remote
+  ssh` against agents seagents started, and a real reboot through `restore`.
 - `seagents hud` / `status` / `wait` / `send` **against another machine**
   through herdr's `--machine` API forwarding (needs a saved herdr machine
   profile) — HERDR-BACKEND-SPEC § Later.
 - A bug report to herdr for Codex's trust question reading idle (the user's
   call; herdr's contributor rules allow a reproducible bug report, not a PR).
 - Decide the **mouse_warping** question for the HUD preview.
-- **README.md** for the repo landing page (not written yet).
 - Add `restore` to i3 autostart (`exec --no-startup-id seagents restore`) once
   it has been through a real reboot, or keep running it by hand.
 - Optional: **eww** port of the HUD for a prettier always-on widget.
@@ -1548,16 +1546,14 @@ The HUD and an agent's window need a real terminal — validate them by hand
 
 ## Conventions
 
-- **Commits: no AI co-author.** Do not add `Co-Authored-By: Claude ...` or
-  "Generated with" lines. The user authors commits solely. (Conventional-commit
-  style, e.g. `fix(focus): ...`, is used.)
-- Repo: `git@github.com:AnakTeka/seagents.git`, **private**, default branch `main`.
-- Local git identity: `Yoga Yudistira <yudistirayoga97@gmail.com>`.
+The project's conventions (cutover rule, no unit tests, commit style) are in
+[`CLAUDE.md`](../CLAUDE.md). Machine-specific notes, when a checkout has any,
+go in an untracked `CLAUDE.local.md` at the repo root.
 
 ---
 
-## Environment (dev machine — may differ on yours)
+## Environment
 
-Arch Linux, i3wm, Terminator and alacritty, no kitty, herdr 0.9.0. The other
-machine also runs i3wm. Cargo/rustc were 1.96. seagents assumes X11 i3 (uses `i3-msg -t get_tree`); it has
-not been tested on sway/Wayland.
+Developed and verified on Linux with X11 i3, Terminator and alacritty, herdr
+0.9.0, Rust 1.96. seagents assumes X11 i3 (it uses `i3-msg -t get_tree`); it
+has not been tested on sway/Wayland.

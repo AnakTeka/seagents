@@ -1,7 +1,7 @@
 //! The lazy offset index: one fixed-width entry per tree node (a line with a
 //! uuid), so the main line can be found without parsing any line's content
-//! and only the lines actually shown are read (SESSIONS-SPEC
-//! "`<session-id>.idx`"). The largest real transcript here is 53 MB; parsing
+//! and only the lines actually shown are read (docs/HANDOFF.md §10, "The
+//! offset index"). The largest real transcript here is 53 MB; parsing
 //! all of it for `read --tail 20` would take longer than the answer is worth.
 //!
 //! Cached at `~/.cache/seagents/sessions/<key>.idx`:

@@ -1,7 +1,10 @@
 # seagents
 
-**Read [`HANDOFF.md`](./HANDOFF.md) first** — it is the full context for this
-project (what it is, architecture, current status, gotchas, and next steps).
+**Read [`docs/HANDOFF.md`](./docs/HANDOFF.md) first** — it is the full
+context for this project (what it is, architecture, current status, gotchas,
+and next steps). The design of the move onto herdr, with every decision, is
+[`docs/HERDR-BACKEND-SPEC.md`](./docs/HERDR-BACKEND-SPEC.md). Machine-specific
+notes, if this checkout has any, are in the untracked `CLAUDE.local.md`.
 
 Quick facts:
 
@@ -24,9 +27,9 @@ Conventions:
   the two side by side: no parallel implementation, no `_v2`/`_new` name, no
   compatibility shim, no flag that keeps the old behaviour reachable, no dead
   helper "in case". Move the shared thing to where it now belongs, update every
-  call site, remove the duplicate, and carry `HANDOFF.md` over in the same
+  call site, remove the duplicate, and carry `docs/HANDOFF.md` over in the same
   commit — one source of truth per concern, at every commit.
-  This is a private single-author project with no external consumers, so nothing
+  This is a single-author project with no external consumers, so nothing
   here is owed a deprecation cycle: a half-finished cutover costs more than the
   full one.
 - **No unit tests.** Don't write `#[cfg(test)]` tests (the existing ones were
@@ -42,4 +45,4 @@ Conventions:
   it. Name the notable deletions in the summary so they are visible.
 - **Commits: do NOT add a Claude/AI co-author or "Generated with" trailer.** The
   user authors commits solely. Conventional-commit style (`fix(...)`, `feat(...)`).
-- Default branch `main`; remote `git@github.com:AnakTeka/seagents.git` (private).
+- Default branch `main`.

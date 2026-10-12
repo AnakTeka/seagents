@@ -3,9 +3,8 @@
 Design spec for moving seagents' agents out of its own pty wrapper and into a
 **herdr server**, with each i3 terminal becoming a *view* of one agent.
 
-Status: **implemented** on branch `feat/herdr-backend` (2026-10-12), not yet
-merged or installed. Written the same day, the approach proven by hand first
-(see *Verified*); the decisions below were taken before building, and
+Status: **implemented** and merged into `main` (2026-10-12). Written the same
+day, the approach proven by hand first (see *Verified*); the decisions below were taken before building, and
 *Decisions D1–D7* during it. Where this and the code disagree, the code and
 [`HANDOFF.md`](./HANDOFF.md) win.
 
@@ -272,7 +271,7 @@ real reboot through `restore`.
 
 ## Cutover shape
 
-Per `CLAUDE.md`, no wrapper and herdr paths side by side. The wrapper is the
+Per [`CLAUDE.md`](../CLAUDE.md), no wrapper and herdr paths side by side. The wrapper is the
 hub that `status`, `hud`, `send`, `stop`, `wait` and `spawn` all hang off, so
 those cannot move one at a time: they move **together, in one change**, and
 the wrapper, the vendored detector and the control socket are deleted in that

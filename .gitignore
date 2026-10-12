@@ -3,3 +3,9 @@
 
 # Reference clone of herdr (not part of seagents)
 /herdr
+
+# Personal, machine-specific notes for Claude Code (not part of the repo)
+/CLAUDE.local.md
+
+# Local working notes and unbuilt plans (not part of the repo)
+/.local/

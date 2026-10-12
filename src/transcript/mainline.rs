@@ -1,5 +1,5 @@
-//! The transcript is a tree, not a log (SESSIONS-SPEC "The transcript is a
-//! tree"): every rewind, edit or retry starts a branch off an earlier node,
+//! The transcript is a tree, not a log (docs/HANDOFF.md §10, "The main
+//! line"): every rewind, edit or retry starts a branch off an earlier node,
 //! so the file in line order interleaves abandoned attempts with the live
 //! conversation (one real 38 MB session: 20 branch points, 22 tips). What
 //! is shown is the **main line** — root to the newest tip.

@@ -64,7 +64,7 @@ struct Terminal {
 
 /// Resolve the terminal to launch a window with.
 ///
-/// Built-ins are the ones actually verified on this machine. Anything else goes
+/// Built-ins are the ones verified by `tools/test-restore.sh`. Anything else goes
 /// through `SEAGENTS_TERMINAL_CMD` (a template over `{handle}`, `{cwd}`,
 /// `{cmd}`) paired with `SEAGENTS_TERMINAL_MATCH`, because a launch flag and
 /// the criterion that finds the resulting window are one decision — set the

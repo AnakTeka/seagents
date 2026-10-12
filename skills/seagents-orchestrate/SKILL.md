@@ -39,6 +39,15 @@ Write it for a stranger. It must say:
 
 Long or multi-line prompts go in a file: `--prompt-file F`.
 
+## Which agent
+
+`spawn` starts Claude Code by default (`--agent claude`); `--agent codex`
+spawns Codex instead. The loop below is the same for both, and
+`--permission-mode` takes the same words (Codex gets the matching `-a`/`-s`
+pair). Other agents herdr can start are accepted too, but only Claude Code and
+Codex report their turns to seagents: `wait --after N` on anything else never
+sees a turn end and only times out. Stick to those two.
+
 ## The loop
 
 ```sh
