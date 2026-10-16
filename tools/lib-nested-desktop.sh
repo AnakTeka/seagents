@@ -46,7 +46,7 @@ nd_init() {
   trap nd_cleanup EXIT
   export HOME="$ROOT/home"
   # These would point herdr — and every seagents command — at another server.
-  unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION HERDR_BIN_PATH
+  unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_CLIENT_SOCKET_PATH HERDR_SESSION HERDR_BIN_PATH
   # seagents derives its config and state dirs from these when set; they would
   # point the run (and its layout.json) back at the real ones.
   unset XDG_STATE_HOME XDG_CONFIG_HOME

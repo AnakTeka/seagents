@@ -11,10 +11,12 @@
 //!
 //! In order: find or make the agent's place in herdr (one workspace per
 //! launch directory, one tab per agent, labelled with its tag), register the
-//! session (`registry`), `herdr agent start` it with our hooks, record which
-//! i3 window it is shown in, start the monitor thread, then attach — and
-//! re-attach after a detach (`Ctrl+B q` would otherwise leave an empty
-//! window over a running agent).
+//! session (`registry`), `herdr agent start` it with our hooks and take its
+//! pid, record which i3 window it is shown in, start the monitor thread, then
+//! attach — and re-attach after a detach (`Ctrl+B q` would otherwise leave an
+//! empty window over a running agent). The attach and the agent are waited
+//! on together, by pidfd ([`Watch`]): the agent exiting ends the attach at
+//! once, so the window is back at its own shell the moment the agent is gone.
 //!
 //! Inside a herdr pane (`HERDR_ENV`), `run` is not the launcher: herdr's own
 //! `agent start` types the agent's command into the pane's shell, where the
@@ -22,11 +24,13 @@
 //! execs the command as it is — herdr must find the agent itself in its pane,
 //! not seagents.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::herdr;
@@ -129,11 +133,19 @@ fn launch(
     // point; Ctrl+C (SIGINT) only cancels the start — while the agent is
     // shown the attach has the terminal raw, and in a window that only waits
     // (taken over) a Ctrl+C must not end an agent another client is using.
+    // The two that close the window also wake `Watch::wait`, through this
+    // pipe.
     let hup = Arc::new(AtomicBool::new(false));
     let int = Arc::new(AtomicBool::new(false));
+    let (wake, woken) = UnixStream::pair().map_err(|e| (1, format!("signal pipe: {e}")))?;
     for sig in [libc::SIGHUP, libc::SIGTERM] {
         let _ = signal_hook::flag::register(sig, Arc::clone(&hup));
+        if let Ok(w) = wake.try_clone() {
+            let _ = signal_hook::low_level::pipe::register(sig, w);
+        }
     }
+    drop(wake);
+    let _ = woken.set_nonblocking(true);
     let _ = signal_hook::flag::register(libc::SIGINT, Arc::clone(&int));
     let cancelled = || hup.load(Ordering::Relaxed) || int.load(Ordering::Relaxed);
     // A requested tag is also the window's handle: whoever launched us with
@@ -210,32 +222,34 @@ fn launch(
     }
     println!("starting {tag}…");
     clean_shell(&pane.pane_id);
-    match start(&tag, kind, &pane.pane_id, &args[1..], &cancelled) {
-        Ok(()) => {}
-        // Up, and stopped at a dialog on the way (a folder-trust prompt):
-        // the window is where it is answered.
-        Err(e) if e.code == "agent_not_ready" => {}
+    let pid = match start(&tag, kind, &pane.pane_id, &args[1..], &cancelled) {
+        Ok(pid) => pid,
         Err(e) if e.code == "cancelled" => {
             let _ = fail(String::new());
             return Err((130, "cancelled".to_string()));
         }
         Err(e) => return Err(fail(format!("starting {tag}: {}", e.message))),
-    }
-    record_pid(&files, &pane.pane_id);
+    };
+    registry::update_meta(&files, |m| m.pid = Some(pid));
+    let watch = Watch::new(pid, woken, Arc::clone(&hup))
+        .map_err(|e| fail(format!("{tag} (pid {pid}) is gone as it started: {e}")))?;
 
-    let gone = Arc::new(AtomicBool::new(false));
+    // Held by the monitor through each tick, and taken (and set) before the
+    // session is finished, so no tick writes into a finished one.
+    let ended = Arc::new(Mutex::new(false));
     monitor(
         files.clone(),
         key.clone(),
         tag.clone(),
         cmd[0].clone(),
-        Arc::clone(&gone),
+        Arc::clone(&ended),
     );
     if let Some(seed) = seed {
         deliver_seed(key.clone(), seed);
     }
 
-    let outcome = attach_loop(&key, &tag, &hup, &gone);
+    let outcome = attach_loop(&key, &tag, &watch);
+    *ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
     // Window closed or agent gone: the agent's pane goes, either way.
     if let Ok(Some(p)) = herdr::pane_of(&key) {
         let _ = herdr::close_pane(&p.pane_id);
@@ -336,21 +350,36 @@ fn clean_shell(pane: &str) {
 /// is not yet.
 const SHELL_READY: Duration = Duration::from_secs(15);
 
-/// `herdr agent start`, once the pane's shell is in the foreground — and
-/// again while herdr still finds the pane busy, within [`SHELL_READY`].
+/// How long after `agent start` returns the agent's process may take to be
+/// the pane's foreground: herdr has detected it there by then, so this is
+/// slack, not a wait anyone should see.
+const PID_WAIT: Duration = Duration::from_secs(5);
+
+/// Start the agent and hand back its pid: `herdr agent start`, once the
+/// pane's shell is in the foreground — and again while herdr still finds the
+/// pane busy, within [`SHELL_READY`] — then the agent's process, as the
+/// pane's foreground process group (within [`PID_WAIT`]). Up and stopped at a
+/// dialog on the way (`agent_not_ready`, a folder-trust prompt) counts as
+/// started: the window is where it is answered.
+///
+/// The process group's leader is the process the pane's shell forked for the
+/// command line herdr typed — the agent itself (an alias to `seagents run`
+/// execs it in place) — so it exits when the agent does, whatever children
+/// it leaves.
 fn start(
     tag: &str,
     kind: &str,
     pane: &str,
     args: &[String],
     cancelled: &dyn Fn() -> bool,
-) -> Result<(), herdr::Error> {
+) -> Result<u64, herdr::Error> {
     let deadline = Instant::now() + SHELL_READY;
+    let foreign = |p: &herdr::Procs| p.fg_pgid != 0 && p.fg_pgid != p.shell_pid;
     loop {
         // The pane's foreground process group is its shell's own.
         while Instant::now() < deadline
             && !cancelled()
-            && herdr::process_info(pane).is_ok_and(|p| p.fg_pgid != 0 && p.fg_pgid != p.shell_pid)
+            && herdr::process_info(pane).is_ok_and(|p| foreign(&p))
         {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -358,18 +387,27 @@ fn start(
             Err(e) if e.code == "agent_pane_busy" && Instant::now() < deadline && !cancelled() => {
                 std::thread::sleep(Duration::from_millis(250));
             }
-            other => return other,
+            Ok(()) => break,
+            Err(e) if e.code == "agent_not_ready" => break,
+            Err(e) => return Err(e),
         }
     }
-}
-
-/// Record the agent's pid: its pane's foreground process group, once that
-/// is no longer the shell.
-fn record_pid(files: &Files, pane: &str) -> Option<u64> {
-    let procs = herdr::process_info(pane).ok()?;
-    let pid = Some(procs.fg_pgid).filter(|&p| p != 0 && p != procs.shell_pid)?;
-    registry::update_meta(files, |m| m.pid = Some(pid));
-    Some(pid)
+    let deadline = Instant::now() + PID_WAIT;
+    loop {
+        if cancelled() {
+            return Err(herdr::Error::new("cancelled", "cancelled"));
+        }
+        if let Some(p) = herdr::process_info(pane).ok().filter(foreign) {
+            return Ok(p.fg_pgid);
+        }
+        if Instant::now() >= deadline {
+            return Err(herdr::Error::new(
+                "no_pid",
+                "herdr started it, but no process of it is in its pane",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Capture the i3 window this agent is shown in, as (con_id, X window id).
@@ -413,17 +451,18 @@ enum Ended {
 /// the terminal over (`herdr terminal attach --takeover`) is respected: this
 /// window says so and waits — it never takes the agent back — until it is
 /// closed (which still ends the agent) or the agent exits.
-fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> Ended {
-    // (`end` is the window closing — SIGHUP or SIGTERM — not Ctrl+C: while
-    // the agent is shown the attach has the terminal raw, and while this
-    // window only waits a Ctrl+C must not end an agent another client uses.)
+///
+/// The agent exiting ends the attach (SIGTERM, which herdr's attach takes
+/// as cleanly as a detach, the terminal restored): the window is back at its
+/// own shell at once, not left on herdr's pane shell — where a key typed
+/// would land — until the pane is closed.
+fn attach_loop(key: &str, tag: &str, watch: &Watch) -> Ended {
     let mut failures: Vec<Instant> = Vec::new();
     loop {
-        if end.load(Ordering::Relaxed) || hung_up() {
-            return Ended::Window;
-        }
-        if gone.load(Ordering::Relaxed) {
-            return Ended::Agent;
+        match watch.wait(None, Some(Duration::ZERO)) {
+            Wake::Window => return Ended::Window,
+            Wake::Agent => return Ended::Agent,
+            Wake::Attach | Wake::Timeout => {}
         }
         let child = herdr::attach(key)
             .stdin(Stdio::inherit())
@@ -445,24 +484,37 @@ fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> End
             }
             text
         });
-        let status = loop {
-            if end.load(Ordering::Relaxed) || hung_up() {
+        // Our own unreaped child: its pidfd opens even once it has exited.
+        let attach = match pidfd(child.id()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ended::Failed(format!("watching herdr's attach: {e}"));
+            }
+        };
+        match watch.wait(Some(&attach), None) {
+            Wake::Window => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ended::Window;
             }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Ended::Failed(e.to_string()),
+            Wake::Agent => {
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                let _ = child.wait();
+                return Ended::Agent;
             }
+            Wake::Attach | Wake::Timeout => {}
+        }
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => return Ended::Failed(e.to_string()),
         };
         let said = reader.join().unwrap_or_default();
-        if end.load(Ordering::Relaxed) || hung_up() {
-            return Ended::Window;
-        }
-        if gone.load(Ordering::Relaxed) || !agent_alive(key) {
-            return Ended::Agent;
+        match watch.wait(None, Some(Duration::ZERO)) {
+            Wake::Window => return Ended::Window,
+            Wake::Agent => return Ended::Agent,
+            Wake::Attach | Wake::Timeout => {}
         }
         if status.success() {
             // A detach: show it again.
@@ -471,7 +523,10 @@ fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> End
         if said.contains("taken over") || said.contains("already has an attached client") {
             eprint!("{said}");
             println!("\n{tag} is shown by another herdr client now; this window waits. Close it to stop {tag}.");
-            return wait_out(end, gone);
+            return match watch.wait(None, None) {
+                Wake::Agent => Ended::Agent,
+                _ => Ended::Window,
+            };
         }
         eprint!("{said}");
         let now = Instant::now();
@@ -483,39 +538,124 @@ fn attach_loop(key: &str, tag: &str, end: &AtomicBool, gone: &AtomicBool) -> End
                 said.trim()
             ));
         }
-        std::thread::sleep(Duration::from_secs(1));
+        // A pause before the retry — cut short by the window or the agent
+        // going (an attach that failed because the pane just closed).
+        match watch.wait(None, Some(Duration::from_secs(1))) {
+            Wake::Window => return Ended::Window,
+            Wake::Agent => return Ended::Agent,
+            Wake::Attach | Wake::Timeout => {}
+        }
     }
 }
 
-/// Sit until the window closes or the agent exits.
-fn wait_out(end: &AtomicBool, gone: &AtomicBool) -> Ended {
-    loop {
-        if end.load(Ordering::Relaxed) || hung_up() {
-            return Ended::Window;
+/// What `run` waits on once the agent is up, all in one `poll()`: the agent
+/// process (a pidfd), the window closing — SIGHUP or SIGTERM (through a
+/// self-pipe), or its terminal hanging up (stdin reports `POLLHUP`; the
+/// shell between us and the terminal may not pass SIGHUP on) — and, while
+/// one runs, herdr's attach (a pidfd). Not Ctrl+C: while the agent is shown
+/// the attach has the terminal raw, and in a window that only waits (taken
+/// over) a Ctrl+C must not end an agent another client uses.
+///
+/// A pidfd fires when its process exits — not when it stops: an agent
+/// suspended with Ctrl+Z (in its pane's shell, `fg` resumes it) keeps the
+/// window.
+struct Watch {
+    agent: OwnedFd,
+    /// The read end of the signal pipe.
+    signals: UnixStream,
+    /// Set by SIGHUP and SIGTERM.
+    end: Arc<AtomicBool>,
+}
+
+/// Why [`Watch::wait`] returned.
+enum Wake {
+    /// The window is closing.
+    Window,
+    /// The agent exited.
+    Agent,
+    /// The attach exited.
+    Attach,
+    Timeout,
+}
+
+impl Watch {
+    fn new(pid: u64, signals: UnixStream, end: Arc<AtomicBool>) -> std::io::Result<Watch> {
+        Ok(Watch {
+            agent: pidfd(pid as u32)?,
+            signals,
+            end,
+        })
+    }
+
+    /// Block until something happens (or `timeout` passes; zero only
+    /// looks). The window closing is told first: it ends the session
+    /// whatever else is going on.
+    fn wait(&self, attach: Option<&OwnedFd>, timeout: Option<Duration>) -> Wake {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            if self.end.load(Ordering::Relaxed) {
+                return Wake::Window;
+            }
+            let fd = |fd: RawFd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let mut fds = [
+                // Only the hang-up, which is reported whatever is asked for:
+                // the attach is the one reading this terminal.
+                libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: 0,
+                    revents: 0,
+                },
+                fd(self.signals.as_raw_fd()),
+                fd(self.agent.as_raw_fd()),
+                // poll() skips a negative fd.
+                fd(attach.map_or(-1, AsRawFd::as_raw_fd)),
+            ];
+            let ms = deadline.map_or(-1, |d| {
+                let left = d.saturating_duration_since(Instant::now());
+                i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+            });
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Cannot wait on anything: nothing to show the agent with.
+                return Wake::Window;
+            }
+            if fds[1].revents != 0 {
+                use std::io::Read;
+                let mut buf = [0u8; 64];
+                while (&self.signals).read(&mut buf).is_ok_and(|n| n > 0) {}
+            }
+            if self.end.load(Ordering::Relaxed)
+                || fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            {
+                return Wake::Window;
+            }
+            if fds[2].revents != 0 {
+                return Wake::Agent;
+            }
+            if fds[3].revents != 0 {
+                return Wake::Attach;
+            }
+            if n == 0 {
+                return Wake::Timeout;
+            }
         }
-        if gone.load(Ordering::Relaxed) {
-            return Ended::Agent;
-        }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// Whether this window's terminal is gone: its side of the tty reports a
-/// hang-up. Beside SIGHUP, which the shell between us and the terminal may
-/// not pass on.
-fn hung_up() -> bool {
-    let mut fd = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: 0,
-        revents: 0,
-    };
-    let n = unsafe { libc::poll(&mut fd, 1, 0) };
-    n > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-}
-
-/// Whether session `key`'s agent still runs (or is still starting).
-fn agent_alive(key: &str) -> bool {
-    registry::by_key(key).is_some_and(|s| s.alive())
+/// A pidfd for `pid` (Linux ≥ 5.3): readable once the process has exited.
+fn pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 /// The monitor: every [`TICK`], fold herdr's verdict and the ledger into
@@ -524,9 +664,9 @@ fn agent_alive(key: &str) -> bool {
 /// dropped-turn rule needs, and keep the reboot snapshot current. `run` is
 /// the one process that lives exactly as long as the agent, so this keeps
 /// "idle for / waiting for" truthful even when no HUD or status poll is
-/// watching. When the agent exits it closes its pane — the attach ends, and
-/// with it the window — and says so through `gone`.
-fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<AtomicBool>) {
+/// watching. The agent's exit is not its business ([`Watch`] has it); it
+/// stops once `ended` is set, and holds it through each tick.
+fn monitor(files: Files, key: String, tag: String, cmd: String, ended: Arc<Mutex<bool>>) {
     let cmd0 = Path::new(&cmd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -541,23 +681,13 @@ fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<Atomic
         let mut screen_hash: Option<u64> = None;
         let mut title = tag.clone();
         loop {
-            // Only this `run` finishes its session while it lives, so the
-            // `.meta` is there.
-            let meta = registry::read_meta(&files).unwrap_or_default();
-            let pid = match meta.pid {
-                Some(pid) => Some(pid),
-                None => herdr::pane_of(&key)
-                    .ok()
-                    .flatten()
-                    .and_then(|p| record_pid(&files, &p.pane_id)),
-            };
-            if pid.is_some_and(|p| !crate::procfs::alive(p)) {
-                if let Ok(Some(p)) = herdr::pane_of(&key) {
-                    let _ = herdr::close_pane(&p.pane_id);
-                }
-                gone.store(true, Ordering::Relaxed);
+            let ended = ended.lock().unwrap_or_else(|e| e.into_inner());
+            if *ended {
                 return;
             }
+            // Only this `run` finishes its session, and not before `ended`
+            // is set, so the `.meta` is there.
+            let meta = registry::read_meta(&files).unwrap_or_default();
             let agent = herdr::agent_on(&key).ok().flatten();
             // The agent's own title (Claude's conversation name), which
             // herdr's attach does not pass on to the window; the tag until
@@ -608,6 +738,7 @@ fn monitor(files: Files, key: String, tag: String, cmd: String, gone: Arc<Atomic
             // Throttled across every caller, so all but one per interval pay
             // a single stat() here.
             crate::snapshot::maybe_capture();
+            drop(ended);
             std::thread::sleep(TICK);
         }
     });

@@ -252,10 +252,11 @@ Source layout under `src/`:
   environment's business, as for any `herdr` command: `HERDR_SOCKET_PATH`,
   else `HERDR_SESSION`, else the default.
 - **`src/run.rs`** — `seagents run` (§1): the in-pane exec, `place()` (the
-  agent's workspace and tab), `clean_shell()`, the start, `identify_window()`,
-  `attach_loop()` (D1: a detach undone, a takeover respected, a closed window
-  ending the agent), the `monitor()` thread, `deliver_seed()`,
-  `notify_transition()`.
+  agent's workspace and tab), `clean_shell()`, `start()` (the agent up, and
+  its pid), `identify_window()`, `attach_loop()` (D1: a detach undone, a
+  takeover respected, a closed window ending the agent, the agent's exit
+  ending the attach) over `Watch` (one `poll()` on pidfds, a signal pipe and
+  the tty), the `monitor()` thread, `deliver_seed()`, `notify_transition()`.
 - **`src/screen.rs`** — what seagents reads off an agent's screen itself, as
   herdr hands it over: `input_box()` (what the input box holds — dim text is
   a placeholder, §9) and `shows_any()`.
@@ -427,19 +428,27 @@ Source layout under `src/`:
    --timeout 120000 -- <args>`, retried on `agent_pane_busy` for up to 15 s
    (verified with an rc file running `sleep 4`). `agent_not_ready` (up, and stopped at a
    dialog on the way — a folder-trust prompt) counts as started: the window is
-   where it is answered. Any other failure closes the pane, finishes the
-   session and exits 1 with herdr's message. Ctrl+C or the window closing
+   where it is answered. Then the agent's pid: the pane's foreground process
+   group, once it is no longer the shell's — herdr has detected the agent by
+   then, so this is immediate; up to 5 s is allowed. The group's leader is
+   the process the pane's shell forked for the command herdr typed, the
+   agent itself (the `claude` → `seagents run claude` alias execs it in
+   place), so it exits when the agent does. Any failure — herdr's, or no pid
+   — closes the pane, finishes the session and exits 1 with the message. Ctrl+C or the window closing
    while it starts cancels it. After that, only the window closing (SIGHUP,
-   SIGTERM, or the tty gone) ends the session: Ctrl+C reaches the agent
+   SIGTERM, or the tty gone) or the agent exiting ends the session: Ctrl+C reaches the agent
    through the raw attach, and in a window that only waits (taken over, below)
    it does nothing (verified).
-8. The agent's pid (the pane's foreground process group) goes into `.meta`;
-   the window is identified on a thread (§4); the **monitor** thread starts;
+8. The agent's pid goes into `.meta`, and a pidfd is opened on it (Linux ≥
+   5.3); the window is identified on a thread (§4); the **monitor** thread starts;
    a seed (from `spawn`) is delivered by its own thread once the agent has
    read idle for 1.5 s (§7).
 9. **The attach loop** (`attach_loop()`): `herdr terminal attach <terminal
    id>` as a child, stdio inherited (its stderr piped, to read why it ended).
-   The window shows the agent alone, full-size. Then:
+   The window shows the agent alone, full-size. `run` then sleeps in one
+   `poll()` (`run::Watch`) on: a pidfd for the attach, the agent's pidfd, a
+   self-pipe that SIGHUP and SIGTERM write to (`signal_hook::low_level::pipe`;
+   not SIGINT), and stdin's `POLLHUP` — no timers. Then:
    - **Window closed** — SIGHUP, or stdin polls as hung up — the agent's pane
      is closed, which ends the agent: **the window and its agent live and die
      together** (decided 2026-10-12).
@@ -453,24 +462,40 @@ Source layout under `src/`:
      (`herdr --remote`) is a different kind of client and takes nothing over
      (verified 2026-10-12: the laptop window and the PC both showed and drove
      one agent).
-   - **Attach failing** 3 times within 10 s ends the session with its error.
-   - **The agent exiting** (`/exit`, a crash): the monitor sees its pid gone
-     and closes its pane, the attach ends, `run` exits — back at the shell for
-     a window opened by hand (as before), the window closed for a spawned one.
+   - **Attach failing** 3 times within 10 s ends the session with its error;
+     the 1 s pause between retries is the same `poll()` with a timeout, so
+     the agent exiting (an attach that failed because its pane just closed)
+     or the window closing cuts it short.
+   - **The agent exiting** (`/exit`, a crash, `stop`): its pidfd fires; `run`
+     decides "agent gone" first, then SIGTERMs the attach — herdr's attach
+     takes SIGTERM like a detach (exit 0, terminal restored, ~5–40 ms), so
+     the decision must come first or it would be re-attached — waits for it,
+     closes the pane and exits: back at the shell for a window opened by
+     hand, the window closed for a spawned one. Measured 2026-10-16 in a pty
+     against an isolated server: 22–38 ms from a SIGKILLed Claude to `run`
+     gone, 11–18 ms from a gracefully exited one; an `echo` typed 20 ms
+     after the kill ran in the window's own shell. (Before, the window went
+     on showing herdr's pane shell until the monitor's 2 s tick closed the
+     pane: a Ctrl+D typed then closed that shell and left the window's own
+     needing another, and an arrow key could land split.) A key typed in the
+     few ms before the attach has exited still goes to the pane's shell.
+     A pidfd does not fire on a stopped process, so Ctrl+Z (below) ends
+     nothing.
 
    On the way out `run` closes the pane if it is still there and `finish()`es
    the session: a tombstone, then every file, its prompt files and its hook
    settings.
 
-**The monitor** (`run::monitor`, every 2 s): fills in the agent's pid if it
-had none; on the agent's exit closes its pane; the **window title**
+**The monitor** (`run::monitor`, every 2 s): the **window title**
 (below); one `herdr agent list` →
 `status::track` (herdr's verdict fused with the ledger, into `.state`, §3);
 desktop notifications on transitions; the done marker cleared when the
 agent's window is focused; the **screen clock** the dropped-turn rule needs
 (§6) — while the agent sits idle in a turn, it hashes the screen (`herdr pane
 read`) and stamps `.state`'s `screen_changed_ms` when it changes; and the
-reboot snapshot offer.
+reboot snapshot offer. The agent's exit is not its business (`Watch` has
+it, above): it holds a lock through each tick that `run` takes, and marks
+ended, before it finishes the session, so no tick writes into a finished one.
 
 **The window title.** herdr's `terminal attach` client never passes the
 agent's own title (OSC 0/2) on to the outer terminal — only herdr's full UI
@@ -494,11 +519,12 @@ focused. `SEAGENTS_NO_NOTIFY=1` disables.
 **Job control**: Ctrl+Z goes through the attach to the agent, which stops in
 its herdr pane — the pane's shell shows, `fg` there resumes it. While it is
 suspended herdr does not list it as an agent (status `unknown`); its pid is
-alive, so nothing ends. The old wrapper's `__lead` anchor and its job-control
+alive, and a pidfd fires only on exit, so nothing ends (verified
+2026-10-16: stopped, `run` stayed, `fg` resumed it). The old wrapper's `__lead` anchor and its job-control
 forwarding are gone with the wrapper.
 
 **A server restart** ends every agent (their terminals were the server's):
-each `run` sees its agent's pid gone and ends. herdr brings the tabs back
+each `run`'s pidfd on its agent fires and it ends. herdr brings the tabs back
 empty; `restore` reuses them (§6).
 
 ### 2. Data model — `~/.cache/seagents/`

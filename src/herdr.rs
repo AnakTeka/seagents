@@ -91,7 +91,7 @@ pub(crate) struct Error {
 }
 
 impl Error {
-    fn new(code: &str, message: impl Into<String>) -> Error {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Error {
         Error {
             code: code.to_string(),
             message: message.into(),
