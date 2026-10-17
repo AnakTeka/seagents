@@ -402,16 +402,11 @@ pub(crate) fn tabs(workspace: &str) -> Result<Vec<Tab>, Error> {
         .unwrap_or_default())
 }
 
-/// A new workspace at `cwd`, without moving anyone's focus, its shell given
-/// `env` besides the server's: its first tab's pane.
-pub(crate) fn create_workspace(
-    cwd: &Path,
-    label: &str,
-    env: &[(String, String)],
-) -> Result<Pane, Error> {
+/// A new workspace at `cwd`, without moving anyone's focus: its first tab's
+/// pane.
+pub(crate) fn create_workspace(cwd: &Path, label: &str) -> Result<Pane, Error> {
     let cwd = cwd.to_string_lossy();
-    let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args = vec![
+    let args = [
         "workspace",
         "create",
         "--cwd",
@@ -420,22 +415,15 @@ pub(crate) fn create_workspace(
         label,
         "--no-focus",
     ];
-    args.extend(env.iter().flat_map(|e| ["--env", e.as_str()]));
     let v = call(&args)?;
     Ok(Pane::from(&v["root_pane"]))
 }
 
-/// A new tab in `workspace` at `cwd`, without moving anyone's focus, its
-/// shell given `env` besides the server's: its pane.
-pub(crate) fn create_tab(
-    workspace: &str,
-    cwd: &Path,
-    label: &str,
-    env: &[(String, String)],
-) -> Result<Pane, Error> {
+/// A new tab in `workspace` at `cwd`, without moving anyone's focus: its
+/// pane.
+pub(crate) fn create_tab(workspace: &str, cwd: &Path, label: &str) -> Result<Pane, Error> {
     let cwd = cwd.to_string_lossy();
-    let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mut args = vec![
+    let args = [
         "tab",
         "create",
         "--workspace",
@@ -446,7 +434,6 @@ pub(crate) fn create_tab(
         label,
         "--no-focus",
     ];
-    args.extend(env.iter().flat_map(|e| ["--env", e.as_str()]));
     let v = call(&args)?;
     Ok(Pane::from(&v["root_pane"]))
 }

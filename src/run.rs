@@ -155,9 +155,8 @@ fn launch(
     // the same tag in between.
     let claim = registry::claim_tag(tag.as_deref(), &cwd, &crate::snapshot::captured_tags())
         .map_err(|e| (2, e))?;
-    let env = pane_env(adapter.as_ref().map_or(&[][..], |a| &a.launch.pass_env));
-    let pane = place(&cwd, &claim.tag, &env)
-        .map_err(|e| (1, format!("making the agent's herdr tab: {e}")))?;
+    let pane =
+        place(&cwd, &claim.tag).map_err(|e| (1, format!("making the agent's herdr tab: {e}")))?;
     let key = pane.terminal_id.clone();
     let meta = registry::Meta {
         key: key.clone(),
@@ -221,7 +220,7 @@ fn launch(
         });
     }
     println!("starting {tag}…");
-    clean_shell(&pane.pane_id);
+    prepare_shell(&pane.pane_id, &key);
     let pid = match start(&tag, kind, &pane.pane_id, &args[1..], &cancelled) {
         Ok(pid) => pid,
         Err(e) if e.code == "cancelled" => {
@@ -267,7 +266,7 @@ fn launch(
 /// and no agent, is taken instead (its shell keeps the environment it has):
 /// herdr brings tabs back after a server restart, and `restore` relaunches an
 /// agent under its old tag into the one it left.
-fn place(cwd: &Path, tag: &str, env: &[(String, String)]) -> Result<herdr::Pane, herdr::Error> {
+fn place(cwd: &Path, tag: &str) -> Result<herdr::Pane, herdr::Error> {
     let cwd_str = cwd.to_string_lossy();
     let panes = herdr::panes()?;
     let agents = herdr::agents()?;
@@ -288,13 +287,13 @@ fn place(cwd: &Path, tag: &str, env: &[(String, String)]) -> Result<herdr::Pane,
         }
     }
     match workspaces.first() {
-        Some(ws) => herdr::create_tab(ws, cwd, tag, env),
+        Some(ws) => herdr::create_tab(ws, cwd, tag),
         None => {
             let label = cwd
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "/".to_string());
-            let pane = herdr::create_workspace(cwd, &label, env)?;
+            let pane = herdr::create_workspace(cwd, &label)?;
             if let Err(e) = herdr::rename_tab(&pane.tab_id, tag) {
                 let _ = herdr::close_pane(&pane.pane_id);
                 return Err(e);
@@ -304,29 +303,66 @@ fn place(cwd: &Path, tag: &str, env: &[(String, String)]) -> Result<herdr::Pane,
     }
 }
 
-/// What a new pane is given of `run`'s own environment. The agent runs in
-/// the pane's shell, under the herdr server's environment, not `run`'s; what
-/// is carried over is where the tool keeps its configuration (the adapter's
-/// `pass_env`), and `SEAGENTS_DEBUG`, so a hook that fails says why
-/// (`hook.log`) for an agent started with it.
-fn pane_env(pass: &[String]) -> Vec<(String, String)> {
-    pass.iter()
-        .map(String::as_str)
-        .chain(["SEAGENTS_DEBUG"])
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect()
-}
+/// What of `run`'s environment stays out of the agent's pane: what belongs to
+/// the window `run` was started in rather than to the user's session — its
+/// terminal (the pane is herdr's terminal, with its own), its tty, its
+/// shell's bookkeeping — and herdr's own variables, which name the pane.
+/// Names, or a prefix and `*`. A calling agent's session (`session_env`) is
+/// kept out too, by [`prepare_shell`].
+const WINDOW_LOCAL: &[&str] = &[
+    "HERDR_*",
+    "TERM",
+    "TERMINFO",
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "VTE_VERSION",
+    "ALACRITTY_*",
+    "WINDOWID",
+    "TERMINATOR_UUID",
+    "KITTY_*",
+    "WEZTERM_*",
+    "KONSOLE_*",
+    "GNOME_TERMINAL_*",
+    "ITERM_*",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    "COLUMNS",
+    "LINES",
+    "GPG_TTY",
+    "SSH_TTY",
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "_",
+    "SHELLOPTS",
+    "BASHOPTS",
+];
 
-/// A herdr server started from inside an agent gives every pane that
-/// agent's session variables, and a Claude that inherits them never writes
-/// its transcript (bisected 2026-09-29). seagents starts its own servers
-/// without them (`herdr::ensure_server`), but one already running may have
-/// them: if the pane's shell holds any, they are unset there first.
-fn clean_shell(pane: &str) {
-    let Ok(procs) = herdr::process_info(pane) else {
-        return;
-    };
-    let names: Vec<String> = std::fs::read(format!("/proc/{}/environ", procs.shell_pid))
+/// Give the pane's shell `run`'s environment before the agent is typed into
+/// it, so `seagents run claude` is `claude` as this shell would run it:
+/// `FOO=bar seagents run claude`, a launcher's exports, a venv's `PATH` all
+/// reach the agent, which otherwise runs under the herdr server's
+/// environment. Everything is carried except [`WINDOW_LOCAL`] and a calling
+/// agent's session variables (`session_env`) — and those the shell already
+/// holds are unset: a herdr server started from inside an agent gives every
+/// pane that agent's session, and a Claude that inherits it never writes its
+/// transcript (bisected 2026-09-29). seagents starts its own servers without
+/// them (`herdr::ensure_server`), but one already running may have them.
+///
+/// Through a 0600 file the shell sources (and deletes), not herdr's `--env`:
+/// that is herdr's command line, which `/proc` shows every local user, and a
+/// tab `run` reuses would not get it at all. The line typed is only the
+/// file's path, led by a space so a shell ignoring such lines keeps it out of
+/// its history.
+fn prepare_shell(pane: &str, key: &str) {
+    let held: Vec<String> = herdr::process_info(pane)
+        .ok()
+        .and_then(|procs| std::fs::read(format!("/proc/{}/environ", procs.shell_pid)).ok())
         .map(|env| {
             env.split(|b| *b == 0)
                 .filter_map(|kv| {
@@ -338,10 +374,66 @@ fn clean_shell(pane: &str) {
                 .collect()
         })
         .unwrap_or_default();
-    let leaked = crate::adapter::session_env(names.iter().map(String::as_str));
+    let leaked = crate::adapter::session_env(held.iter().map(String::as_str));
+    let ours: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
+        .filter(|(k, _)| is_name(k) && !matches_any(k, WINDOW_LOCAL))
+        .collect();
+    let session = crate::adapter::session_env(ours.iter().map(|(k, _)| k.as_str()));
+
+    let Ok(path) = registry::env_file(key) else {
+        eprintln!("seagents: no runtime dir; the agent gets the herdr server's environment");
+        return;
+    };
+    let mut script = Vec::new();
     if !leaked.is_empty() {
-        let _ = herdr::run_line(pane, &format!("unset {}", leaked.join(" ")));
+        script.extend_from_slice(format!("unset {}\n", leaked.join(" ")).as_bytes());
     }
+    for (k, v) in ours.iter().filter(|(k, _)| !session.contains(k)) {
+        script.extend_from_slice(format!("export {k}=").as_bytes());
+        script.extend_from_slice(&quote_bytes(v.as_encoded_bytes()));
+        script.push(b'\n');
+    }
+    let quoted = crate::launch::shell_quote(&path.to_string_lossy());
+    script.extend_from_slice(format!("rm -f -- {quoted}\n").as_bytes());
+    let sourced = crate::fsutil::write_atomic(&path, &script)
+        .map_err(|e| e.to_string())
+        .and_then(|()| herdr::run_line(pane, &format!(" . {quoted}")).map_err(|e| e.message));
+    if let Err(e) = sourced {
+        let _ = std::fs::remove_file(&path);
+        eprintln!("seagents: passing the environment to the agent's pane: {e}");
+    }
+}
+
+/// A name a POSIX shell can `export`: not, say, bash's exported functions
+/// (`BASH_FUNC_f%%`).
+fn is_name(k: &str) -> bool {
+    let mut chars = k.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn matches_any(name: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|p| match p.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == *p,
+    })
+}
+
+/// [`crate::launch::shell_quote`] for bytes: a value need not be UTF-8.
+fn quote_bytes(v: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in v {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
 }
 
 /// How long the pane's shell may take to be ready for `agent start`: herdr

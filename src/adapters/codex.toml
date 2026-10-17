@@ -16,9 +16,6 @@ session_env      = [
   "CODEX_NETWORK_PROXY_ACTIVE",
   "CODEX_ESCALATE_SOCKET",
 ]
-# The agent runs under the herdr server's environment, not `run`'s: where
-# Codex keeps its config (and auth) is passed on to its pane.
-pass_env         = ["CODEX_HOME"]
 
 # Codex has no permission-mode flag: an approval policy (-a) and a sandbox
 # (-s) instead, mapped from Claude's mode words under

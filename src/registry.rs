@@ -33,7 +33,8 @@
 //! A session's **prompt files** (`<cwd>/.seagents/prompts/<key>-…`,
 //! [`write_prompt`]) live outside the cache, in the agent's working
 //! directory, and its **hook settings** (`<runtime dir>/hooks-<key>.json`,
-//! [`hooks_file`]) in the runtime dir, but are the session's all the same:
+//! [`hooks_file`]) and **environment** (`<runtime dir>/env-<key>.sh`,
+//! [`env_file`]) in the runtime dir, but are the session's all the same:
 //! named here, deleted with it.
 //!
 //! Liveness is one rule ([`Session::alive`]): the `run` holding the window is
@@ -440,6 +441,9 @@ fn finish_in(dir: &Path, s: &Session, tombstone: bool) {
     remove_prompts(&s.meta.key, &s.meta.cwd);
     if let Ok(hooks) = hooks_file(&s.meta.key) {
         let _ = fs::remove_file(hooks);
+    }
+    if let Ok(env) = env_file(&s.meta.key) {
+        let _ = fs::remove_file(env);
     }
 }
 
@@ -880,6 +884,14 @@ pub(crate) fn runtime_dir() -> Result<PathBuf, String> {
 /// shows on the line herdr types into the pane (or in the shell's history).
 pub(crate) fn hooks_file(key: &str) -> Result<PathBuf, String> {
     Ok(runtime_dir()?.join(format!("hooks-{key}.json")))
+}
+
+/// Session `key`'s environment, `<runtime dir>/env-<key>.sh`: `run`'s own
+/// environment as `export` lines, which the agent's pane's shell sources —
+/// and deletes — before the agent is typed into it (`run::prepare_shell`).
+/// A file, not herdr's `--env`, so no value shows in `/proc`.
+pub(crate) fn env_file(key: &str) -> Result<PathBuf, String> {
+    Ok(runtime_dir()?.join(format!("env-{key}.sh")))
 }
 
 // ---------------------------------------------------------------------------

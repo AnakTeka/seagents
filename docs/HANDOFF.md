@@ -252,7 +252,7 @@ Source layout under `src/`:
   environment's business, as for any `herdr` command: `HERDR_SOCKET_PATH`,
   else `HERDR_SESSION`, else the default.
 - **`src/run.rs`** — `seagents run` (§1): the in-pane exec, `place()` (the
-  agent's workspace and tab), `clean_shell()`, `start()` (the agent up, and
+  agent's workspace and tab), `prepare_shell()`, `start()` (the agent up, and
   its pid), `identify_window()`, `attach_loop()` (D1: a detach undone, a
   takeover respected, a closed window ending the agent, the agent's exit
   ending the attach) over `Watch` (one `poll()` on pidfds, a signal pipe and
@@ -350,15 +350,14 @@ Source layout under `src/`:
   how it is injected (an adapter with hooks is one whose agent reports its
   conversation and keeps the exact turn ledger), the permission modes and
   each one's argv, which variables are the calling agent's session
-  (`session_env`) and which configuration paths the pane is given
-  (`pass_env`), the input box, the exit sequence, the dialogs herdr misses
+  (`session_env`), the input box, the exit sequence, the dialogs herdr misses
   (`[screen] dialogs`). Keyed by the herdr agent kind of `argv[0]`
   (`herdr::kind_for`); `~/.config/seagents/agents/<agent>.toml` replaces the
   bundled file whole (an unparseable override is an error, not a silent
   default); other herdr kinds get the generic adapter.
   Bundled: `claude` and `codex` (§11). `run` reads `[hooks]` (how — `inject =
   "settings" | "config"` — the flag's spellings, the events,
-  `hookless_flags`) and `pass_env`; `restore` reads
+  `hookless_flags`) and `session_env`; `restore` reads
   `[restore]` (the argv that resumes a conversation, and the stale words it
   replaces); `spawn` reads `permission_argv`; `capabilities()` is what `status
   --json` reports per agent; `send` reads `[send]` (when a body goes by
@@ -406,10 +405,9 @@ Source layout under `src/`:
    pane is at that cwd. A tab already labelled with the tag, holding one pane
    and no agent, is taken instead, in any workspace at that cwd: herdr brings
    tabs back after a server restart (measured: and one that had been closed,
-   too), and `restore` relaunches an agent under its old tag. A new tab's
-   shell is given the adapter's `pass_env` (`CLAUDE_CONFIG_DIR`,
-   `CODEX_HOME`) and `SEAGENTS_DEBUG` from `run`'s environment (`--env`):
-   **the agent runs under the herdr server's environment, not `run`'s.**
+   too), and `restore` relaunches an agent under its old tag. The pane's
+   shell starts with the herdr server's environment, not `run`'s — step 7
+   gives it `run`'s.
 6. Hooks injected (§6) — Claude's merged settings go to
    `$XDG_RUNTIME_DIR/seagents/hooks-<key>.json` (0600) and are passed as
    `--settings <path>`, because herdr types the command line into the pane's
@@ -419,9 +417,19 @@ Source layout under `src/`:
    by it — and before the hook settings file, so whoever finishes the session
    finds that too. The window's title is set to the tag then (see "The window
    title" below).
-7. `starting <tag>…` is printed; `clean_shell()` unsets any calling-session
-   variable the pane's shell already holds (a server someone else started
-   from inside an agent); then, once the pane's foreground is its shell
+7. `starting <tag>…` is printed; `prepare_shell()` gives the pane's shell
+   `run`'s environment, so `seagents run claude` is `claude` as the calling
+   shell would run it (`FOO=bar seagents run claude`, a launcher's
+   `CLAUDE_CONFIG_DIR` or `CC_ACCOUNT`, a venv's `PATH`): everything but
+   what belongs to the calling window (`run::WINDOW_LOCAL` — its terminal,
+   tty and shell bookkeeping, and `HERDR_*`) and a calling agent's session
+   (`session_env`), whose variables the shell already holds are unset too
+   (a server someone else started from inside an agent). As `export` lines
+   in `$XDG_RUNTIME_DIR/seagents/env-<key>.sh` (0600), which the shell
+   sources and deletes (` . <path>`, space-led to stay out of history) —
+   not `herdr tab create --env`, whose values `/proc` would show every local
+   user, and which a reused tab would never get. POSIX-shell syntax (`export`,
+   `unset`, `.`). Then, once the pane's foreground is its shell
    again (herdr refuses `agent start` with `agent_pane_busy` while anything
    else is — a shell still running its rc files, or that `unset`; its CLI
    retries only 2 s), `herdr agent start <tag> --kind <kind> --pane <p>
@@ -1341,7 +1349,7 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 - **Session variables** a Codex shell tool sees: `CODEX_CI`,
   `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_PERMISSION_PROFILE`,
   `CODEX_SANDBOX*`, … — stripped by the launcher; `CODEX_HOME` is the user's,
-  and passed on to the agent's pane (`pass_env`, §1).
+  and reaches the agent's pane with the rest of `run`'s environment (§1).
 - **Folder trust**: a never-trusted directory opens on "Do you trust the
   contents of this directory?"; answering writes `[projects."…"]` into
   config.toml. herdr 0.9.0 reads it as **idle** (seen 2026-10-12; upstream's
@@ -1405,13 +1413,11 @@ and logs land there). `src/adapters/codex.toml` carries the facts:
 
 ## Limitations & gotchas
 
-- **The agent runs under the herdr server's environment, not `run`'s.**
-  `FOO=bar seagents run claude` does not reach Claude; only the adapter's
-  `pass_env` (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) and `SEAGENTS_DEBUG` are
-  passed to a new pane (as `--env`, so paths only — herdr's command line is
-  visible in `/proc`). A tab `run` reuses (§1) keeps the environment its shell
-  has. Start the herdr server from the environment you want agents to have,
-  or let `run` start it (`herdr::ensure_server`).
+- **The pane's shell is given `run`'s environment by sourcing a file**
+  (§1, step 7), so it assumes a POSIX-ish shell (`export`, `unset`, `.`).
+  The line is typed after the shell's rc files, so `run`'s values win over
+  theirs. The environment is not recorded: an agent `restore` brings back
+  gets the environment `restore` runs in, not its original launcher's.
 - **herdr starts the agent by typing its command into the pane's shell** —
   so it runs your shell's rc files and aliases (the `claude` alias is fine,
   §1), it shows in the shell's history, and `run /abs/path/claude` loses its

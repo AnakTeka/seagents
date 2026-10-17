@@ -214,11 +214,12 @@ So the alias keeps working and the window looks as it does today.
 
 Found while building, and resolved the way most consistent with the above:
 
-- **The agent runs under the herdr server's environment, not `run`'s.** An
-  adapter's `[launch] pass_env` (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) and
-  `SEAGENTS_DEBUG` are passed to a new pane with `herdr tab create --env`
-  (paths only: herdr's command line is visible in `/proc`). Found when a
-  test's `CODEX_HOME` did not reach Codex.
+- **The agent runs under the herdr server's environment, not `run`'s.** So
+  `run` gives the pane's shell its own environment (bar the calling window's
+  terminal variables and a calling agent's session) by having it source a
+  0600 file, not with `herdr tab create --env`, whose values `/proc` would
+  show every local user. Found when a test's `CODEX_HOME` did not reach
+  Codex.
 - **Codex's trust question reads as idle to herdr** — so the seed, too (not
   only `stop`), would have answered it. The `stop`-only guard became one
   adapter list, `[screen] dialogs`, read by `status::agent_status`, through

@@ -23,9 +23,6 @@ session_env      = [
   "CLAUDE_EFFORT",
   "AI_AGENT",
 ]
-# The agent runs under the herdr server's environment, not `run`'s: where
-# Claude Code keeps its config (and auth) is passed on to its pane.
-pass_env         = ["CLAUDE_CONFIG_DIR"]
 
 # What `spawn --permission-mode` takes, and the argv for each.
 [launch.permission_argv]

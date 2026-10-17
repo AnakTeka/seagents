@@ -137,13 +137,6 @@ pub(crate) struct Launch {
     /// in `*`. Never the user's own configuration (Claude's
     /// `CLAUDE_CONFIG_DIR`).
     pub(crate) session_env: Vec<String>,
-    /// Variables of `run`'s own environment the agent's pane is given, when
-    /// set: where the tool keeps its configuration (`CLAUDE_CONFIG_DIR`,
-    /// `CODEX_HOME`). The agent runs under the herdr server's environment,
-    /// not `run`'s, so without this `CODEX_HOME=… seagents run codex` would
-    /// not reach Codex. Paths only, never secrets: they travel on herdr's
-    /// command line, which `/proc` shows every local user.
-    pub(crate) pass_env: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -237,14 +230,6 @@ fn parse(text: &str) -> Result<Adapter, String> {
         return Err(format!(
             "launch.session_env: {bad:?} is not a variable name (or a prefix and *)"
         ));
-    }
-    if let Some(bad) = adapter
-        .launch
-        .pass_env
-        .iter()
-        .find(|n| n.ends_with('*') || !valid_env_pattern(n))
-    {
-        return Err(format!("launch.pass_env: {bad:?} is not a variable name"));
     }
     let hooks = &adapter.hooks;
     if hooks.enabled() && (hooks.flags.is_empty() || hooks.events.is_empty()) {
