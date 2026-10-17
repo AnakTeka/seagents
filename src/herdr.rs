@@ -515,11 +515,53 @@ pub(crate) fn process_info(pane: &str) -> Result<Procs, Error> {
 /// `herdr terminal attach <terminal_id>`, to be run in the caller's own
 /// terminal: shows that one terminal full-window until it detaches (`Ctrl+B
 /// q`), is taken over, or the terminal goes. Never `--takeover`: a window does
-/// not steal its agent back from another client that took it.
-pub(crate) fn attach(terminal_id: &str) -> Command {
+/// not steal its agent back from another client that took it. It reads
+/// [`attach_config`], not the user's herdr config.
+pub(crate) fn attach(terminal_id: &str) -> Result<Command, String> {
     let mut cmd = Command::new(bin());
-    cmd.args(["terminal", "attach", terminal_id]);
-    cmd
+    cmd.args(["terminal", "attach", terminal_id])
+        .env("HERDR_CONFIG_PATH", attach_config()?);
+    Ok(cmd)
+}
+
+/// The user's herdr config, where herdr looks for it: `HERDR_CONFIG_PATH`,
+/// else `$XDG_CONFIG_HOME/herdr/config.toml` (default `~/.config/herdr/`).
+fn user_config() -> PathBuf {
+    if let Some(path) = std::env::var_os("HERDR_CONFIG_PATH").filter(|v| !v.is_empty()) {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        })
+        .join("herdr/config.toml")
+}
+
+/// The config a window's attach reads: the user's herdr config with
+/// `ui.mouse_capture = false`, rewritten to `<runtime dir>/herdr-attach.toml`
+/// on every attach so it follows the user's edits. herdr's default captures
+/// the mouse in a direct attach whatever runs there, so over a plain shell
+/// (an agent suspended with Ctrl+Z) the window could not select text; without
+/// it the mouse still reaches a program that asks for it (Claude does). The
+/// user's own config — and with it herdr's full UI, whose tab and split
+/// clicks need capture — keeps herdr's default.
+fn attach_config() -> Result<PathBuf, String> {
+    let mut config: toml::Table = std::fs::read_to_string(user_config())
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    let ui = config
+        .entry("ui")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(ui) = ui {
+        ui.insert("mouse_capture".into(), toml::Value::Boolean(false));
+    }
+    let path = crate::registry::runtime_dir()?.join("herdr-attach.toml");
+    crate::fsutil::write_atomic(&path, config.to_string().as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Submit `text` to the agent in `pane` as a prompt: herdr pastes it the way

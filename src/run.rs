@@ -464,7 +464,11 @@ fn attach_loop(key: &str, tag: &str, watch: &Watch) -> Ended {
             Wake::Agent => return Ended::Agent,
             Wake::Attach | Wake::Timeout => {}
         }
-        let child = herdr::attach(key)
+        let mut attach = match herdr::attach(key) {
+            Ok(cmd) => cmd,
+            Err(e) => return Ended::Failed(e),
+        };
+        let child = attach
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())

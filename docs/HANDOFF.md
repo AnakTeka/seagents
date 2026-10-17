@@ -523,6 +523,17 @@ alive, and a pidfd fires only on exit, so nothing ends (verified
 2026-10-16: stopped, `run` stayed, `fg` resumed it). The old wrapper's `__lead` anchor and its job-control
 forwarding are gone with the wrapper.
 
+**The mouse in a window**: herdr's direct attach captures the mouse by
+default (`ui.mouse_capture`), whatever runs in the terminal — so over the
+pane's shell (an agent suspended with Ctrl+Z) the window could not select
+text. The attach therefore reads its own config, `herdr::attach_config`: the
+user's herdr config with `ui.mouse_capture = false`, rewritten to
+`<runtime dir>/herdr-attach.toml` on every attach and passed as
+`HERDR_CONFIG_PATH`. The mouse still reaches a program that asks for it
+(Claude does: its own selection and scrolling work). The user's config is
+left alone, so herdr's full UI (`herdr`, `herdr --remote`) keeps its mouse —
+clicking tabs and spaces needs capture on (verified 2026-10-16).
+
 **A server restart** ends every agent (their terminals were the server's):
 each `run`'s pidfd on its agent fires and it ends. herdr brings the tabs back
 empty; `restore` reuses them (§6).
